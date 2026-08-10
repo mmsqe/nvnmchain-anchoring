@@ -1,13 +1,16 @@
 //! `AnchoringRegistry`'s own events — the second log source.
 //!
-//! Everything the wrapper anchors can be rebuilt from the `Anchored` log, with
-//! one exception: grants and revokes anchor nothing at all, so role history
-//! exists only here. An indexer that follows the precompile alone can never
-//! answer "who could write this record".
+//! Grants and revokes anchor as `acl` envelopes, so the `Anchored` log alone
+//! rebuilds "who could write this record". The revision that emitted these
+//! events without anchoring them was never deployed, so there is no partial
+//! history for this source to complete.
+//!
+//! It stays because it is a cheaper projection than decoding envelopes, and
+//! cross-checks the anchored ACL against what the wrapper said it did.
 
-/// `(topic0, signature)` for every event the wrapper emits. Topics are asserted
-/// against their signatures in the tests, so a mistyped hash cannot sit here
-/// quietly matching nothing.
+/// `(topic0, signature)` for every event the wrapper emits. `tests/signatures.rs`
+/// checks the hashes against these signatures and the signatures against the
+/// contract, so neither can sit here quietly matching nothing.
 pub const REGISTRY_TOPICS: &[(&str, &str)] = &[
     (
         "0x3ce4563d134e2bed44925e6752673cb055ab97f4e4e9b1af57b1d10154f6a1a4",

@@ -3,8 +3,9 @@
 use crate::eth::{checksum_address, hex0x, keccak_hex, normalize_hex, word_to_u128, word_to_usize};
 
 // `AnchoringRegistry` anchors in two formats — a bare `abi.encode`, and a newer
-// one leading with a `bytes32` kind — and a registry is an upgradeable proxy, so
-// one namespace emits both across an upgrade.
+// one leading with a `bytes32` kind. Only the tagged form has ever been
+// emitted; the untagged reading matters only if a build predating the kind
+// tags ships.
 //
 // Either way the ids in the payload have to reproduce the key it was anchored
 // under, `keccak256(abi.encode(kind, ids…))`. For untagged payloads that is the

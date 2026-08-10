@@ -24,7 +24,7 @@ NVNM_RPC=http://127.0.0.1:8545 DB_PATH=/tmp/anchoring.db cargo run
 |---|---|---|
 | `NVNM_RPC` / `TEMPO_RPC` | canary | JSON-RPC endpoint |
 | `DB_PATH` | `anchoring.db` | SQLite file; one per chain |
-| `REGISTRY_ADDRESS` | — | `AnchoringRegistry` proxy; without it, no role history |
+| `REGISTRY_ADDRESS` | — | `AnchoringRegistry` proxy; adds its events as a second source |
 | `START_BLOCK` | `0` | nothing to find below the T10 block |
 | `LOG_RANGE` | `2000` | blocks per `eth_getLogs` |
 | `POLL_SECONDS` | `2` | between passes |
@@ -40,8 +40,9 @@ Blocks are never fetched. Two log filters, **each with its own cursor**:
 
 Separate cursors because setting `REGISTRY_ADDRESS` on an existing database has
 to backfill that source, not inherit a cursor already at the head and skip its
-history silently. The second source is not optional if you want roles: grants
-and revokes only anchor in the newer contract, and never did before it.
+history silently. Roles do not depend on it — grants and revokes anchor — but it
+is a cheaper projection than decoding envelopes, and cross-checks the anchored
+ACL against what the wrapper said it did.
 
 A range is one request — logs and the hash of its last block together — so the
 checkpoint costs nothing extra and commits with the cursor. Reorgs walk those
@@ -54,8 +55,12 @@ only the raw tables, since a fold cannot be un-folded.
 ## Envelopes
 
 `AnchoringRegistry` anchors in two formats — a bare `abi.encode`, and a newer
-one leading with a `bytes32` kind (`registry`, `record`, `status`, `acl`). A
-registry is an upgradeable proxy, so one namespace emits both across an upgrade.
+one leading with a `bytes32` kind (`registry`, `record`, `status`, `acl`).
+
+Only the tagged form has ever been emitted, so the untagged reading is dead
+code — and not insurance against a later format change either, since a third
+format would need its own reading. It is deletable until a build predating the
+kind tags ships.
 
 Either way the ids have to reproduce the key the payload was anchored under,
 `keccak256(abi.encode(kind, ids…))`. For untagged payloads that is the only
@@ -89,3 +94,13 @@ promotes `topic0`/`topic1`/`topic2` to indexed columns.)
 both contract revisions, not re-encoded here. `tempo-e2e`'s `test_anchoring.py`
 and `test_anchoring_registry.py` cover the same ground against a live node and
 are the acceptance spec.
+
+The topics filtered on are checked twice over: each topic0 is the keccak of the
+signature beside it, and each signature is one the contracts compile to. The
+second half matters because a signature and its hash drift together — agreeing
+with each other while matching nothing on chain, which indexes silently empty.
+
+`make fixtures` vendors the contracts' event ABI to
+`tests/fixtures/contract-events.json`, recording the commit it read for failure
+messages. Nothing offline can spot a stale fixture, so rerun it on any event
+change.

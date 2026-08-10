@@ -1,7 +1,7 @@
 //! Envelope payloads dumped from forge runs against the shipped contracts —
 //! re-encoding them in the test would only check the decoder against its own
-//! guess. `UNTAGGED_*` come from nvnm-contracts main, `TAGGED_*` from its
-//! `indexer` branch, which leads every envelope with its kind.
+//! guess. `TAGGED_*` come from nvnmchain-contracts `main`; `UNTAGGED_*` from the
+//! revision before it led every envelope with a kind, which was never deployed.
 #![allow(dead_code)]
 
 pub const REGISTRY_KEY: &str = "0x173602657603c73bdfa5393aba98fa9e899f7c58898ea2a7d444639768d549d4";
@@ -59,7 +59,7 @@ pub fn bytes(hexed: &str) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Tagged format (nvnm-contracts `indexer` branch): a leading bytes32 kind, and
+// Tagged format (nvnmchain-contracts `main`): a leading bytes32 kind, and
 // ACL changes anchored as a fourth shape. Keys are unchanged.
 // ---------------------------------------------------------------------------
 
