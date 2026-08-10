@@ -1,4 +1,8 @@
-//! A JSON-RPC client with exactly the four calls this indexer makes.
+//! A JSON-RPC client with exactly the state reads the audit makes.
+//!
+//! The log itself no longer comes from here — tidx has it. What a node still
+//! answers that an index cannot is the precompile's own storage, which is the
+//! whole point of auditing against it rather than against a second index.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -42,45 +46,6 @@ impl Rpc {
             bail!("{method}: {error}");
         }
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
-    }
-
-    pub async fn block_number(&self) -> Result<u64> {
-        let result = self.call("eth_blockNumber", json!([])).await?;
-        parse_hex_u64(result.as_str().unwrap_or("0x0")).context("parse block number")
-    }
-
-    /// The canonical hash of `number`, for detecting a reorg under our cursor.
-    pub async fn block_hash(&self, number: u64) -> Result<Option<String>> {
-        let result = self
-            .call(
-                "eth_getBlockByNumber",
-                json!([format!("0x{number:x}"), false]),
-            )
-            .await?;
-        Ok(result
-            .get("hash")
-            .and_then(Value::as_str)
-            .map(str::to_string))
-    }
-
-    /// Logs from `address` whose topic0 is one of `topics0`, over an inclusive
-    /// block range. One call per range — the whole reason this indexer does not
-    /// need to walk blocks.
-    pub async fn logs(
-        &self,
-        address: &str,
-        topics0: &[&str],
-        from: u64,
-        to: u64,
-    ) -> Result<Vec<Value>> {
-        let filter = json!({
-            "address": address,
-            "fromBlock": format!("0x{from:x}"),
-            "toBlock": format!("0x{to:x}"),
-            "topics": [topics0],
-        });
-        let result = self.call("eth_getLogs", json!([filter])).await?;
-        Ok(result.as_array().cloned().unwrap_or_default())
     }
 
     /// Several calls in one request. The endpoint answers out of order, so
@@ -131,7 +96,7 @@ impl Rpc {
 
     /// `latest(namespace, key)` on the precompile — the node's own answer for a
     /// head, used to calibrate our slot derivation against it.
-    pub async fn latest(&self, namespace: &str, key: &str) -> Result<String> {
+    pub async fn latest(&self, namespace: &str, key: &str, block: u64) -> Result<String> {
         let data = format!(
             "{}{:0>64}{}",
             crate::precompile::LATEST_SELECTOR,
@@ -141,55 +106,22 @@ impl Rpc {
         let result = self
             .call(
                 "eth_call",
-                json!([{"to": crate::precompile::ADDRESS, "data": data}, "latest"]),
+                json!([{"to": crate::precompile::ADDRESS, "data": data}, block_tag(block)]),
             )
             .await?;
         Ok(result.as_str().unwrap_or("0x").to_string())
     }
 
-    /// One range of logs plus the hash of its last block, in a single request —
-    /// the checkpoint then costs no extra round trip and can commit with the
-    /// cursor it belongs to.
-    pub async fn logs_and_block_hash(
-        &self,
-        address: &str,
-        topics0: &[&str],
-        from: u64,
-        to: u64,
-    ) -> Result<(Vec<Value>, String)> {
-        let filter = json!({
-            "address": address,
-            "fromBlock": format!("0x{from:x}"),
-            "toBlock": format!("0x{to:x}"),
-            "topics": [topics0],
-        });
-        let results = self
-            .call_batch(vec![
-                ("eth_getLogs", json!([filter])),
-                ("eth_getBlockByNumber", json!([format!("0x{to:x}"), false])),
-            ])
-            .await?;
-        let logs = match results.first() {
-            Some(Value::Array(logs)) => logs.clone(),
-            _ => Vec::new(),
-        };
-        let hash = results
-            .get(1)
-            .and_then(|b| b.get("hash"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        Ok((logs, hash))
-    }
-
-    pub async fn storage_at(&self, address: &str, slot: &str) -> Result<String> {
+    pub async fn storage_at(&self, address: &str, slot: &str, block: u64) -> Result<String> {
         let result = self
-            .call("eth_getStorageAt", json!([address, slot, "latest"]))
+            .call("eth_getStorageAt", json!([address, slot, block_tag(block)]))
             .await?;
         Ok(result.as_str().unwrap_or("0x").to_string())
     }
 }
 
-pub fn parse_hex_u64(value: &str) -> Option<u64> {
-    u64::from_str_radix(value.trim().strip_prefix("0x").unwrap_or(value.trim()), 16).ok()
+/// A block number as a JSON-RPC block tag. Every read the audit makes names a
+/// block rather than `latest`, so this is never `"latest"`.
+pub fn block_tag(block: u64) -> String {
+    format!("0x{block:x}")
 }

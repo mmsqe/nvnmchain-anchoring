@@ -34,8 +34,14 @@ pub fn head_slot(namespace: &str, key: &str) -> Option<String> {
 }
 
 /// The `Anchored` payload: `abi.encode(bytes32 commitment, bytes metadata)`.
-/// Hand-read rather than run through a general decoder: one fixed shape, and a
-/// strict reading is what keeps a malformed log out of the index.
+///
+/// Read here rather than by the index that stored the log, because tidx decodes
+/// a dynamic `bytes` argument as the 32-byte head word — the ABI *offset* to the
+/// payload, not the payload — while giving `string` a real dereference
+/// (`data_decode_sql_postgres`, where `Bytes(Some(_) | None)` share one arm).
+/// Asking it for `metadata` returns `0x…40`, which hashes to nothing and decodes
+/// to no envelope. So the queries select the raw `data` column and this reads it:
+/// one fixed shape, strictly, so a malformed log is refused rather than misread.
 pub fn decode_anchored_data(data: &[u8]) -> Option<(String, Vec<u8>)> {
     if data.len() < 96 || !data.len().is_multiple_of(32) {
         return None;

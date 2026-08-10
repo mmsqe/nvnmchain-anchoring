@@ -58,6 +58,15 @@ pub fn word_to_u128(word: &[u8; 32]) -> Option<u128> {
     Some(u128::from_be_bytes(buf))
 }
 
+/// The address in an indexed topic, right-aligned in its word.
+pub fn address_from_topic(topic: &str) -> Option<String> {
+    let hexed = strip_hex(topic);
+    if hexed.len() != 64 {
+        return None;
+    }
+    Some(checksum_address(&hexed[24..]))
+}
+
 /// A word as a length or offset, or `None` when it is too large to be one.
 pub fn word_to_usize(word: &[u8]) -> Option<usize> {
     if word.len() != 32 || word[..24].iter().any(|b| *b != 0) {
@@ -66,13 +75,4 @@ pub fn word_to_usize(word: &[u8]) -> Option<usize> {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&word[24..]);
     usize::try_from(u64::from_be_bytes(buf)).ok()
-}
-
-/// The address in an indexed topic, right-aligned in its word.
-pub fn address_from_topic(topic: &str) -> Option<String> {
-    let hexed = strip_hex(topic);
-    if hexed.len() != 64 {
-        return None;
-    }
-    Some(checksum_address(&hexed[24..]))
 }

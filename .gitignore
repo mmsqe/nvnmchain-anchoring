@@ -1,5 +1,2 @@
 /target
-*.db
-*.db-wal
-*.db-shm
 /.cache

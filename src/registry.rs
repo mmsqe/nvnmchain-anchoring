@@ -1,16 +1,22 @@
-//! `AnchoringRegistry`'s own events — the second log source.
+//! `AnchoringRegistry`'s own events — the second source the projection reads.
 //!
 //! Grants and revokes anchor as `acl` envelopes, so the `Anchored` log alone
 //! rebuilds "who could write this record". The revision that emitted these
 //! events without anchoring them was never deployed, so there is no partial
 //! history for this source to complete.
 //!
-//! It stays because it is a cheaper projection than decoding envelopes, and
-//! cross-checks the anchored ACL against what the wrapper said it did.
+//! It stays because `roles` is the one projection these events serve
+//! *completely* — every field the retired queries returned is in them, so it
+//! folds in SQL over tidx with no payload decoded. The other three are lossy
+//! here: `RegistryAdded` carries neither description, metadata nor timestamp,
+//! and `RecordAdded` carries neither uri, checksum algorithm, metadata nor
+//! timestamp. Those live only in the envelope.
 
-/// `(topic0, signature)` for every event the wrapper emits. `tests/signatures.rs`
-/// checks the hashes against these signatures and the signatures against the
-/// contract, so neither can sit here quietly matching nothing.
+/// `(topic0, signature)` for every event the wrapper emits, canonical form.
+/// `tests/signatures.rs` checks the hashes against these signatures and the
+/// signatures against the contract, so neither can sit here quietly matching
+/// nothing — a signature tidx cannot match decodes to an empty table just as
+/// surely as a mistyped topic used to scan an empty range.
 pub const REGISTRY_TOPICS: &[(&str, &str)] = &[
     (
         "0x3ce4563d134e2bed44925e6752673cb055ab97f4e4e9b1af57b1d10154f6a1a4",

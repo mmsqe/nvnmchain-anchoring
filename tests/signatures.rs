@@ -1,9 +1,8 @@
-//! The topics this indexer filters on, checked against the contracts that emit them.
+//! The signatures this crate matches on, checked against the contracts that emit them.
 //!
-//! `ingest.rs` and `envelopes.rs` assert each topic0 is the keccak of the signature beside it.
-//! That catches a mistyped hash, not a signature that drifted from the contract: those two stay
-//! consistent with each other while matching nothing on chain, and a filter matching nothing
-//! indexes silently empty.
+//! Asserting each topic0 is the keccak of the signature beside it catches a mistyped hash, not a
+//! signature that drifted from the contract: those two stay consistent with each other while
+//! matching nothing on chain, and a signature matching nothing decodes to an empty table.
 //!
 //! So signatures are compared against the contracts' compiled event ABI, vendored by
 //! `make fixtures`. Nothing offline can spot a stale fixture, so rerun it on any event change.
