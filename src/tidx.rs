@@ -46,14 +46,16 @@ impl Engine {
             .find(|e| e.as_param().eq_ignore_ascii_case(value.trim()))
     }
 
-    /// A byte string as this engine's SQL literal. The PostgreSQL cast is
-    /// redundant — an unknown literal resolves against the `bytea` column it is
-    /// compared to — but it is the spelling `tempo-e2e` already proves against a
-    /// running tidx, and being explicit costs nothing.
+    /// A byte string as this engine's SQL literal.
+    ///
+    /// Uncast, though PostgreSQL would take `::bytea`. The cast is redundant —
+    /// an unknown literal resolves against the column it is compared to, in a
+    /// predicate and across a `UNION` alike — and tidx's pushdown extractor
+    /// reads a bare literal but not a cast expression.
     pub fn bytes_literal(self, value: &str) -> String {
         let hexed = strip_hex(value).to_lowercase();
         match self {
-            Self::Postgres => format!("'\\x{hexed}'::bytea"),
+            Self::Postgres => format!("'\\x{hexed}'"),
             Self::ClickHouse => format!("'0x{hexed}'"),
         }
     }

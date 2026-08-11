@@ -6,10 +6,14 @@ mod common;
 use common::{bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA};
 use nvnmchain_anchoring::eth::{checksum_address, keccak_hex};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
+use nvnmchain_anchoring::registry::{roles_sql, ROLE_EVENTS};
 use nvnmchain_anchoring::tidx::{heads_sql, parse_coverage, parse_heads, Engine, Table};
 use serde_json::json;
 
 const NAMESPACE: &str = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E";
+/// A registry, which is a deployment rather than an enshrined address — every
+/// roles query names one, and that name is the whole partition.
+const REGISTRY: &str = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
 
 fn table(body: serde_json::Value) -> Table {
     Table::from_response(&body).expect("a query tidx accepted")
@@ -159,19 +163,24 @@ fn the_address_literal_is_spelled_for_its_engine() {
     let hexed = ANCHORING_ADDRESS.trim_start_matches("0x").to_lowercase();
     assert_eq!(
         Engine::Postgres.bytes_literal(ANCHORING_ADDRESS),
-        format!("'\\x{hexed}'::bytea")
+        format!("'\\x{hexed}'")
     );
     assert_eq!(
         Engine::ClickHouse.bytes_literal(ANCHORING_ADDRESS),
         format!("'0x{hexed}'")
     );
 
-    assert!(heads_sql(Engine::Postgres, 7).contains(&format!("'\\x{hexed}'::bytea")));
+    assert!(heads_sql(Engine::Postgres, 7).contains(&format!("'\\x{hexed}'")));
     assert!(heads_sql(Engine::ClickHouse, 7).contains(&format!("'0x{hexed}'")));
 
     // The topic goes through the same spelling — it is a bytea column too.
     let topic0 = ANCHORED_TOPIC.trim_start_matches("0x");
-    assert!(heads_sql(Engine::Postgres, 7).contains(&format!("'\\x{topic0}'::bytea")));
+    assert!(heads_sql(Engine::Postgres, 7).contains(&format!("'\\x{topic0}'")));
+
+    // Uncast, everywhere: tidx's pushdown extractor reads a bare literal and
+    // not a cast expression.
+    assert!(!roles_sql(Engine::Postgres, REGISTRY, 7).contains("::bytea"));
+    assert!(!heads_sql(Engine::Postgres, 7).contains("::bytea"));
 }
 
 #[test]
@@ -179,6 +188,52 @@ fn heads_are_bounded_at_the_audited_block() {
     // tidx's realtime sync runs ahead of its contiguous interval; a head newer
     // than the block state is read at would report as a false mismatch.
     assert!(heads_sql(Engine::Postgres, 123).contains("block_num <= 123"));
+}
+
+#[test]
+fn the_roles_query_orders_revokes_against_grants() {
+    // Not "granted minus revoked": the same key can be granted, revoked and
+    // granted again, and a set difference answers that nobody holds it. The
+    // partition is every field of the key the wrapper hashes an `acl` envelope
+    // under, so two roles for one account stay apart.
+    let sql = roles_sql(Engine::Postgres, REGISTRY, 99);
+    assert!(sql.contains(
+        "PARTITION BY \"checksumHash\", account, role \
+         ORDER BY block_num DESC, log_idx DESC"
+    ));
+    assert!(sql.contains("WHERE rn = 1 AND granted"));
+
+    // Every event the query is sent with has an arm, or the ordering has
+    // nothing to order against. Read off ROLE_EVENTS rather than spelled again,
+    // so a fourth signature cannot be added without one.
+    for named in ROLE_EVENTS {
+        let event = named.split('(').next().expect("a signature has a name");
+        assert!(sql.contains(&format!("FROM {event} ")), "no {event} arm");
+    }
+}
+
+#[test]
+fn the_roles_query_needs_no_seed_for_the_creators_admin() {
+    // The old wrapper wrote `member` directly in addRegistry and announced the creator's
+    // admin only in RegistryAdded, so the fold needed that event as a third arm. A registry
+    // announces it as an ordinary RoleGranted at deployment, so two arms answer in full.
+    let sql = roles_sql(Engine::Postgres, REGISTRY, 99);
+    assert!(!sql.contains("RegistryAdded"), "{sql}");
+    assert_eq!(ROLE_EVENTS.len(), 2, "{ROLE_EVENTS:?}");
+}
+
+#[test]
+fn the_roles_query_is_scoped_to_one_deployment() {
+    // tidx's generated CTEs filter on topic0 alone — the wrapper is a
+    // deployment, not a genesis address, so any contract emitting the same
+    // event answers too unless the query says which one. Bounded in the same
+    // breath, since both predicates ride the pushdown together.
+    let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
+    let bound = "AND block_num <= 7";
+    assert!(roles_sql(Engine::Postgres, REGISTRY, 7)
+        .contains(&format!("address = '\\x{hexed}' {bound}")));
+    assert!(roles_sql(Engine::ClickHouse, REGISTRY, 7)
+        .contains(&format!("address = '0x{hexed}' {bound}")));
 }
 
 #[test]

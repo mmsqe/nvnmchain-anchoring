@@ -34,7 +34,8 @@ fixtures:
 	  '{source: $$repo, commit: $$commit, note: "Regenerate with: make fixtures", \
 	    events: ([.[] | .abi[] | select(.type == "event")] \
 	             | map({name, inputs: [.inputs[] | {type}]}) | sort_by(.name))}' \
-	  $(CONTRACTS_WORK)/out/AnchoringRegistry.sol/AnchoringRegistry.json \
+	  $(CONTRACTS_WORK)/out/Registry.sol/Registry.json \
+	  $(CONTRACTS_WORK)/out/RegistryFactory.sol/RegistryFactory.json \
 	  $(CONTRACTS_WORK)/out/IAnchoring.sol/IAnchoring.json \
 	  > $(FIXTURE)
 	@echo "wrote $(FIXTURE) (nvnmchain-contracts $$(git -C $(CONTRACTS_WORK) rev-parse --short HEAD))"

@@ -98,14 +98,43 @@ rather than closing it: a run reports when the index has not reached back to
 
 ## Status
 
-The decoder and the audit are in. The projection into registries, records,
-versions and roles, and the query API over it, are not.
+The decoder and the audit are in. The projection into records, versions and
+roles, and the query API over it, are not.
 
-Two of those four fold in SQL over tidx alone. `registries` and `records` do
-not: the wrapper's events are narrower than the envelopes they accompany, so
-three of `Registry`'s six fields and four of `Record`'s ten exist only in the
-anchored payload. Worth matching the `proto/nvnmchain/anchoring/v1` shapes so
-callers of the old node queries move over unchanged.
+Two of those three no longer need this crate at all. `roles` is written out —
+`registry::roles_sql`, one query a caller sends tidx directly, which this crate
+never runs — and `registries` is the factory's deployment event, read straight
+off the log with no envelope behind it. `records` and `versions` are what is
+left, and they do need the decoder: four of `Record`'s ten fields exist only in
+the anchored payload, and `metadata` is a dynamic `bytes` that tidx hands back
+as its ABI offset word. Worth matching the `proto/nvnmchain/anchoring/v1` shapes
+so callers of the old node queries move over unchanged.
+
+### `roles`, over `?signature=`
+
+`RoleGranted` and `RoleRevoked` carry only `bytes32` outside the topics, so tidx
+decodes them where it cannot decode `Anchored`. The query orders the two against
+each other — newest row per `(checksumHash, account, role)` wins, kept if it
+granted — because revokes are not deletions and the same key can be granted,
+revoked and granted again.
+
+**Two signatures, not three.** A registry announces its creator's `admin` as an
+ordinary `RoleGranted` when the factory initializes it, so the grant/revoke pair
+answers in full. The wrapper needed a third — it wrote `member` directly in
+`addRegistry` and announced that admin only as a `RegistryAdded` — and the seed
+arm that supplied it went with the wrapper.
+
+It names the **address**, which is the whole partition: a registry is a
+deployment, tidx's generated CTEs filter on topic0 alone, and one contract per
+registry means that address selects exactly one registry's logs. The `topic1`
+narrowing this used to need is gone with the id it narrowed on — `topic1` is the
+role's scope now, not a registry id.
+
+That also retires the measurement this section used to carry (66 ms against
+2.4 ms over a synthetic 4M-log index): it compared an unscoped read of one
+wrapper's logs against a topic1-narrowed one, and neither shape exists any more.
+A registry's logs are only its own, so the address predicate is the narrowing.
+No replacement figure is quoted here because none has been taken.
 
 ## Tests
 
