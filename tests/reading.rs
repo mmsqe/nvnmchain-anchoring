@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{bytes, REGISTRY_KEY, TAGGED_REGISTRY_COMMITMENT, TAGGED_REGISTRY_METADATA};
+use common::{bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA};
 use nvnmchain_anchoring::eth::{checksum_address, keccak_hex};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
 use nvnmchain_anchoring::tidx::{heads_sql, parse_coverage, parse_heads, Engine, Table};
@@ -42,8 +42,8 @@ fn a_log_row_becomes_a_head() {
         "columns": ["namespace", "key", "data"],
         "rows": [[
             topic(&NAMESPACE.to_lowercase()),
-            REGISTRY_KEY,
-            anchored_data(TAGGED_REGISTRY_COMMITMENT, TAGGED_REGISTRY_METADATA),
+            RECORD_KEY,
+            anchored_data(RECORD_COMMITMENT, RECORD_METADATA),
         ]],
         "row_count": 1,
     })))
@@ -52,9 +52,9 @@ fn a_log_row_becomes_a_head() {
     assert_eq!(heads.len(), 1);
     // Checksummed on the way in, whatever case the index returned.
     assert_eq!(heads[0].namespace, NAMESPACE);
-    assert_eq!(heads[0].key, REGISTRY_KEY);
-    assert_eq!(heads[0].commitment, TAGGED_REGISTRY_COMMITMENT);
-    assert_eq!(heads[0].metadata, bytes(TAGGED_REGISTRY_METADATA));
+    assert_eq!(heads[0].key, RECORD_KEY);
+    assert_eq!(heads[0].commitment, RECORD_COMMITMENT);
+    assert_eq!(heads[0].metadata, bytes(RECORD_METADATA));
 }
 
 #[test]
@@ -66,10 +66,10 @@ fn a_row_whose_payload_does_not_decode_is_an_error() {
     let corrupt = parse_heads(&table(json!({
         "ok": true,
         "columns": ["namespace", "key", "data"],
-        "rows": [[topic(NAMESPACE), REGISTRY_KEY, "0x00"]],
+        "rows": [[topic(NAMESPACE), RECORD_KEY, "0x00"]],
     })));
     assert!(corrupt.is_err());
-    assert!(corrupt.unwrap_err().to_string().contains(REGISTRY_KEY));
+    assert!(corrupt.unwrap_err().to_string().contains(RECORD_KEY));
 }
 
 #[test]
@@ -89,7 +89,7 @@ fn a_column_the_query_did_not_return_is_an_error() {
     let short = parse_heads(&table(json!({
         "ok": true,
         "columns": ["namespace", "key"],
-        "rows": [[topic(NAMESPACE), REGISTRY_KEY]],
+        "rows": [[topic(NAMESPACE), RECORD_KEY]],
     })));
     assert!(short.is_err());
     assert!(short.unwrap_err().to_string().contains("data"));

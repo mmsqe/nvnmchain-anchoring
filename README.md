@@ -60,15 +60,16 @@ the contiguous marker below it.
 
 ## Envelopes
 
-`AnchoringRegistry` anchors in two formats — a bare `abi.encode`, and a newer
-one leading with a `bytes32` kind (`registry`, `record`, `status`, `acl`). Only
-the tagged form has ever been emitted; the untagged reading stays dead until a
-build predating the kind tags ships.
+A registry anchors two kinds, each leading with a `bytes32` tag: `record` and
+`status`. One word identifies the shape, and the ids inside must then reproduce
+the key the payload was anchored under, `keccak256(abi.encode(kind, ids…))` —
+which catches a schema that has drifted from the contract, and binds the payload
+to its key. Anything else reads as JSON, then text, then opaque.
 
-Either way the ids must reproduce the key the payload was anchored under,
-`keccak256(abi.encode(kind, ids…))` — the only thing identifying an untagged
-shape, and still a check that a tagged one has not drifted from the contract.
-Anything else reads as JSON, then text, then opaque.
+No registry id in any key: a registry is a deployment, so the address a payload
+was anchored under is the registry. A payload only means something with its
+namespace beside it — the same commitment under two registries is two different
+records.
 
 ## `audit`
 

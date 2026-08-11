@@ -1,174 +1,121 @@
-//! Reading `AnchoringRegistry` envelopes out of anchored metadata.
+//! Reading a `Registry` payload out of anchored metadata.
 //!
-//! The payloads below are what `AnchoringRegistry.sol` actually emits, dumped
-//! from a forge run against the shipped contracts rather than re-encoded here;
-//! a decoder checked against its own guess proves nothing. `tempo-e2e`'s
-//! `test_anchoring_registry.py` decodes the same record shape from a live node.
-
-use nvnmchain_anchoring::envelope::{decode_envelope, is_self_verifying, read_payload, Payload};
-use nvnmchain_anchoring::eth::keccak_hex;
-use nvnmchain_anchoring::precompile::{ANCHORED_SIGNATURE, ANCHORED_TOPIC};
+//! Every envelope leads with a `bytes32` kind, so one word identifies the shape; the ids
+//! inside must then reproduce the key it was anchored under, which catches a schema that has
+//! drifted from the contract and binds the payload to its key. Payloads are dumped from a
+//! forge run against the shipped contract — re-encoding them here would only check the
+//! decoder against its own guess.
 
 mod common;
-use common::*;
 
-#[test]
-fn anchored_topic_matches_the_signature() {
-    assert_eq!(keccak_hex(ANCHORED_SIGNATURE.as_bytes()), ANCHORED_TOPIC);
-}
+use common::{
+    bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_COMMITMENT, STATUS_KEY,
+    STATUS_METADATA,
+};
+use nvnmchain_anchoring::envelope::{decode_envelope, is_self_verifying, read_payload, Payload};
 
-#[test]
-fn registry_envelope_decodes() {
-    let env = decode_envelope(REGISTRY_KEY, &bytes(UNTAGGED_REGISTRY_METADATA))
-        .expect("registry envelope");
-    assert_eq!(env.kind, "registry");
-    assert_eq!(env.field("id"), "1");
-    assert_eq!(env.field("name"), "Docs");
-    assert_eq!(env.field("description"), "internal docs");
-    assert_eq!(
-        env.field("creator"),
-        "0x2190d584E30F4a2396C1487Aa784428f2068CBE8"
-    );
-    assert_eq!(env.summary(), "Registry #1 — Docs");
+fn decoded(key: &str, metadata: &str) -> nvnmchain_anchoring::envelope::Envelope {
+    decode_envelope(key, &bytes(metadata)).expect("decodes as an envelope")
 }
 
 #[test]
 fn record_envelope_decodes() {
-    let env =
-        decode_envelope(RECORD_KEY, &bytes(UNTAGGED_RECORD_METADATA)).expect("record envelope");
+    let env = decoded(RECORD_KEY, RECORD_METADATA);
     assert_eq!(env.kind, "record");
+    assert_eq!(env.field("record_id"), "1");
+    assert_eq!(env.field("index"), "1");
     assert_eq!(env.field("uri"), "ipfs://cid");
     assert_eq!(env.field("checksum"), "0xabc");
     assert_eq!(env.field("checksum_algo"), "sha256");
-    assert_eq!(env.summary(), "Record #1 v1 — 0xabc");
+    assert_eq!(env.field("metadata"), "{}");
+    assert!(env.field("timestamp").parse::<u128>().is_ok());
 }
 
 #[test]
 fn status_envelope_decodes() {
-    let env =
-        decode_envelope(STATUS_KEY, &bytes(UNTAGGED_STATUS_METADATA)).expect("status envelope");
+    let env = decoded(STATUS_KEY, STATUS_METADATA);
     assert_eq!(env.kind, "status");
+    assert_eq!(env.field("record_id"), "1");
+    assert_eq!(env.field("index"), "1");
     assert_eq!(env.field("status"), "approved");
-    // The sequence number is what makes re-asserting the same status a fresh anchor.
     assert_eq!(env.field("seq"), "1");
 }
 
 #[test]
 fn envelopes_are_identified_by_the_key_they_are_anchored_under() {
-    // The payloads carry nothing naming their shape; the key does, and each is
-    // keccak256(abi.encode(kind, ids…)) over ids the payload itself repeats.
-    assert!(decode_envelope(RECORD_KEY, &bytes(UNTAGGED_REGISTRY_METADATA)).is_none());
-    let wrong = format!("0x{}", "11".repeat(32));
-    assert!(decode_envelope(&wrong, &bytes(UNTAGGED_STATUS_METADATA)).is_none());
+    // The kind word says what shape to try; the key derivation says the ids inside are the
+    // ones it was actually anchored under. A record payload under a status key is neither.
+    assert!(decode_envelope(STATUS_KEY, &bytes(RECORD_METADATA)).is_none());
+    assert!(decode_envelope(RECORD_KEY, &bytes(STATUS_METADATA)).is_none());
+}
+
+#[test]
+fn a_payload_under_the_wrong_key_is_refused() {
+    // Same shape, same kind, a key from another record: the ids no longer reproduce it.
+    let elsewhere = format!("0x{}", "5c".repeat(32));
+    assert!(decode_envelope(&elsewhere, &bytes(RECORD_METADATA)).is_none());
+}
+
+#[test]
+fn a_registry_id_is_no_longer_part_of_any_key() {
+    // recordKey(record_id) — one id, not two. Were the old two-id derivation still in use,
+    // the shipped payload could not reproduce the key the contract anchored it under, and
+    // the test above would be the one failing.
+    let env = decoded(RECORD_KEY, RECORD_METADATA);
+    assert!(
+        env.fields.iter().all(|(name, _)| *name != "registry_id"),
+        "the registry is the address it was anchored under, not a field: {:?}",
+        env.fields
+    );
 }
 
 #[test]
 fn foreign_payloads_are_not_envelopes() {
-    for payload in [
-        "0x",
-        "0xdeadbeef",
-        &format!("0x{}", "ab".repeat(64)),
-        &format!("0x{}", "00".repeat(32 * 6)),
-    ] {
+    // Anything may be anchored, so a payload that is not ours reads as something else
+    // rather than being forced into a schema.
+    for metadata in ["0x", "0x00", &format!("0x{}", "ab".repeat(64))] {
         assert!(
-            decode_envelope(REGISTRY_KEY, &bytes(payload)).is_none(),
-            "payload {payload} should not decode as an envelope"
+            decode_envelope(RECORD_KEY, &bytes(metadata)).is_none(),
+            "{metadata}"
         );
     }
 }
 
 #[test]
 fn anchor_and_hash_payloads_are_self_verifying() {
-    // Every registry write goes through anchorAndHash, so the event commits to
-    // the digest of its own metadata.
+    // The precompile's own guarantee: anchorAndHash commits to the digest of its metadata,
+    // which holds whatever the payload turns out to mean.
     assert!(is_self_verifying(
-        UNTAGGED_REGISTRY_COMMITMENT,
-        &bytes(UNTAGGED_REGISTRY_METADATA)
+        RECORD_COMMITMENT,
+        &bytes(RECORD_METADATA)
     ));
     assert!(is_self_verifying(
-        UNTAGGED_RECORD_COMMITMENT,
-        &bytes(UNTAGGED_RECORD_METADATA)
-    ));
-    assert!(is_self_verifying(
-        UNTAGGED_STATUS_COMMITMENT,
-        &bytes(UNTAGGED_STATUS_METADATA)
+        STATUS_COMMITMENT,
+        &bytes(STATUS_METADATA)
     ));
     assert!(!is_self_verifying(
-        UNTAGGED_REGISTRY_COMMITMENT,
-        &bytes(UNTAGGED_RECORD_METADATA)
+        STATUS_COMMITMENT,
+        &bytes(RECORD_METADATA)
     ));
 }
 
 #[test]
 fn payloads_that_are_not_envelopes_still_read() {
-    // What tempo-e2e anchors from a plain EOA: self-describing JSON, under a
-    // key derived by the application rather than by AnchoringRegistry.
-    let key = format!("0x{}", "77".repeat(32));
-    let json = br#"{"v":1,"kind":"content","data":{"uri":"ipfs://QmX"}}"#;
-    match read_payload(&key, json) {
-        Payload::Json(value) => assert_eq!(value["kind"], "content"),
-        other => panic!("expected json, got {other:?}"),
-    }
-    match read_payload(&key, b"plain note") {
-        Payload::Text(text) => assert_eq!(text, "plain note"),
-        other => panic!("expected text, got {other:?}"),
-    }
+    // A plain EOA anchors whatever it likes; the reading degrades rather than failing.
+    let key = format!("0x{}", "11".repeat(32));
     assert!(matches!(
-        read_payload(&key, &[0xff, 0xfe, 0x00]),
-        Payload::Opaque
+        read_payload(&key, br#"{"v":1}"#),
+        Payload::Json(_)
     ));
-    // ...and a registry envelope still wins over the weaker readings.
+    assert!(matches!(read_payload(&key, b"hello"), Payload::Text(_)));
+    assert!(matches!(read_payload(&key, &[0xff, 0xfe]), Payload::Opaque));
+}
+
+#[test]
+fn a_registry_payload_reads_as_an_envelope() {
+    // ...and one that is ours takes the Envelope arm ahead of the fallbacks.
     assert!(matches!(
-        read_payload(REGISTRY_KEY, &bytes(UNTAGGED_REGISTRY_METADATA)),
+        read_payload(RECORD_KEY, &bytes(RECORD_METADATA)),
         Payload::Envelope(_)
     ));
-}
-
-// ---------------------------------------------------------------------------
-// The tagged format the contracts are moving to
-// ---------------------------------------------------------------------------
-
-#[test]
-fn tagged_envelopes_decode() {
-    // A registry is an upgradeable proxy, so one namespace emits both formats
-    // across an upgrade and the indexer has to read either.
-    let env = decode_envelope(REGISTRY_KEY, &bytes(TAGGED_REGISTRY_METADATA)).expect("registry");
-    assert_eq!((env.kind, env.tagged), ("registry", true));
-    assert_eq!(env.field("name"), "Docs");
-    assert_eq!(env.summary(), "Registry #1 — Docs");
-
-    let env = decode_envelope(RECORD_KEY, &bytes(TAGGED_RECORD_METADATA)).expect("record");
-    assert_eq!((env.kind, env.tagged), ("record", true));
-    assert_eq!(env.field("uri"), "ipfs://cid");
-
-    let env = decode_envelope(STATUS_KEY, &bytes(TAGGED_STATUS_METADATA)).expect("status");
-    assert_eq!((env.kind, env.tagged), ("status", true));
-    assert_eq!(env.field("status"), "approved");
-
-    // ...and the untagged ones still read, under the same keys.
-    let env = decode_envelope(REGISTRY_KEY, &bytes(UNTAGGED_REGISTRY_METADATA)).expect("untagged");
-    assert_eq!((env.kind, env.tagged), ("registry", false));
-}
-
-#[test]
-fn acl_envelopes_decode_and_have_no_untagged_form() {
-    // Grants and revokes are anchored only in the tagged format — before it,
-    // role history was not in the log at all.
-    let env = decode_envelope(ACL_KEY, &bytes(ACL_METADATA)).expect("acl envelope");
-    assert_eq!((env.kind, env.tagged), ("acl", true));
-    assert_eq!(env.field("registry_id"), "1");
-    assert_eq!(env.field("account"), ACL_ACCOUNT);
-    // bytes32 that is right-padded text reads as text, like Solidity wrote it.
-    assert_eq!(env.field("role"), "editor");
-    assert_eq!(env.field("granted"), "true");
-    assert!(env.summary().contains("granted to"));
-    assert!(is_self_verifying(ACL_COMMITMENT, &bytes(ACL_METADATA)));
-}
-
-#[test]
-fn a_tagged_payload_under_the_wrong_key_is_still_refused() {
-    // The tag says what it is; the key still has to agree, so a stale schema
-    // cannot quietly read one shape as another.
-    assert!(decode_envelope(RECORD_KEY, &bytes(TAGGED_REGISTRY_METADATA)).is_none());
-    assert!(decode_envelope(REGISTRY_KEY, &bytes(ACL_METADATA)).is_none());
 }

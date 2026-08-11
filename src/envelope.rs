@@ -1,23 +1,25 @@
-//! Reading `AnchoringRegistry` payloads out of anchored metadata.
+//! Reading a `Registry` payload out of anchored metadata.
 
-use crate::eth::{checksum_address, hex0x, keccak_hex, normalize_hex, word_to_u128, word_to_usize};
+use crate::eth::{hex0x, keccak_hex, normalize_hex, word_to_u128, word_to_usize};
 
-// `AnchoringRegistry` anchors in two formats — a bare `abi.encode`, and a newer
-// one leading with a `bytes32` kind. Only the tagged form has ever been
-// emitted; the untagged reading matters only if a build predating the kind
-// tags ships.
+// Every envelope leads with a `bytes32` kind, so one word identifies the shape.
+// The ids in the payload must then reproduce the key it was anchored under,
+// `keccak256(abi.encode(kind, ids…))` — which catches a schema that has drifted
+// from the contract, and binds the payload to the key rather than letting one
+// from elsewhere read as an envelope.
 //
-// Either way the ids in the payload have to reproduce the key it was anchored
-// under, `keccak256(abi.encode(kind, ids…))`. For untagged payloads that is the
-// only thing identifying the shape; for tagged ones it still catches a schema
-// that has drifted from the contract.
+// There was an untagged format once, identified by that key derivation alone.
+// It never shipped: one contract per registry is a fresh deployment, so no
+// build predating the kind tags can ever have emitted one.
+//
+// No registryId in any key. The registry is the address the envelope was
+// anchored under, so a payload only means something with its namespace beside
+// it — the same commitment under two registries is two different records.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Ty {
     Uint,
-    Address,
     Bytes32,
-    Bool,
     Str,
 }
 
@@ -25,35 +27,23 @@ struct Schema {
     kind: &'static str,
     fields: &'static [(&'static str, Ty)],
     /// Field positions of the ids that make up the anchored key, in the order
-    /// `AnchoringRegistry` hashes them.
+    /// the contract hashes them.
     key_ids: &'static [usize],
-    /// Whether the shape exists in the untagged format. `acl` arrived with the
-    /// tag, so there is no untagged reading of it to attempt.
-    untagged: bool,
 }
 
-/// Each schema is one `abi.encode` call in `AnchoringRegistry.sol`, paired with
-/// the `*Key()` helper naming the slot it is anchored at.
+/// Each schema is one `abi.encode` call in `Registry.sol`, paired with the
+/// `*Key()` helper naming the slot it is anchored at.
+///
+/// Two kinds, not four. `registry` went with the wrapper: name, description and
+/// metadata ride in the factory's deployment event now, descriptive and set
+/// once, so there is nothing to prove and no envelope to decode. `acl` went with
+/// the anchoring of role changes: membership is the registry's own state and its
+/// history is its own events, which carry every field.
 const SCHEMAS: &[Schema] = &[
     Schema {
-        // addRegistry → registryKey(id)
-        kind: "registry",
-        fields: &[
-            ("id", Ty::Uint),
-            ("name", Ty::Str),
-            ("description", Ty::Str),
-            ("metadata", Ty::Str),
-            ("creator", Ty::Address),
-            ("timestamp", Ty::Uint),
-        ],
-        key_ids: &[0],
-        untagged: true,
-    },
-    Schema {
-        // addRecord → recordKey(registry_id, record_id)
+        // addRecord → recordKey(record_id)
         kind: "record",
         fields: &[
-            ("registry_id", Ty::Uint),
             ("record_id", Ty::Uint),
             ("index", Ty::Uint),
             ("uri", Ty::Str),
@@ -62,43 +52,25 @@ const SCHEMAS: &[Schema] = &[
             ("metadata", Ty::Str),
             ("timestamp", Ty::Uint),
         ],
-        key_ids: &[0, 1],
-        untagged: true,
+        key_ids: &[0],
     },
     Schema {
-        // updateRecordStatus → statusKey(registry_id, record_id, index)
+        // updateRecordStatus → statusKey(record_id, index)
         kind: "status",
         fields: &[
-            ("registry_id", Ty::Uint),
             ("record_id", Ty::Uint),
             ("index", Ty::Uint),
             ("status", Ty::Str),
             ("seq", Ty::Uint),
         ],
-        key_ids: &[0, 1, 2],
-        untagged: true,
-    },
-    Schema {
-        // grantRole / revokeRole → aclKey(registry_id, checksum_hash, account, role)
-        kind: "acl",
-        fields: &[
-            ("registry_id", Ty::Uint),
-            ("checksum_hash", Ty::Bytes32),
-            ("account", Ty::Address),
-            ("role", Ty::Bytes32),
-            ("granted", Ty::Bool),
-        ],
-        key_ids: &[0, 1, 2, 3],
-        untagged: false,
+        key_ids: &[0, 1],
     },
 ];
 
 #[derive(Debug, Clone)]
 pub struct Envelope {
-    /// `registry`, `record`, `status` or `acl`.
+    /// `record` or `status`.
     pub kind: &'static str,
-    /// Whether the payload led with its kind, or had to be identified by key.
-    pub tagged: bool,
     pub fields: Vec<(&'static str, String)>,
 }
 
@@ -113,7 +85,6 @@ impl Envelope {
     /// One-line description, for listings.
     pub fn summary(&self) -> String {
         match self.kind {
-            "registry" => format!("Registry #{} — {}", self.field("id"), self.field("name")),
             "record" => format!(
                 "Record #{} v{} — {}",
                 self.field("record_id"),
@@ -126,16 +97,6 @@ impl Envelope {
                 self.field("index"),
                 self.field("status")
             ),
-            "acl" => format!(
-                "Role {} {} {}",
-                self.field("role"),
-                if self.field("granted") == "true" {
-                    "granted to"
-                } else {
-                    "revoked from"
-                },
-                self.field("account")
-            ),
             other => other.to_string(),
         }
     }
@@ -144,7 +105,7 @@ impl Envelope {
 /// How a payload reads, in descending order of confidence.
 #[derive(Debug, Clone)]
 pub enum Payload {
-    /// An `AnchoringRegistry` envelope, identified by the key it is under.
+    /// A `Registry` envelope, identified by the key it is under.
     Envelope(Envelope),
     /// Self-describing text — what plain EOA anchors carry in practice.
     Json(serde_json::Value),
@@ -174,54 +135,36 @@ pub fn read_payload(key: &str, metadata: &[u8]) -> Payload {
     Payload::Opaque
 }
 
-/// Decode the `AnchoringRegistry` envelope anchored at `key`, or `None` when
+/// Decode the `Registry` envelope anchored at `key`, or `None` when
 /// `metadata` is not one.
 pub fn decode_envelope(key: &str, metadata: &[u8]) -> Option<Envelope> {
     let key = normalize_hex(key);
-    for schema in SCHEMAS {
-        // Tagged first: the leading kind rejects a wrong shape on one word,
-        // where the untagged reading has to decode the whole payload to fail.
-        for tagged in [true, false] {
-            if !tagged && !schema.untagged {
-                continue;
-            }
-            if let Some(envelope) = decode_as(schema, metadata, tagged, &key) {
-                return Some(envelope);
-            }
-        }
-    }
-    None
+    SCHEMAS
+        .iter()
+        .find_map(|schema| decode_as(schema, metadata, &key))
 }
 
 /// One attempt, kept only if the ids reproduce the anchored key.
-fn decode_as(
-    schema: &'static Schema,
-    metadata: &[u8],
-    tagged: bool,
-    key: &str,
-) -> Option<Envelope> {
+fn decode_as(schema: &'static Schema, metadata: &[u8], key: &str) -> Option<Envelope> {
     let mut layout: Vec<(&'static str, Ty)> = Vec::with_capacity(schema.fields.len() + 1);
-    if tagged {
-        layout.push(("kind", Ty::Bytes32));
-    }
+    layout.push(("kind", Ty::Bytes32));
     layout.extend_from_slice(schema.fields);
 
     let (values, words) = decode_strict(&layout, metadata)?;
-    let shift = usize::from(tagged);
-    if tagged && bytes32_label(&words[0]) != schema.kind {
+    // The leading kind rejects a wrong shape on one word, before the key is derived.
+    if bytes32_label(&words[0]) != schema.kind {
         return None;
     }
-    let ids: Vec<[u8; 32]> = schema.key_ids.iter().map(|i| words[*i + shift]).collect();
+    let ids: Vec<[u8; 32]> = schema.key_ids.iter().map(|i| words[*i + 1]).collect();
     if derive_key(schema.kind, &ids) != key {
         return None;
     }
     Some(Envelope {
         kind: schema.kind,
-        tagged,
         fields: schema
             .fields
             .iter()
-            .zip(values.into_iter().skip(shift))
+            .zip(values.into_iter().skip(1))
             .map(|((name, _), value)| (*name, value))
             .collect(),
     })
@@ -279,21 +222,6 @@ fn decode_strict(fields: &[(&str, Ty)], data: &[u8]) -> Option<(Vec<String>, Vec
         match ty {
             Ty::Uint => values.push(word_to_u128(&word)?.to_string()),
             Ty::Bytes32 => values.push(bytes32_label(&word)),
-            Ty::Bool => match word[31] {
-                // Solidity writes a bool as a full zero/one word; anything else
-                // is not the field we think it is.
-                b @ (0 | 1) if word[..31].iter().all(|x| *x == 0) => {
-                    values.push((b == 1).to_string())
-                }
-                _ => return None,
-            },
-            Ty::Address => {
-                // The 12 high bytes of an ABI-encoded address are zero.
-                if word[..12].iter().any(|b| *b != 0) {
-                    return None;
-                }
-                values.push(checksum_address(&hex::encode(&word[12..])));
-            }
             Ty::Str => {
                 if word_to_usize(&word)? != tail {
                     return None;
