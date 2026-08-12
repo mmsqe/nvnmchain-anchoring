@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
 
     let cfg = Settings::from_env()?;
     let rpc = Rpc::new(&cfg.rpc_url)?;
-    let tidx = Tidx::new(&cfg.tidx_url, cfg.chain_id, cfg.engine)?;
+    let tidx = Tidx::with_page(&cfg.tidx_url, cfg.chain_id, cfg.engine, cfg.page_size)?;
 
     info!(
         "rpc={} tidx={} chain={} engine={}",
