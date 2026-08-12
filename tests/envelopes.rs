@@ -22,7 +22,10 @@ fn decoded(key: &str, metadata: &str) -> nvnmchain_anchoring::envelope::Envelope
 fn record_envelope_decodes() {
     let env = decoded(RECORD_KEY, RECORD_METADATA);
     assert_eq!(env.kind, "record");
-    assert_eq!(env.field("record_id"), "1");
+    assert_eq!(
+        env.field("checksum_hash"),
+        "0x851bb152e67e6c958ab7da1431fcaed09ce0efc598885f69a750b3b4b81fc1dc"
+    );
     assert_eq!(env.field("index"), "1");
     assert_eq!(env.field("uri"), "ipfs://cid");
     assert_eq!(env.field("checksum"), "0xabc");
@@ -35,7 +38,10 @@ fn record_envelope_decodes() {
 fn status_envelope_decodes() {
     let env = decoded(STATUS_KEY, STATUS_METADATA);
     assert_eq!(env.kind, "status");
-    assert_eq!(env.field("record_id"), "1");
+    assert_eq!(
+        env.field("checksum_hash"),
+        "0x851bb152e67e6c958ab7da1431fcaed09ce0efc598885f69a750b3b4b81fc1dc"
+    );
     assert_eq!(env.field("index"), "1");
     assert_eq!(env.field("status"), "approved");
     assert_eq!(env.field("seq"), "1");
@@ -58,7 +64,7 @@ fn a_payload_under_the_wrong_key_is_refused() {
 
 #[test]
 fn a_registry_id_is_no_longer_part_of_any_key() {
-    // recordKey(record_id) — one id, not two. Were the old two-id derivation still in use,
+    // recordKey(checksum_hash) — one id, not two. Were the old two-id derivation still in use,
     // the shipped payload could not reproduce the key the contract anchored it under, and
     // the test above would be the one failing.
     let env = decoded(RECORD_KEY, RECORD_METADATA);

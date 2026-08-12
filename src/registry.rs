@@ -21,12 +21,12 @@ use crate::tidx::Engine;
 /// and decodes empty rather than failing.
 pub const REGISTRY_TOPICS: &[(&str, &str)] = &[
     (
-        "0x5fea036c56a9fe203110015d4d45fde7ec91f39e84507f4ffd536c61ed0b27ea",
-        "RecordAdded(uint256,uint256,string)",
+        "0xb4aaf705a3bf1baf4b094ef32b3517c8df84a8766f0d751a0c85aa41b63be45c",
+        "RecordAdded(bytes32,uint256,string)",
     ),
     (
-        "0x3a95bced669bc2f225a75f44a7f9e4e43bf64f0b7e31b27aa93aee661eec3a9a",
-        "RecordStatusUpdated(uint256,uint256,string)",
+        "0x7735f518b96096d1410ef5122b09bdb190e8d94e93e6896cbeff28f034ea883c",
+        "RecordStatusUpdated(bytes32,uint256,string)",
     ),
     (
         "0xd61bf855a7ed7c857a0c46025807cab964fad9226a03392763af3e0c57ea4ae2",

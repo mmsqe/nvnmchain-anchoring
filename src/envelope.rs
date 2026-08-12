@@ -19,7 +19,11 @@ use crate::eth::{hex0x, keccak_hex, normalize_hex, word_to_u128, word_to_usize};
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Ty {
     Uint,
+    /// A right-padded label ("record", "admin") if it reads as one, hex otherwise.
     Bytes32,
+    /// Always hex: a keccak hash is never a label, and does not fit the `u128`
+    /// [`Ty::Uint`] parses through -- reading one that way fails the decode.
+    Hash,
     Str,
 }
 
@@ -41,10 +45,10 @@ struct Schema {
 /// history is its own events, which carry every field.
 const SCHEMAS: &[Schema] = &[
     Schema {
-        // addRecord → recordKey(record_id)
+        // addRecord → recordKey(checksum_hash)
         kind: "record",
         fields: &[
-            ("record_id", Ty::Uint),
+            ("checksum_hash", Ty::Hash),
             ("index", Ty::Uint),
             ("uri", Ty::Str),
             ("checksum", Ty::Str),
@@ -55,10 +59,10 @@ const SCHEMAS: &[Schema] = &[
         key_ids: &[0],
     },
     Schema {
-        // updateRecordStatus → statusKey(record_id, index)
+        // updateRecordStatus → statusKey(checksum_hash, index)
         kind: "status",
         fields: &[
-            ("record_id", Ty::Uint),
+            ("checksum_hash", Ty::Hash),
             ("index", Ty::Uint),
             ("status", Ty::Str),
             ("seq", Ty::Uint),
@@ -80,25 +84,6 @@ impl Envelope {
             .iter()
             .find(|(n, _)| *n == name)
             .map_or("", |(_, v)| v.as_str())
-    }
-
-    /// One-line description, for listings.
-    pub fn summary(&self) -> String {
-        match self.kind {
-            "record" => format!(
-                "Record #{} v{} — {}",
-                self.field("record_id"),
-                self.field("index"),
-                self.field("checksum")
-            ),
-            "status" => format!(
-                "Status of record #{} v{} — {}",
-                self.field("record_id"),
-                self.field("index"),
-                self.field("status")
-            ),
-            other => other.to_string(),
-        }
     }
 }
 
@@ -222,6 +207,7 @@ fn decode_strict(fields: &[(&str, Ty)], data: &[u8]) -> Option<(Vec<String>, Vec
         match ty {
             Ty::Uint => values.push(word_to_u128(&word)?.to_string()),
             Ty::Bytes32 => values.push(bytes32_label(&word)),
+            Ty::Hash => values.push(hex0x(&word)),
             Ty::Str => {
                 if word_to_usize(&word)? != tail {
                     return None;

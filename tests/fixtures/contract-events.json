@@ -1,6 +1,6 @@
 {
   "source": "git@github.com:NVNM-Chain/nvnmchain-contracts.git",
-  "commit": "9579bd947382ac204419e2233e374f752c108d02",
+  "commit": "f188164573b296299f780d63f12b145177961713",
   "note": "Regenerate with: make fixtures",
   "events": [
     {
@@ -75,7 +75,7 @@
       "name": "RecordAdded",
       "inputs": [
         {
-          "type": "uint256"
+          "type": "bytes32"
         },
         {
           "type": "uint256"
@@ -89,7 +89,7 @@
       "name": "RecordStatusUpdated",
       "inputs": [
         {
-          "type": "uint256"
+          "type": "bytes32"
         },
         {
           "type": "uint256"
