@@ -6,7 +6,7 @@ mod common;
 use common::{bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA};
 use nvnmchain_anchoring::eth::{checksum_address, keccak_hex};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
-use nvnmchain_anchoring::registry::{roles_sql, ROLE_EVENTS};
+use nvnmchain_anchoring::registry::{record_ids_sql, roles_sql, RECORD_ADDED_TOPIC, ROLE_EVENTS};
 use nvnmchain_anchoring::tidx::{heads_sql, parse_coverage, parse_heads, Engine, Table};
 use serde_json::json;
 
@@ -220,6 +220,52 @@ fn the_roles_query_needs_no_seed_for_the_creators_admin() {
     let sql = roles_sql(Engine::Postgres, REGISTRY, 99);
     assert!(!sql.contains("RegistryAdded"), "{sql}");
     assert_eq!(ROLE_EVENTS.len(), 2, "{ROLE_EVENTS:?}");
+}
+
+#[test]
+fn record_numbering_counts_records_and_not_versions() {
+    // The whole reason for the inner window. Numbering the rows themselves would
+    // give every version its own id, so re-anchoring an early record would
+    // renumber it and shift every record after it.
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99);
+    assert!(
+        sql.contains("ROW_NUMBER() OVER (PARTITION BY topic1 ORDER BY block_num, log_idx) AS rn")
+    );
+    assert!(sql.contains("WHERE rn = 1"));
+    assert!(sql.contains("ROW_NUMBER() OVER (ORDER BY block_num, log_idx) AS record_id"));
+
+    // Ascending in both, where the head queries are descending: this one wants
+    // the oldest row per key, not the newest.
+    assert!(!sql.contains("DESC"), "{sql}");
+}
+
+#[test]
+fn record_numbering_reads_topics_and_not_the_data_section() {
+    // Why it can fold at all where a whole records projection cannot: the
+    // checksum hash is indexed, so the query never meets the dynamic argument
+    // tidx would hand back as an ABI offset word.
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99);
+    assert!(sql.contains("topic1 AS checksum_hash"));
+    assert!(sql.contains("FROM logs "), "{sql}");
+    assert!(
+        !sql.contains("RecordAdded"),
+        "reads the base table, not a generated one"
+    );
+    assert!(!sql.contains("data"), "{sql}");
+}
+
+#[test]
+fn record_numbering_is_scoped_to_one_deployment_and_bounded() {
+    // The same trap as the roles query: tidx's tables filter on topic0 alone, so
+    // without the address any registry's records would be numbered together.
+    let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
+    let topic0 = RECORD_ADDED_TOPIC.trim_start_matches("0x");
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 7);
+    assert!(sql.contains(&format!("address = '\\x{hexed}'")));
+    assert!(sql.contains(&format!("selector = '\\x{topic0}'")));
+    assert!(sql.contains("AND block_num <= 7"));
+    assert!(record_ids_sql(Engine::ClickHouse, REGISTRY, 7).contains(&format!("'0x{hexed}'")));
+    assert!(!sql.contains("::bytea"));
 }
 
 #[test]

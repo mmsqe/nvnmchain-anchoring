@@ -4,15 +4,24 @@
 //! `hasRole`, and history is these events, which carry every field they need. A
 //! third copy in the anchored log would only be something to drift.
 //!
-//! `roles` folds in SQL over an index where records do not: every argument
-//! outside the topics is `bytes32`, which tidx decodes itself, where a dynamic
-//! one comes back as its ABI offset word ([`crate::tidx::heads_sql`] reads raw
-//! `data` for that reason).
+//! `roles` folds in SQL over an index because every argument outside the topics
+//! is `bytes32`, which tidx decodes itself; a dynamic one comes back as its ABI
+//! offset word ([`crate::tidx::heads_sql`] reads raw `data` for that reason).
 //!
-//! It is also the one query this crate does not run: [`roles_sql`] is what a
-//! caller sends tidx, and nothing here reads the answer.
+//! A whole records projection does not fold that far, but its *numbering* does.
+//! [`record_ids_sql`] is where the record id went when the contract stopped
+//! assigning one.
+//!
+//! Neither query is run here. Both are what a caller sends tidx, and nothing in
+//! this crate reads the answer.
 
 use crate::tidx::Engine;
+
+/// `RecordAdded`'s topic0, the selector [`record_ids_sql`] filters on. Named so
+/// the query and the [`REGISTRY_TOPICS`] row checked against the contract cannot
+/// come apart.
+pub const RECORD_ADDED_TOPIC: &str =
+    "0xb4aaf705a3bf1baf4b094ef32b3517c8df84a8766f0d751a0c85aa41b63be45c";
 
 /// `(topic0, signature)` for every event a registry emits, canonical form.
 /// `tests/signatures.rs` checks the hashes against these signatures and the
@@ -20,10 +29,7 @@ use crate::tidx::Engine;
 /// nothing — a signature that drifts builds its table off some other topic0
 /// and decodes empty rather than failing.
 pub const REGISTRY_TOPICS: &[(&str, &str)] = &[
-    (
-        "0xb4aaf705a3bf1baf4b094ef32b3517c8df84a8766f0d751a0c85aa41b63be45c",
-        "RecordAdded(bytes32,uint256,string)",
-    ),
+    (RECORD_ADDED_TOPIC, "RecordAdded(bytes32,uint256,string)"),
     (
         "0x7735f518b96096d1410ef5122b09bdb190e8d94e93e6896cbeff28f034ea883c",
         "RecordStatusUpdated(bytes32,uint256,string)",
@@ -88,5 +94,45 @@ pub fn roles_sql(engine: Engine, registry: &str, up_to: u64) -> String {
          ) held WHERE rn = 1 AND granted",
         granted = arm("RoleGranted", "TRUE"),
         revoked = arm("RoleRevoked", "FALSE"),
+    )
+}
+
+/// The record ids the contract stopped assigning: `RecordAdded` in first-anchor
+/// order, numbered from 1 within one registry — the whole of what `recordCount`
+/// and `recordIdByChecksum` did before a record became `keccak256(checksum)`.
+///
+/// Reads the base `logs` table rather than a generated one: the checksum hash is
+/// `topic1`, so numbering never touches the data section and needs no
+/// `?signature=`.
+///
+/// Two windows, not one. The inner keeps each checksum's *first* appearance, the
+/// outer numbers those; numbering the rows would give every version an id, so
+/// re-anchoring an early record would shift every record after it. Ascending,
+/// where [`crate::tidx::heads_sql`] is descending — that wants the newest row
+/// per key, this one the oldest.
+///
+/// Cost tracks the registry's own `RecordAdded` rows, not the chain. Measured on
+/// tidx's schema in PostgreSQL 16, index-backed with no sequential scan:
+///
+/// | query | rows scanned | rows out | time |
+/// |---|---|---|---|
+/// | this, 20k-record registry | 60k | 20k | 37ms |
+/// | this, 200k-record registry | 600k | 200k | 468ms |
+/// | `heads_sql`, for scale | 200k | 40k | 153ms |
+///
+/// A full recomputation, with no cheap single-record path — a number is a
+/// property of the whole ordering. Materialize it for a large registry rather
+/// than answering a page load with it.
+pub fn record_ids_sql(engine: Engine, registry: &str, up_to: u64) -> String {
+    format!(
+        "SELECT checksum_hash, ROW_NUMBER() OVER (ORDER BY block_num, log_idx) AS record_id \
+         FROM (\
+           SELECT topic1 AS checksum_hash, block_num, log_idx, \
+                  ROW_NUMBER() OVER (PARTITION BY topic1 \
+                                     ORDER BY block_num, log_idx) AS rn \
+           FROM logs WHERE address = {} AND selector = {} AND block_num <= {up_to}\
+         ) firsts WHERE rn = 1",
+        engine.bytes_literal(registry),
+        engine.bytes_literal(RECORD_ADDED_TOPIC),
     )
 }
