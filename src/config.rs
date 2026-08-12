@@ -4,7 +4,7 @@ use std::env;
 
 use anyhow::{Context, Result};
 
-use crate::tidx::Engine;
+use crate::tidx::{Engine, HARD_LIMIT};
 
 pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
 pub const DEFAULT_TIDX_URL: &str = "http://127.0.0.1:8080";
@@ -21,6 +21,9 @@ pub struct Settings {
     /// The precompile arrives at T10, so an index reaching this far back has
     /// seen every anchor there is.
     pub first_block: u64,
+    /// Rows per tidx round trip. Only worth setting below the default to make
+    /// the paging loop observable in a test.
+    pub page_size: usize,
 }
 
 impl Settings {
@@ -47,6 +50,10 @@ impl Settings {
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(0),
+            page_size: env::var("PAGE_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(HARD_LIMIT),
         })
     }
 }

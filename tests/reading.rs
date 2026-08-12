@@ -7,7 +7,10 @@ use common::{bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA};
 use nvnmchain_anchoring::eth::{checksum_address, keccak_hex};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
 use nvnmchain_anchoring::registry::{record_ids_sql, roles_sql, RECORD_ADDED_TOPIC, ROLE_EVENTS};
-use nvnmchain_anchoring::tidx::{heads_sql, parse_coverage, parse_heads, Engine, Table};
+use nvnmchain_anchoring::tidx::{
+    cursor_after, heads_sql, parse_coverage, parse_heads, reject_truncated, Engine, Table,
+    HARD_LIMIT, HEADS_KEY,
+};
 use serde_json::json;
 
 const NAMESPACE: &str = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E";
@@ -170,24 +173,25 @@ fn the_address_literal_is_spelled_for_its_engine() {
         format!("'0x{hexed}'")
     );
 
-    assert!(heads_sql(Engine::Postgres, 7).contains(&format!("'\\x{hexed}'")));
-    assert!(heads_sql(Engine::ClickHouse, 7).contains(&format!("'0x{hexed}'")));
+    assert!(heads_sql(Engine::Postgres, 7, "").contains(&format!("'\\x{hexed}'")));
+    assert!(heads_sql(Engine::ClickHouse, 7, "").contains(&format!("'0x{hexed}'")));
 
     // The topic goes through the same spelling — it is a bytea column too.
     let topic0 = ANCHORED_TOPIC.trim_start_matches("0x");
-    assert!(heads_sql(Engine::Postgres, 7).contains(&format!("'\\x{topic0}'")));
+    assert!(heads_sql(Engine::Postgres, 7, "").contains(&format!("'\\x{topic0}'")));
 
     // Uncast, everywhere: tidx's pushdown extractor reads a bare literal and
-    // not a cast expression.
+    // not a cast expression. `tempo-e2e` sends the same spelling to a running
+    // tidx, so this is the form with a live proof behind it.
     assert!(!roles_sql(Engine::Postgres, REGISTRY, 7).contains("::bytea"));
-    assert!(!heads_sql(Engine::Postgres, 7).contains("::bytea"));
+    assert!(!heads_sql(Engine::Postgres, 7, "").contains("::bytea"));
 }
 
 #[test]
 fn heads_are_bounded_at_the_audited_block() {
     // tidx's realtime sync runs ahead of its contiguous interval; a head newer
     // than the block state is read at would report as a false mismatch.
-    assert!(heads_sql(Engine::Postgres, 123).contains("block_num <= 123"));
+    assert!(heads_sql(Engine::Postgres, 123, "").contains("block_num <= 123"));
 }
 
 #[test]
@@ -296,4 +300,68 @@ fn head_slot_derivation_matches_the_node_suite() {
 
     assert_eq!(head_slot("0xnothex", &key), None);
     assert_eq!(head_slot(NAMESPACE, "0x1234"), None);
+}
+
+#[test]
+fn a_full_page_is_refused_because_it_may_be_short() {
+    // tidx truncates at its row cap and says nothing. A projection missing rows
+    // reads exactly like a complete one, and an audit over a truncated head list
+    // reports clean — so a full page is an error, not an answer.
+    let full = table(serde_json::json!({
+        "ok": true,
+        "columns": ["a"],
+        "rows": [[1], [2], [3]],
+    }));
+    assert!(
+        reject_truncated(full, 3).is_err(),
+        "a full page must not pass"
+    );
+
+    let short = table(serde_json::json!({
+        "ok": true,
+        "columns": ["a"],
+        "rows": [[1], [2]],
+    }));
+    assert!(
+        reject_truncated(short, 3).is_ok(),
+        "a short page is the answer"
+    );
+}
+
+#[test]
+fn the_row_cap_is_the_one_tidx_enforces() {
+    // Pinned against tidx's `HARD_LIMIT_MAX`. If they diverge, the check fires
+    // late or never — and never is a silent short answer.
+    assert_eq!(HARD_LIMIT, 10_000);
+}
+
+#[test]
+fn a_cursor_is_lexicographic_over_its_key_and_spelled_for_its_engine() {
+    // (a, b) > (x, y) written out, because not every engine takes a row-value
+    // comparison. Bytea literals go through the engine's spelling — carried
+    // between them, a predicate matches nothing rather than erroring.
+    let rows = table(serde_json::json!({
+        "ok": true,
+        "columns": ["namespace", "key", "block_num"],
+        "rows": [[topic("aa"), topic("bb"), 12]],
+    }));
+    let row = rows.rows[0].clone();
+
+    // Built from `bytes_literal` rather than spelled out, so the shape is what
+    // is under test and not whichever literal syntax the engine wants today.
+    let ns = Engine::Postgres.bytes_literal(&topic("aa"));
+    let key = Engine::Postgres.bytes_literal(&topic("bb"));
+    let pg = cursor_after(Engine::Postgres, &rows, HEADS_KEY, &row).expect("a cursor");
+    assert_eq!(
+        pg,
+        format!(" AND (topic1 > {ns} OR (topic1 = {ns} AND (topic2 > {key})))")
+    );
+
+    let ch = cursor_after(Engine::ClickHouse, &rows, HEADS_KEY, &row).expect("a cursor");
+    assert!(ch.contains("topic1 > '0x"), "{ch}");
+
+    // A numeric column is written bare, not as a byte string.
+    let by_block: nvnmchain_anchoring::tidx::Key = &[("block_num", "block_num")];
+    let n = cursor_after(Engine::Postgres, &rows, by_block, &row).expect("a cursor");
+    assert_eq!(n, " AND (block_num > 12)");
 }

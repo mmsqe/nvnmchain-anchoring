@@ -52,8 +52,17 @@ impl Engine {
     /// an unknown literal resolves against the column it is compared to, in a
     /// predicate and across a `UNION` alike — and tidx's pushdown extractor
     /// reads a bare literal but not a cast expression.
+    ///
+    /// Hex digits only, by construction. These queries are built by string
+    /// interpolation, and a cursor splices a value tidx handed back into the
+    /// next page's predicate — so anything that is not a hex digit is dropped
+    /// rather than escaped, and a quote cannot reach the literal at all.
     pub fn bytes_literal(self, value: &str) -> String {
-        let hexed = strip_hex(value).to_lowercase();
+        let hexed: String = strip_hex(value)
+            .chars()
+            .filter(char::is_ascii_hexdigit)
+            .map(|c| c.to_ascii_lowercase())
+            .collect();
         match self {
             Self::Postgres => format!("'\\x{hexed}'"),
             Self::ClickHouse => format!("'0x{hexed}'"),
@@ -142,16 +151,89 @@ fn text(row: &[Value], at: usize) -> &str {
     row.get(at).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// tidx's own per-query row cap (`HARD_LIMIT_MAX`), which is also its default:
+/// it truncates at this many rows and says nothing about having done so. Pinned
+/// here because the only defence is knowing the number — see
+/// [`reject_truncated`].
+pub const HARD_LIMIT: usize = 10_000;
+
+/// A full page is refused rather than returned.
+///
+/// [`Tidx::paged`] answers a full page by asking for the next one, so anything
+/// that reaches here full was not paged and is a truncated answer wearing a
+/// complete one's clothes — an audit over the first 10,000 heads of a larger
+/// chain reports clean. Erring on a *legitimately* full page costs one
+/// confusing message; not erring costs a silent one.
+pub fn reject_truncated(table: Table, limit: usize) -> Result<Table> {
+    if table.rows.len() >= limit {
+        bail!(
+            "tidx returned {} rows, its per-query maximum — this answer is truncated, \
+             and a short list here is indistinguishable from a complete one",
+            table.rows.len()
+        );
+    }
+    Ok(table)
+}
+
+/// A paged query's ordering: the column each value is *read* from, paired with
+/// the SQL the predicate is written against. They differ wherever the predicate
+/// belongs inside a subquery — `topic1` there is `namespace` in the answer.
+pub type Key<'a> = &'a [(&'a str, &'a str)];
+
+/// `AND` … placing a query after `row`, lexicographically over `key`.
+///
+/// Spelled out rather than as a row-value comparison, which not every engine
+/// takes. Numbers go in bare and strings through the engine's byte literal —
+/// which is also what keeps a value tidx handed back from reaching SQL as
+/// anything but hex.
+pub fn cursor_after(engine: Engine, table: &Table, key: Key, row: &[Value]) -> Result<String> {
+    let mut cells = Vec::with_capacity(key.len());
+    for (column, sql) in key {
+        let value = row
+            .get(table.index_of(column)?)
+            .with_context(|| format!("no `{column}` in the last row"))?;
+        cells.push(match value {
+            Value::Number(n) => (*sql, n.to_string()),
+            Value::String(s) => (*sql, engine.bytes_literal(s)),
+            other => bail!("`{column}` is not a cursor column: {other}"),
+        });
+    }
+    // (a, b) > (x, y) as a > x OR (a = x AND b > y), nested to any width.
+    let mut predicate = String::new();
+    for (name, literal) in cells.iter().rev() {
+        predicate = if predicate.is_empty() {
+            format!("{name} > {literal}")
+        } else {
+            format!("{name} > {literal} OR ({name} = {literal} AND ({predicate}))")
+        };
+    }
+    Ok(format!(" AND ({predicate})"))
+}
+
 pub struct Tidx {
     client: Client,
     url: String,
     chain_id: u64,
     engine: Engine,
+    /// Rows per round trip, and so what a full page means. Defaults to tidx's
+    /// own cap; smaller only trades round trips for memory, and lets a test
+    /// exercise the paging loop without ten thousand rows to hand.
+    page: usize,
 }
 
 impl Tidx {
     pub fn new(url: impl Into<String>, chain_id: u64, engine: Engine) -> Result<Self> {
+        Self::with_page(url, chain_id, engine, HARD_LIMIT)
+    }
+
+    pub fn with_page(
+        url: impl Into<String>,
+        chain_id: u64,
+        engine: Engine,
+        page: usize,
+    ) -> Result<Self> {
         Ok(Self {
+            page: page.clamp(1, HARD_LIMIT),
             client: Client::builder()
                 .timeout(Duration::from_secs(60))
                 .build()
@@ -176,19 +258,68 @@ impl Tidx {
 
     /// `GET /query`, over the base tables.
     pub async fn query(&self, sql: &str) -> Result<Table> {
+        reject_truncated(self.one_page(sql).await?, self.page)
+    }
+
+    /// One page. Left un-checked for truncation because [`Self::paged`] answers a
+    /// full page by asking for the next one, which is the whole point.
+    async fn one_page(&self, sql: &str) -> Result<Table> {
         let chain_id = self.chain_id.to_string();
+        let limit = self.page.to_string();
         let params = [
             ("chainId", chain_id.as_str()),
             ("engine", self.engine.as_param()),
+            // Asked for explicitly, though it is also tidx's default: the number
+            // is what `reject_truncated` recognises, so it should not be one
+            // this side merely assumes.
+            ("limit", limit.as_str()),
             ("sql", sql),
         ];
         Table::from_response(&self.get_json("/query", &params).await?)
     }
 
+    /// A query walked to exhaustion, one page per round trip.
+    ///
+    /// `build` is handed an `AND …` predicate placing it after the last row
+    /// seen, and `key` names the columns that predicate is over — which must be
+    /// the columns the query orders by.
+    ///
+    /// For a windowed query those columns must also be the *partition*: a page
+    /// boundary that falls inside a partition would compute "newest per key"
+    /// from half a key's rows. Aligned to the partition, every page's window is
+    /// as correct as the unpaged one's.
+    pub async fn paged(&self, key: Key<'_>, build: impl Fn(&str) -> String) -> Result<Table> {
+        let mut all = self.one_page(&build("")).await?;
+        let (mut fetched, mut after) = (all.rows.len(), String::new());
+        while fetched >= self.page {
+            let last = all
+                .rows
+                .last()
+                .cloned()
+                .expect("a full page has a last row");
+            let next = cursor_after(self.engine, &all, key, &last)?;
+            // A cursor that does not move fetches the same page forever, which
+            // means `key` is not unique per row — the caller's bug, not a chain
+            // worth asking again.
+            if next == after {
+                let columns: Vec<_> = key.iter().map(|(c, _)| *c).collect();
+                bail!("paging stalled: {} does not advance", columns.join(", "));
+            }
+            after = next;
+            let mut page = self.one_page(&build(&after)).await?;
+            fetched = page.rows.len();
+            all.rows.append(&mut page.rows);
+        }
+        Ok(all)
+    }
+
     /// Every `(namespace, key)`'s newest commitment as of `up_to` — what the
     /// audit compares against the chain's storage at that same block.
     pub async fn heads(&self, up_to: u64) -> Result<Vec<Head>> {
-        parse_heads(&self.query(&heads_sql(self.engine, up_to)).await?)
+        let table = self
+            .paged(HEADS_KEY, |after| heads_sql(self.engine, up_to, after))
+            .await?;
+        parse_heads(&table)
     }
 
     /// `GET /status`, which is the only way to this: `/query` allowlists
@@ -210,14 +341,19 @@ impl Tidx {
 /// Bounded at `up_to` because tidx's realtime sync runs ahead of its contiguous
 /// interval: an unbounded query can return a head newer than the block the
 /// audit reads state at, which reports as a mismatch that is really skew.
-pub fn heads_sql(engine: Engine, up_to: u64) -> String {
+/// What [`heads_sql`] pages on: the indexed caller and key, which are also its
+/// window's partition, so a page boundary never splits one.
+pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
+
+pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
     format!(
         "SELECT namespace, key, data FROM (\
            SELECT topic1 AS namespace, topic2 AS key, data, \
                   ROW_NUMBER() OVER (PARTITION BY topic1, topic2 \
                                      ORDER BY block_num DESC, log_idx DESC) AS rn \
-           FROM logs WHERE address = {} AND selector = {} AND block_num <= {up_to}\
-         ) heads WHERE rn = 1",
+           FROM logs WHERE address = {} AND selector = {} \
+                 AND block_num <= {up_to}{after}\
+         ) heads WHERE rn = 1 ORDER BY namespace, key",
         engine.bytes_literal(ADDRESS),
         engine.bytes_literal(ANCHORED_TOPIC),
     )
