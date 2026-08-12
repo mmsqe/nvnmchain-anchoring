@@ -72,9 +72,6 @@ fn every_domain_event_is_filtered() {
     // skipped, so a new contract event fails until someone picks a side for it.
     const NOT_INDEXED: &[&str] = &[
         "Anchored(address,bytes32,bytes32,bytes)", // the precompile's own, filtered separately
-        // The factory's: RegistryDeployed is read straight off the log by whatever lists
-        // registries, with no envelope behind it, so this crate never filters for it.
-        "RegistryDeployed(address,address,string,string,string)",
         "ImplementationUpgraded(address)",
         "Initialized(uint64)",
         "OwnershipHandoverCanceled(address)",

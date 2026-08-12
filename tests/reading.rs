@@ -3,13 +3,18 @@
 
 mod common;
 
-use common::{bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA};
-use nvnmchain_anchoring::eth::{checksum_address, keccak_hex};
+use common::{bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_KEY, STATUS_METADATA};
+use nvnmchain_anchoring::eth::{checksum_address, keccak_hex, parse_address};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
-use nvnmchain_anchoring::registry::{record_ids_sql, roles_sql, RECORD_ADDED_TOPIC, ROLE_EVENTS};
+use std::collections::BTreeMap;
+
+use nvnmchain_anchoring::registry::{
+    parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql, roles_sql,
+    RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
+};
 use nvnmchain_anchoring::tidx::{
-    cursor_after, heads_sql, parse_coverage, parse_heads, reject_truncated, Engine, Table,
-    HARD_LIMIT, HEADS_KEY,
+    cursor_after, heads_sql, namespace_heads_sql, parse_coverage, parse_heads, reject_truncated,
+    Engine, Head, Table, HARD_LIMIT, HEADS_KEY,
 };
 use serde_json::json;
 
@@ -300,6 +305,235 @@ fn head_slot_derivation_matches_the_node_suite() {
 
     assert_eq!(head_slot("0xnothex", &key), None);
     assert_eq!(head_slot(NAMESPACE, "0x1234"), None);
+}
+
+/// `abi.encode(string, string, string)` — `RegistryDeployed`'s data section,
+/// built the way the ABI says rather than pasted, so a test that fails names a
+/// decoder bug and not a typo in a literal.
+fn deployed_data(strings: [&str; 3]) -> String {
+    let (mut head, mut tail) = (String::new(), String::new());
+    let mut offset = 3 * 32;
+    for value in strings {
+        head.push_str(&format!("{offset:064x}"));
+        let raw = value.as_bytes();
+        let words = raw.len().div_ceil(32);
+        tail.push_str(&format!("{:064x}", raw.len()));
+        if words > 0 {
+            tail.push_str(&format!(
+                "{:0<width$}",
+                hex::encode(raw),
+                width = words * 64
+            ));
+        }
+        offset += 32 + words * 32;
+    }
+    format!("0x{head}{tail}")
+}
+
+const FACTORY: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+
+#[test]
+fn a_literal_cannot_carry_a_quote_out_of_its_string() {
+    // The queries are string interpolation, and one caller is an HTTP path
+    // segment now. Non-hex is dropped rather than escaped, so there is nothing
+    // to escape wrong.
+    for hostile in ["aa' OR 1=1--", "aa\\x27; DROP TABLE logs; --", "0xaa'"] {
+        let literal = Engine::Postgres.bytes_literal(hostile);
+        assert_eq!(literal.matches('\'').count(), 2, "{literal}");
+        assert!(!literal.contains("OR"), "{literal}");
+        assert!(!literal.contains(';'), "{literal}");
+    }
+}
+
+#[test]
+fn an_address_is_rejected_rather_than_filtered_into_another_one() {
+    // Dropping non-hex would turn `0xAB!CD…` into a different, real-looking
+    // address and answer "nothing here" — so callers check before building SQL.
+    assert!(parse_address(REGISTRY).is_some());
+    assert!(parse_address(&REGISTRY.to_lowercase()).is_some());
+    for bad in [
+        "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6",     // 19 bytes
+        "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0e0", // 21 bytes
+        "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6g0",   // not hex
+        "",
+    ] {
+        assert!(parse_address(bad).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn the_registries_query_is_scoped_to_one_factory_and_ordered_by_deployment() {
+    // Ordered because deployment order *is* the numbering: an index into the
+    // answer is what an on-chain counter would have assigned. Scoped because
+    // tidx's tables filter on topic0 alone, so every factory would answer.
+    let hexed = FACTORY.trim_start_matches("0x").to_lowercase();
+    let topic0 = REGISTRY_DEPLOYED_TOPIC.trim_start_matches("0x");
+    let sql = registries_sql(Engine::Postgres, FACTORY, 7);
+    assert!(sql.contains(&format!("address = '\\x{hexed}'")), "{sql}");
+    assert!(sql.contains(&format!("selector = '\\x{topic0}'")), "{sql}");
+    assert!(sql.contains("AND block_num <= 7"), "{sql}");
+    assert!(sql.contains("ORDER BY block_num, log_idx"), "{sql}");
+    assert!(!sql.contains("::bytea"), "{sql}");
+}
+
+#[test]
+fn registries_are_numbered_by_the_order_they_were_deployed_in() {
+    let rows = parse_registries(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["registry", "creator", "data", "block_num"],
+        "rows": [
+            [topic("aa"), topic("bb"), deployed_data(["docs", "", "{}"]), 11],
+            [topic("cc"), topic("bb"), deployed_data(["photos", "mine", ""]), 12],
+        ],
+    })))
+    .expect("two RegistryDeployed rows");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].number, rows[1].number), (1, 2));
+    assert_eq!(rows[0].name, "docs");
+    assert_eq!(rows[0].description, "");
+    assert_eq!(rows[0].metadata, "{}");
+    assert_eq!(rows[1].name, "photos");
+    assert_eq!(rows[1].description, "mine");
+    assert_eq!(rows[1].block_num, 12);
+    // Checksummed on the way out, as every address in this crate is.
+    assert!(
+        rows[0].address.to_lowercase().ends_with("aa"),
+        "{}",
+        rows[0].address
+    );
+}
+
+#[test]
+fn a_row_that_is_not_a_deployment_payload_is_an_error() {
+    // The query names one factory and one topic0, so a payload that will not
+    // decode means the event moved — not that someone anchored something odd.
+    // Empty strings would read as a registry with no name.
+    let bad = parse_registries(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["registry", "creator", "data", "block_num"],
+        "rows": [[topic("aa"), topic("bb"), "0xdeadbeef", 11]],
+    })));
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+#[test]
+fn roles_come_back_with_their_names_rather_than_padded_words() {
+    // `admin` is a right-padded bytes32 on the wire. A caller comparing against
+    // the string would never match the padding.
+    let admin = format!("0x{:0<64}", hex::encode("admin"));
+    let rows = parse_roles(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["checksumHash", "account", "role", "block_num"],
+        "rows": [[topic("11"), "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0", admin, 9]],
+    })))
+    .expect("one held role");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].role, "admin");
+    assert_eq!(rows[0].block_num, 9);
+}
+
+#[test]
+fn a_numeric_column_reads_on_either_engine() {
+    // tidx serializes integers as JSON numbers on one engine and strings on the
+    // other; reading only one drops block_num to zero without saying so.
+    for block in [serde_json::json!(12), serde_json::json!("12")] {
+        let rows = parse_registries(&table(serde_json::json!({
+            "ok": true,
+            "columns": ["registry", "creator", "data", "block_num"],
+            "rows": [[topic("aa"), topic("bb"), deployed_data(["docs", "", ""]), block]],
+        })))
+        .expect("a row");
+        assert_eq!(rows[0].block_num, 12);
+    }
+}
+
+/// The checksum hash the vendored fixtures are anchored under: `keccak256("0xabc")`.
+const FIXTURE_HASH: &str = "0x851bb152e67e6c958ab7da1431fcaed09ce0efc598885f69a750b3b4b81fc1dc";
+
+fn head(key: &str, metadata: &str) -> Head {
+    Head {
+        namespace: REGISTRY.to_string(),
+        key: key.to_string(),
+        commitment: String::new(),
+        metadata: bytes(metadata),
+    }
+}
+
+#[test]
+fn a_record_carries_the_status_anchored_against_its_own_version() {
+    // Both fixtures are version 1 of the same checksum, so the status belongs to
+    // the version the record is at and shows up on it.
+    let numbers = BTreeMap::from([(FIXTURE_HASH.to_string(), 1)]);
+    let records = parse_records(
+        &[
+            head(RECORD_KEY, RECORD_METADATA),
+            head(STATUS_KEY, STATUS_METADATA),
+        ],
+        &numbers,
+    )
+    .expect("a record and its status");
+
+    assert_eq!(records.len(), 1, "the status is not a record of its own");
+    let record = &records[0];
+    assert_eq!(record.number, Some(1));
+    assert_eq!(record.checksum_hash, FIXTURE_HASH);
+    assert_eq!(record.version, 1);
+    assert_eq!(record.checksum, "0xabc");
+    assert_eq!(record.uri, "ipfs://cid");
+    assert_eq!(record.status.as_deref(), Some("approved"));
+}
+
+#[test]
+fn a_status_without_its_record_is_not_a_record() {
+    // Statuses are keyed per version and only ever attach to one. Alone, it
+    // describes nothing — inventing a record around it would be worse.
+    let records = parse_records(&[head(STATUS_KEY, STATUS_METADATA)], &BTreeMap::new())
+        .expect("a status head alone is not an error");
+    assert!(records.is_empty(), "{records:?}");
+}
+
+#[test]
+fn a_head_that_is_not_a_registry_envelope_is_an_error() {
+    // Only the registry anchors under its own namespace, and only these two
+    // shapes. Skipping one would drop a record and still look like a full list.
+    let bad = parse_records(&[head(RECORD_KEY, "0xdeadbeef")], &BTreeMap::new());
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+#[test]
+fn a_record_the_numbering_did_not_reach_keeps_its_place_and_says_so() {
+    // The two queries are bounded at the same block, so a gap means they
+    // disagree — worth seeing as a null rather than sorting as record 0.
+    let records = parse_records(&[head(RECORD_KEY, RECORD_METADATA)], &BTreeMap::new())
+        .expect("a record with no number");
+    assert_eq!(records[0].number, None);
+}
+
+#[test]
+fn a_namespace_scoped_heads_query_narrows_on_the_caller_topic() {
+    // `topic1` is the caller, and one registry's projection wants only its own
+    // heads — the audit's chain-wide query would drag in every namespace.
+    // Padded to a full word: `topic1` is 32 bytes with the address right-aligned,
+    // and the bare 20-byte form matches nothing — which reads as a registry that
+    // anchored nothing rather than as a broken query. The e2e caught this; this
+    // is the assertion that would have.
+    let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
+    let word = format!("{hexed:0>64}");
+    let scoped = namespace_heads_sql(Engine::Postgres, REGISTRY, 7);
+    assert!(
+        scoped.contains(&format!("topic1 = '\\x{word}'")),
+        "{scoped}"
+    );
+    assert!(
+        !scoped.contains(&format!("topic1 = '\\x{hexed}'")),
+        "{scoped}"
+    );
+    assert!(scoped.contains("AND block_num <= 7"), "{scoped}");
+    // ...and the chain-wide one still is not scoped, or the audit would only
+    // ever check one namespace.
+    assert!(!heads_sql(Engine::Postgres, 7, "").contains("topic1 = "));
 }
 
 #[test]

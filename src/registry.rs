@@ -15,7 +15,21 @@
 //! Neither query is run here. Both are what a caller sends tidx, and nothing in
 //! this crate reads the answer.
 
-use crate::tidx::Engine;
+use anyhow::{Context, Result};
+
+use std::collections::BTreeMap;
+
+use serde::Serialize;
+
+use crate::envelope::{bytes32_label, decode_envelope, decode_strings};
+use crate::eth::{address_from_topic, normalize_hex, strip_hex};
+use crate::tidx::{number, text, Engine, Head, Table};
+
+/// `RegistryDeployed`'s topic0, the selector [`registries_sql`] filters on.
+/// The factory's event, not a registry's -- but it belongs in the same table so
+/// the same fixture check covers it.
+pub const REGISTRY_DEPLOYED_TOPIC: &str =
+    "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576";
 
 /// `RecordAdded`'s topic0, the selector [`record_ids_sql`] filters on. Named so
 /// the query and the [`REGISTRY_TOPICS`] row checked against the contract cannot
@@ -23,12 +37,17 @@ use crate::tidx::Engine;
 pub const RECORD_ADDED_TOPIC: &str =
     "0xb4aaf705a3bf1baf4b094ef32b3517c8df84a8766f0d751a0c85aa41b63be45c";
 
-/// `(topic0, signature)` for every event a registry emits, canonical form.
+/// `(topic0, signature)` for every event the registry contracts emit, canonical
+/// form -- the factory's deployment announcement included.
 /// `tests/signatures.rs` checks the hashes against these signatures and the
 /// signatures against the contract, so neither can sit here quietly matching
 /// nothing — a signature that drifts builds its table off some other topic0
 /// and decodes empty rather than failing.
 pub const REGISTRY_TOPICS: &[(&str, &str)] = &[
+    (
+        REGISTRY_DEPLOYED_TOPIC,
+        "RegistryDeployed(address,address,string,string,string)",
+    ),
     (RECORD_ADDED_TOPIC, "RecordAdded(bytes32,uint256,string)"),
     (
         "0x7735f518b96096d1410ef5122b09bdb190e8d94e93e6896cbeff28f034ea883c",
@@ -135,4 +154,227 @@ pub fn record_ids_sql(engine: Engine, registry: &str, up_to: u64) -> String {
         engine.bytes_literal(registry),
         engine.bytes_literal(RECORD_ADDED_TOPIC),
     )
+}
+
+/// Every registry one factory deployed, in deployment order.
+///
+/// No envelope behind it: name, description and metadata are descriptive, set
+/// once, and ride in the event itself. They are dynamic `string`s, so the row
+/// carries raw `data` for [`crate::envelope::decode_strings`] rather than a
+/// column tidx generated -- the same reason [`crate::tidx::heads_sql`] reads
+/// raw `data`.
+///
+/// Ordered, because deployment order is the canonical numbering: an index into
+/// this list is what an on-chain counter would have assigned. The factory
+/// address is a parameter for the reason it is everywhere else here -- tidx's
+/// tables filter on topic0 alone, so without it any contract emitting the same
+/// event answers too.
+pub fn registries_sql(engine: Engine, factory: &str, up_to: u64) -> String {
+    format!(
+        "SELECT topic1 AS registry, topic2 AS creator, data, block_num \
+         FROM logs WHERE address = {} AND selector = {} AND block_num <= {up_to} \
+         ORDER BY block_num, log_idx",
+        engine.bytes_literal(factory),
+        engine.bytes_literal(REGISTRY_DEPLOYED_TOPIC),
+    )
+}
+
+/// One registry, as the deployment log announces it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Deployed {
+    /// Deployment order, 1-based — what an on-chain counter would have assigned,
+    /// and the same rule [`record_ids_sql`] applies one level down.
+    pub number: u64,
+    pub address: String,
+    pub creator: String,
+    pub name: String,
+    pub description: String,
+    pub metadata: String,
+    pub block_num: u64,
+}
+
+/// [`registries_sql`]'s rows. The strings come out of raw `data` here, so a row
+/// that is not a `RegistryDeployed` payload is an error rather than a registry
+/// with empty fields — the query is scoped to one factory and one topic0, so a
+/// payload that will not decode means the schema moved, not that a caller
+/// anchored something odd.
+pub fn parse_registries(table: &Table) -> Result<Vec<Deployed>> {
+    const STRINGS: &[&str] = &["name", "description", "metadata"];
+    let (registry, creator, data, block) = (
+        table.index_of("registry")?,
+        table.index_of("creator")?,
+        table.index_of("data")?,
+        table.index_of("block_num")?,
+    );
+    table
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let at = || format!("row {i}");
+            let fields = hex::decode(strip_hex(text(row, data)))
+                .ok()
+                .and_then(|raw| decode_strings(STRINGS, &raw))
+                .with_context(|| format!("{}: not a RegistryDeployed payload", at()))?;
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map_or(String::new(), |(_, v)| v.clone())
+            };
+            Ok(Deployed {
+                number: i as u64 + 1,
+                address: address_from_topic(text(row, registry))
+                    .with_context(|| format!("{}: malformed registry topic", at()))?,
+                creator: address_from_topic(text(row, creator))
+                    .with_context(|| format!("{}: malformed creator topic", at()))?,
+                name: field("name"),
+                description: field("description"),
+                metadata: field("metadata"),
+                block_num: number(row, block).with_context(|| format!("{}: no block_num", at()))?,
+            })
+        })
+        .collect()
+}
+
+/// One role a registry holds as granted.
+#[derive(Debug, Clone, Serialize)]
+pub struct RoleHeld {
+    /// `keccak256("")` for a registry-scoped role, the record's checksum hash
+    /// otherwise. Not resolvable back to the checksum — it is a hash.
+    pub scope: String,
+    pub account: String,
+    /// `admin` or `editor`, read back from its right-padded `bytes32`.
+    pub role: String,
+    pub block_num: u64,
+}
+
+/// [`roles_sql`]'s rows. Every column is `bytes32` or an address, so these come
+/// from tables tidx decoded rather than from raw `data`.
+pub fn parse_roles(table: &Table) -> Result<Vec<RoleHeld>> {
+    let (scope, account, role, block) = (
+        table.index_of("checksumHash")?,
+        table.index_of("account")?,
+        table.index_of("role")?,
+        table.index_of("block_num")?,
+    );
+    table
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            Ok(RoleHeld {
+                scope: normalize_hex(text(row, scope)),
+                account: address_from_topic(text(row, account))
+                    .unwrap_or_else(|| normalize_hex(text(row, account))),
+                role: hex::decode(strip_hex(text(row, role)))
+                    .ok()
+                    .and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
+                    .map_or_else(|| normalize_hex(text(row, role)), |w| bytes32_label(&w)),
+                block_num: number(row, block).with_context(|| format!("row {i}: no block_num"))?,
+            })
+        })
+        .collect()
+}
+
+/// [`record_ids_sql`]'s rows, as `checksum_hash -> record_id`.
+pub fn parse_record_ids(table: &Table) -> Result<BTreeMap<String, u64>> {
+    let (hash, id) = (
+        table.index_of("checksum_hash")?,
+        table.index_of("record_id")?,
+    );
+    table
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            Ok((
+                normalize_hex(text(row, hash)),
+                number(row, id).with_context(|| format!("row {i}: no record_id"))?,
+            ))
+        })
+        .collect()
+}
+
+/// One record at its newest version, with the status anchored against that
+/// version if there is one.
+#[derive(Debug, Clone, Serialize)]
+pub struct Record {
+    /// The id the contract stopped assigning, from [`parse_record_ids`]. `None`
+    /// only if the two queries disagree, which is worth seeing rather than
+    /// hiding behind a zero.
+    pub number: Option<u64>,
+    pub checksum_hash: String,
+    /// The newest version index. The head holds only this one — earlier
+    /// versions are in the log, not in state.
+    pub version: u64,
+    pub uri: String,
+    pub checksum: String,
+    pub checksum_algo: String,
+    pub metadata: String,
+    pub timestamp: u64,
+    pub status: Option<String>,
+}
+
+/// A registry's records, from its heads.
+///
+/// A head that will not decode is an error: only this registry anchors under its
+/// namespace and only in these two shapes, so skipping one would drop a record
+/// and still look like a full list. Statuses attach only to the version they
+/// name — one against version 2 of a record now at 3 is not its status.
+pub fn parse_records(heads: &[Head], numbers: &BTreeMap<String, u64>) -> Result<Vec<Record>> {
+    let mut records: BTreeMap<String, Record> = BTreeMap::new();
+    let mut statuses: BTreeMap<(String, u64), String> = BTreeMap::new();
+
+    for head in heads {
+        let envelope = decode_envelope(&head.key, &head.metadata)
+            .with_context(|| format!("key {}: not a registry envelope", head.key))?;
+        let hash = normalize_hex(envelope.field("checksum_hash"));
+        let index = envelope
+            .field("index")
+            .parse::<u64>()
+            .with_context(|| format!("key {}: index {:?}", head.key, envelope.field("index")))?;
+        match envelope.kind {
+            "record" => {
+                records.insert(
+                    hash.clone(),
+                    Record {
+                        number: numbers.get(&hash).copied(),
+                        checksum_hash: hash,
+                        version: index,
+                        uri: envelope.field("uri").to_string(),
+                        checksum: envelope.field("checksum").to_string(),
+                        checksum_algo: envelope.field("checksum_algo").to_string(),
+                        metadata: envelope.field("metadata").to_string(),
+                        timestamp: envelope.field("timestamp").parse().with_context(|| {
+                            format!(
+                                "key {}: timestamp {:?}",
+                                head.key,
+                                envelope.field("timestamp")
+                            )
+                        })?,
+                        status: None,
+                    },
+                );
+            }
+            "status" => {
+                statuses.insert((hash, index), envelope.field("status").to_string());
+            }
+            other => anyhow::bail!("key {}: unknown envelope kind {other}", head.key),
+        }
+    }
+
+    let mut out: Vec<Record> = records
+        .into_values()
+        .map(|mut record| {
+            record.status = statuses
+                .get(&(record.checksum_hash.clone(), record.version))
+                .cloned();
+            record
+        })
+        .collect();
+    // In the order the contract would have numbered them; unnumbered last, so a
+    // disagreement between the two queries stands out instead of sorting as 0.
+    out.sort_by_key(|r| (r.number.is_none(), r.number, r.checksum_hash.clone()));
+    Ok(out)
 }

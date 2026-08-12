@@ -54,9 +54,12 @@ impl Engine {
     /// reads a bare literal but not a cast expression.
     ///
     /// Hex digits only, by construction. These queries are built by string
-    /// interpolation, and a cursor splices a value tidx handed back into the
-    /// next page's predicate — so anything that is not a hex digit is dropped
-    /// rather than escaped, and a quote cannot reach the literal at all.
+    /// interpolation, and two callers now put an outside value into one: an
+    /// HTTP path segment, and a cursor splicing back a value tidx handed out.
+    /// Anything that is not a hex digit is dropped rather than escaped — a
+    /// quote cannot reach the literal at all. A backstop, not the validation:
+    /// a *filtered* address would query some other address and answer "nothing
+    /// here", so callers reject a malformed one up front.
     pub fn bytes_literal(self, value: &str) -> String {
         let hexed: String = strip_hex(value)
             .chars()
@@ -135,7 +138,7 @@ impl Table {
         })
     }
 
-    fn index_of(&self, column: &str) -> Result<usize> {
+    pub fn index_of(&self, column: &str) -> Result<usize> {
         self.columns
             .iter()
             .position(|c| c.eq_ignore_ascii_case(column))
@@ -147,7 +150,7 @@ fn array(value: &Value) -> &[Value] {
     value.as_array().map_or(&[], Vec::as_slice)
 }
 
-fn text(row: &[Value], at: usize) -> &str {
+pub fn text(row: &[Value], at: usize) -> &str {
     row.get(at).and_then(Value::as_str).unwrap_or_default()
 }
 
@@ -210,6 +213,17 @@ pub fn cursor_after(engine: Engine, table: &Table, key: Key, row: &[Value]) -> R
     Ok(format!(" AND ({predicate})"))
 }
 
+/// A numeric cell. tidx serializes integers as JSON numbers on one engine and
+/// as strings on the other, so reading only one of the two drops the column to
+/// zero without saying so.
+pub fn number(row: &[Value], at: usize) -> Option<u64> {
+    match row.get(at)? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 pub struct Tidx {
     client: Client,
     url: String,
@@ -258,15 +272,23 @@ impl Tidx {
 
     /// `GET /query`, over the base tables.
     pub async fn query(&self, sql: &str) -> Result<Table> {
-        reject_truncated(self.one_page(sql).await?, self.page)
+        self.query_with(sql, &[]).await
+    }
+
+    /// `GET /query` with generated event tables. Each signature becomes a table
+    /// named after its event, with argument names for columns; without one only
+    /// the base tables exist. A signature tidx cannot match builds its table off
+    /// some other topic0 and returns no rows rather than an error.
+    pub async fn query_with(&self, sql: &str, signatures: &[&str]) -> Result<Table> {
+        reject_truncated(self.one_page(sql, signatures).await?, self.page)
     }
 
     /// One page. Left un-checked for truncation because [`Self::paged`] answers a
     /// full page by asking for the next one, which is the whole point.
-    async fn one_page(&self, sql: &str) -> Result<Table> {
+    async fn one_page(&self, sql: &str, signatures: &[&str]) -> Result<Table> {
         let chain_id = self.chain_id.to_string();
         let limit = self.page.to_string();
-        let params = [
+        let mut params = vec![
             ("chainId", chain_id.as_str()),
             ("engine", self.engine.as_param()),
             // Asked for explicitly, though it is also tidx's default: the number
@@ -275,7 +297,9 @@ impl Tidx {
             ("limit", limit.as_str()),
             ("sql", sql),
         ];
-        Table::from_response(&self.get_json("/query", &params).await?)
+        params.extend(signatures.iter().map(|s| ("signature", *s)));
+        let table = Table::from_response(&self.get_json("/query", &params).await?)?;
+        reject_truncated(table, HARD_LIMIT)
     }
 
     /// A query walked to exhaustion, one page per round trip.
@@ -289,7 +313,7 @@ impl Tidx {
     /// from half a key's rows. Aligned to the partition, every page's window is
     /// as correct as the unpaged one's.
     pub async fn paged(&self, key: Key<'_>, build: impl Fn(&str) -> String) -> Result<Table> {
-        let mut all = self.one_page(&build("")).await?;
+        let mut all = self.one_page(&build(""), &[]).await?;
         let (mut fetched, mut after) = (all.rows.len(), String::new());
         while fetched >= self.page {
             let last = all
@@ -306,7 +330,7 @@ impl Tidx {
                 bail!("paging stalled: {} does not advance", columns.join(", "));
             }
             after = next;
-            let mut page = self.one_page(&build(&after)).await?;
+            let mut page = self.one_page(&build(&after), &[]).await?;
             fetched = page.rows.len();
             all.rows.append(&mut page.rows);
         }
@@ -346,12 +370,32 @@ impl Tidx {
 pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
 
 pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
+    heads_where(engine, None, up_to, after)
+}
+
+/// The same rule narrowed to one namespace — one registry's heads, for a
+/// projection over its records rather than an audit over the whole chain.
+///
+/// `topic1` is the caller, and `idx_logs_address_topic1` leads on it, so this is
+/// the cheaper query of the two despite doing the same thing.
+pub fn namespace_heads_sql(engine: Engine, namespace: &str, up_to: u64) -> String {
+    heads_where(engine, Some(namespace), up_to, "")
+}
+
+fn heads_where(engine: Engine, namespace: Option<&str>, up_to: u64, after: &str) -> String {
+    let scope = namespace.map_or_else(String::new, |ns| {
+        // `topic1` is a 32-byte word with the address right-aligned, not the
+        // 20-byte `address` column beside it. Comparing the bare address matches
+        // no row at all, which reads as a registry that has anchored nothing.
+        let word = format!("{:0>64}", strip_hex(ns));
+        format!(" AND topic1 = {}", engine.bytes_literal(&word))
+    });
     format!(
         "SELECT namespace, key, data FROM (\
            SELECT topic1 AS namespace, topic2 AS key, data, \
                   ROW_NUMBER() OVER (PARTITION BY topic1, topic2 \
                                      ORDER BY block_num DESC, log_idx DESC) AS rn \
-           FROM logs WHERE address = {} AND selector = {} \
+           FROM logs WHERE address = {} AND selector = {}{scope} \
                  AND block_num <= {up_to}{after}\
          ) heads WHERE rn = 1 ORDER BY namespace, key",
         engine.bytes_literal(ADDRESS),

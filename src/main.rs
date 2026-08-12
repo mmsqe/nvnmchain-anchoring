@@ -4,9 +4,10 @@ use tracing::info;
 use nvnmchain_anchoring::config::Settings;
 use nvnmchain_anchoring::rpc::Rpc;
 use nvnmchain_anchoring::tidx::Tidx;
-use nvnmchain_anchoring::{audit, envelope};
+use nvnmchain_anchoring::{audit, envelope, service};
+use std::sync::Arc;
 
-const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds]";
+const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds|serve]";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,6 +56,10 @@ async fn main() -> Result<()> {
             if !report.is_clean() {
                 std::process::exit(1);
             }
+        }
+        "serve" => {
+            let bind = cfg.bind.clone();
+            service::serve(Arc::new(service::Ctx { tidx, cfg }), &bind).await?;
         }
         other => {
             eprintln!("unknown command `{other}`\n{USAGE}");

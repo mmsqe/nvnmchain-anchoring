@@ -17,6 +17,29 @@ other log on the chain. This is what it structurally cannot do:
 
 ## Running
 
+`serve` exposes the projections over HTTP, which is what the explorer's
+`ANCHORING_URL` links to:
+
+```
+CHAIN_ID=… FACTORY_ADDRESS=0x… BIND=127.0.0.1:8081 nvnmchain-anchoring serve
+
+GET /health                          how far the index this answers from reaches
+GET /registries                      every registry the factory deployed, in order
+GET /registries/{address}/records    each record decoded, at its newest version
+GET /registries/{address}/roles      every role held, folded from the log
+```
+
+A malformed address is a 400 and never reaches SQL; tidx being unreachable or
+refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since that is this
+process misconfigured rather than the one behind it. None of them is ever an
+empty result — an empty list means a registry with nothing in it.
+
+**The projections refuse rather than truncate.** tidx caps a query at 10,000
+rows and says nothing when it hits that, so a registry past that size errors
+instead of answering short — a short list would be indistinguishable from a
+complete one. The audit walks its heads by cursor and has no such ceiling;
+paging the projections the same way is not written yet.
+
 ```bash
 CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo run
 ```
@@ -98,17 +121,23 @@ rather than closing it: a run reports when the index has not reached back to
 
 ## Status
 
-The decoder and the audit are in. The projection into records, versions and
-roles, and the query API over it, are not.
+The decoder, the audit, and `serve` over registries, records and roles are in.
+Version *history* is not: `/records` answers at each record's newest version,
+because that is what the chain keeps — one word per key. Earlier versions are in
+the log and want their own endpoint rather than a field that could quietly be
+short.
 
-Two of those three no longer need this crate at all. `roles` is written out —
-`registry::roles_sql`, one query a caller sends tidx directly, which this crate
-never runs — and `registries` is the factory's deployment event, read straight
-off the log with no envelope behind it. `records` and `versions` are what is
-left, and they do need the decoder: four of `Record`'s ten fields exist only in
-the anchored payload, and `metadata` is a dynamic `bytes` that tidx hands back
-as its ABI offset word. Worth matching the `proto/nvnmchain/anchoring/v1` shapes
-so callers of the old node queries move over unchanged.
+`records` is where the decoder earns the repo: four of `Record`'s ten fields
+exist only inside the anchored payload, and `metadata` is a dynamic `bytes` that
+tidx hands back as its ABI offset word. `registries` and `roles` needed none of
+that, so they went first. Still worth matching the
+`proto/nvnmchain/anchoring/v1` shapes so callers of the old node queries move
+over unchanged.
+
+Read-through, not materialized: every request queries tidx and nothing is kept
+here. A second store over the same log is what the explorer already is, and the
+measurements on `record_ids_sql` say read-through is comfortable at the sizes
+this chain has. Materializing is a decision to make against numbers later.
 
 ### `roles`, over `?signature=`
 

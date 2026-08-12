@@ -120,6 +120,18 @@ pub fn read_payload(key: &str, metadata: &[u8]) -> Payload {
     Payload::Opaque
 }
 
+/// The strings an all-`string` ABI payload carries, in order -- what
+/// `RegistryDeployed` puts in its data section.
+///
+/// Goes through the same strict decode an envelope does: offsets must be the
+/// canonical ones and nothing may be left over, so a payload of another shape
+/// is refused rather than read as text from the wrong place.
+pub fn decode_strings(names: &[&'static str], data: &[u8]) -> Option<Vec<(&'static str, String)>> {
+    let layout: Vec<(&str, Ty)> = names.iter().map(|name| (*name, Ty::Str)).collect();
+    let (values, _) = decode_strict(&layout, data)?;
+    Some(names.iter().copied().zip(values).collect())
+}
+
 /// Decode the `Registry` envelope anchored at `key`, or `None` when
 /// `metadata` is not one.
 pub fn decode_envelope(key: &str, metadata: &[u8]) -> Option<Envelope> {
@@ -157,7 +169,7 @@ fn decode_as(schema: &'static Schema, metadata: &[u8], key: &str) -> Option<Enve
 
 /// A right-padded `bytes32` string ("admin") as text, anything else as hex —
 /// how Solidity writes kind tags and role names.
-fn bytes32_label(word: &[u8; 32]) -> String {
+pub fn bytes32_label(word: &[u8; 32]) -> String {
     let text = word.split(|b| *b == 0).next().unwrap_or(&[]);
     let padded = word[text.len()..].iter().all(|b| *b == 0);
     match std::str::from_utf8(text) {
