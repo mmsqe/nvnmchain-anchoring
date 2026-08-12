@@ -5,7 +5,7 @@
 # working copy before the branch is pushed — but that path lands in the fixture's `source`, so
 # regenerate from the remote before committing. CONTRACTS_REF takes a branch, tag, or SHA.
 CONTRACTS_REPO ?= git@github.com:NVNM-Chain/nvnmchain-contracts.git
-CONTRACTS_REF ?= main
+CONTRACTS_REF ?= registry_factory
 CONTRACTS_WORK := .cache/nvnmchain-contracts
 FIXTURE := tests/fixtures/contract-events.json
 
@@ -34,7 +34,8 @@ fixtures:
 	  '{source: $$repo, commit: $$commit, note: "Regenerate with: make fixtures", \
 	    events: ([.[] | .abi[] | select(.type == "event")] \
 	             | map({name, inputs: [.inputs[] | {type}]}) | sort_by(.name))}' \
-	  $(CONTRACTS_WORK)/out/AnchoringRegistry.sol/AnchoringRegistry.json \
+	  $(CONTRACTS_WORK)/out/Registry.sol/Registry.json \
+	  $(CONTRACTS_WORK)/out/RegistryFactory.sol/RegistryFactory.json \
 	  $(CONTRACTS_WORK)/out/IAnchoring.sol/IAnchoring.json \
 	  > $(FIXTURE)
 	@echo "wrote $(FIXTURE) (nvnmchain-contracts $$(git -C $(CONTRACTS_WORK) rev-parse --short HEAD))"

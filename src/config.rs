@@ -22,15 +22,15 @@ pub struct Settings {
     /// The precompile arrives at T10, so an index reaching this far back has
     /// seen every anchor there is.
     pub first_block: u64,
+    /// The `RegistryFactory` whose deployments `/registries` lists. Optional
+    /// because the audit needs no factory; the endpoint says so rather than
+    /// listing every contract that emits the same event.
+    pub factory: Option<String>,
+    /// Where `serve` listens.
+    pub bind: String,
     /// Rows per tidx round trip. Only worth setting below the default to make
     /// the paging loop observable in a test.
     pub page_size: usize,
-    /// The `AnchoringRegistry` every projection reads from. Optional because the
-    /// audit needs no wrapper; the endpoints say so rather than answering for
-    /// every contract that emits the same events.
-    pub registry: Option<String>,
-    /// Where `serve` listens.
-    pub bind: String,
 }
 
 impl Settings {
@@ -57,12 +57,12 @@ impl Settings {
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(0),
-            // Validated at startup, not per request: a typo would read a
+            // Validated at startup, not per request: a typo here would query a
             // real-looking other address and list nothing.
-            registry: match env::var("REGISTRY_ADDRESS") {
+            factory: match env::var("FACTORY_ADDRESS") {
                 Ok(v) => Some(
                     parse_address(&v)
-                        .with_context(|| format!("REGISTRY_ADDRESS={v}: not a 20-byte address"))?,
+                        .with_context(|| format!("FACTORY_ADDRESS={v}: not a 20-byte address"))?,
                 ),
                 Err(_) => None,
             },

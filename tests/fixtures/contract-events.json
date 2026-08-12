@@ -1,6 +1,6 @@
 {
   "source": "git@github.com:NVNM-Chain/nvnmchain-contracts.git",
-  "commit": "1761de6bbc0bf4584d350f6a1887e1f68ac9ddc6",
+  "commit": "a9f1b8781601bf6990afe2908898acc2f3a08fe5",
   "note": "Regenerate with: make fixtures",
   "events": [
     {
@@ -17,14 +17,6 @@
         },
         {
           "type": "bytes"
-        }
-      ]
-    },
-    {
-      "name": "Initialized",
-      "inputs": [
-        {
-          "type": "uint64"
         }
       ]
     },
@@ -59,10 +51,7 @@
       "name": "RecordAdded",
       "inputs": [
         {
-          "type": "uint256"
-        },
-        {
-          "type": "uint256"
+          "type": "bytes32"
         },
         {
           "type": "uint256"
@@ -76,10 +65,7 @@
       "name": "RecordStatusUpdated",
       "inputs": [
         {
-          "type": "uint256"
-        },
-        {
-          "type": "uint256"
+          "type": "bytes32"
         },
         {
           "type": "uint256"
@@ -90,25 +76,28 @@
       ]
     },
     {
-      "name": "RegistryAdded",
+      "name": "RegistryDeployed",
       "inputs": [
         {
-          "type": "uint256"
+          "type": "address"
+        },
+        {
+          "type": "address"
         },
         {
           "type": "string"
         },
         {
-          "type": "address"
+          "type": "string"
+        },
+        {
+          "type": "string"
         }
       ]
     },
     {
       "name": "RoleGranted",
       "inputs": [
-        {
-          "type": "uint256"
-        },
         {
           "type": "bytes32"
         },
@@ -124,9 +113,6 @@
       "name": "RoleRevoked",
       "inputs": [
         {
-          "type": "uint256"
-        },
-        {
           "type": "bytes32"
         },
         {
@@ -134,14 +120,6 @@
         },
         {
           "type": "bytes32"
-        }
-      ]
-    },
-    {
-      "name": "Upgraded",
-      "inputs": [
-        {
-          "type": "address"
         }
       ]
     }

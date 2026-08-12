@@ -1,14 +1,16 @@
 //! An HTTP surface over the projections.
 //!
-//! What the retired `registries(...)` and `records(...)` queries answered, read
-//! from the log instead of from the module that no longer serves them.
+//! The explorer renders a link to "the anchoring decoder" on every key page
+//! when `ANCHORING_URL` is set, and nothing was serving it. This is that.
 //!
-//! Read-through: every request queries tidx and nothing is kept here. A second
-//! store over the same log is what an explorer already is, so materializing is a
-//! decision to make against numbers later, not a shape to start with.
+//! Read-through: every request queries tidx, and nothing is kept here. A second
+//! store over the same log is what the explorer already is, and the measurements
+//! on [`crate::registry::record_ids_sql`] say read-through is comfortable at the
+//! sizes this chain has — so materializing is a decision to make against numbers
+//! later, not a shape to start with.
 //!
 //! `/records` answers at each record's newest version, because that is what the
-//! chain keeps — one word per key. Earlier versions live in the log and want
+//! chain keeps — one word per key. Earlier versions are in the log, and want
 //! their own endpoint rather than a field that could quietly be short.
 
 use std::sync::Arc;
@@ -22,9 +24,10 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::config::Settings;
+use crate::eth::parse_address;
 use crate::registry::{
-    parse_records, parse_registries, parse_roles, registries_sql, roles_sql, REGISTRIES_KEY,
-    ROLES_KEY, ROLE_EVENTS,
+    parse_record_ids, parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql,
+    roles_sql, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
 };
 use crate::tidx::{namespace_heads_sql, parse_heads, Tidx, HEADS_KEY};
 
@@ -33,9 +36,10 @@ pub struct Ctx {
     pub cfg: Settings,
 }
 
-/// A failed request. Everything here is the caller's id being unreadable, this
-/// process misconfigured, or tidx unreachable — so the status says which, and an
-/// empty result set stays a legitimate answer rather than how a failure looks.
+/// A failed request. Everything here is either the caller's address being
+/// malformed or tidx being unreachable or refusing, so the split is 400 against
+/// 502 and the message says which — an empty result set is a legitimate answer
+/// and must never be how a failure looks.
 struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
@@ -50,35 +54,30 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-/// The wrapper every projection reads from, or a 500 — this process
-/// misconfigured is neither the caller's fault nor tidx's, and 502 would send an
-/// operator to look at the wrong process.
-fn wrapper(ctx: &Ctx) -> Result<&str, ApiError> {
-    ctx.cfg.registry.as_deref().ok_or_else(|| {
-        ApiError(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "REGISTRY_ADDRESS is not set, so there is no wrapper to read from".into(),
-        )
-    })
+fn bad_request(message: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, message.into())
 }
 
-/// A registry id from a path segment. Rejected here rather than interpolated:
-/// these queries are built by string formatting, and an id is a number.
-fn registry_id(raw: &str) -> Result<u64, ApiError> {
-    raw.parse().map_err(|_| {
-        ApiError(
-            StatusCode::BAD_REQUEST,
-            format!("`{raw}` is not a registry id"),
-        )
-    })
+/// This service configured wrong, which is neither the caller's fault nor
+/// tidx's — 502 would send an operator to look at the wrong process.
+fn misconfigured(message: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::INTERNAL_SERVER_ERROR, message.into())
+}
+
+/// The registry a path segment names. Rejected here rather than filtered
+/// downstream: `bytes_literal` drops non-hex, so a mangled address would query a
+/// real-looking other one and answer "nothing here".
+fn registry_of(address: &str) -> Result<String, ApiError> {
+    parse_address(address)
+        .ok_or_else(|| bad_request(format!("`{address}` is not a 20-byte hex address")))
 }
 
 pub fn router(ctx: Arc<Ctx>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/registries", get(registries))
-        .route("/registries/{id}/records", get(records))
-        .route("/registries/{id}/roles", get(roles))
+        .route("/registries/{address}/records", get(records))
+        .route("/registries/{address}/roles", get(roles))
         .with_state(ctx)
 }
 
@@ -95,18 +94,18 @@ async fn health(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError> {
 }
 
 async fn registries(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError> {
-    let wrapper = wrapper(&ctx)?;
+    let factory = ctx.cfg.factory.as_deref().ok_or_else(|| {
+        misconfigured("FACTORY_ADDRESS is not set, so there is no factory to list from")
+    })?;
     let at = ctx.tidx.coverage().await?.tip_num;
     let table = ctx
         .tidx
-        .paged(
-            &[crate::registry::REGISTRY_ADDED],
-            REGISTRIES_KEY,
-            |after| registries_sql(ctx.cfg.engine, wrapper, at, after),
-        )
+        .paged(&[], REGISTRIES_KEY, |after| {
+            registries_sql(ctx.cfg.engine, factory, at, after)
+        })
         .await?;
     Ok(Json(json!({
-        "wrapper": wrapper,
+        "factory": factory,
         "at_block": at,
         "registries": parse_registries(&table)?,
     })))
@@ -114,18 +113,18 @@ async fn registries(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError
 
 async fn roles(
     State(ctx): State<Arc<Ctx>>,
-    Path(id): Path<String>,
+    Path(address): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let (wrapper, id) = (wrapper(&ctx)?, registry_id(&id)?);
+    let registry = registry_of(&address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
     let table = ctx
         .tidx
         .paged(ROLE_EVENTS, ROLES_KEY, |after| {
-            roles_sql(ctx.cfg.engine, wrapper, id, at, after)
+            roles_sql(ctx.cfg.engine, &registry, at, after)
         })
         .await?;
     Ok(Json(json!({
-        "registry_id": id,
+        "registry": registry,
         "at_block": at,
         "roles": parse_roles(&table)?,
     })))
@@ -133,24 +132,30 @@ async fn roles(
 
 async fn records(
     State(ctx): State<Arc<Ctx>>,
-    Path(id): Path<String>,
+    Path(address): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let (wrapper, id) = (wrapper(&ctx)?, registry_id(&id)?);
+    let registry = registry_of(&address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
-    // Every registry shares the wrapper's namespace, so this reads them all and
-    // `parse_records` keeps the one asked for. The key hashes the registry id
-    // in, so there is nothing here for a `WHERE` to narrow on.
+    // Both bounded at the same block, so the numbering and the heads describe
+    // one state of the chain rather than two.
+    let ids = parse_record_ids(
+        &ctx.tidx
+            .paged(&[], RECORD_IDS_KEY, |after| {
+                record_ids_sql(ctx.cfg.engine, &registry, at, after)
+            })
+            .await?,
+    )?;
     let heads = parse_heads(
         &ctx.tidx
             .paged(&[], HEADS_KEY, |after| {
-                namespace_heads_sql(ctx.cfg.engine, wrapper, at, after)
+                namespace_heads_sql(ctx.cfg.engine, &registry, at, after)
             })
             .await?,
     )?;
     Ok(Json(json!({
-        "registry_id": id,
+        "registry": registry,
         "at_block": at,
-        "records": parse_records(&heads, id)?,
+        "records": parse_records(&heads, &ids)?,
     })))
 }
 
