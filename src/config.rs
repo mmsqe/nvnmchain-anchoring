@@ -4,6 +4,7 @@ use std::env;
 
 use anyhow::{Context, Result};
 
+use crate::eth::parse_address;
 use crate::tidx::{Engine, HARD_LIMIT};
 
 pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
@@ -24,6 +25,12 @@ pub struct Settings {
     /// Rows per tidx round trip. Only worth setting below the default to make
     /// the paging loop observable in a test.
     pub page_size: usize,
+    /// The `AnchoringRegistry` every projection reads from. Optional because the
+    /// audit needs no wrapper; the endpoints say so rather than answering for
+    /// every contract that emits the same events.
+    pub registry: Option<String>,
+    /// Where `serve` listens.
+    pub bind: String,
 }
 
 impl Settings {
@@ -50,6 +57,16 @@ impl Settings {
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(0),
+            // Validated at startup, not per request: a typo would read a
+            // real-looking other address and list nothing.
+            registry: match env::var("REGISTRY_ADDRESS") {
+                Ok(v) => Some(
+                    parse_address(&v)
+                        .with_context(|| format!("REGISTRY_ADDRESS={v}: not a 20-byte address"))?,
+                ),
+                Err(_) => None,
+            },
+            bind: env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
             page_size: env::var("PAGE_SIZE")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())

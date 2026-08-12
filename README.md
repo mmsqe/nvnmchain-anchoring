@@ -17,6 +17,29 @@ other log on the chain. This is what it structurally cannot do:
 
 ## Running
 
+`serve` exposes the projections over HTTP, read from the log rather than from
+the module that retired them:
+
+```
+CHAIN_ID=… REGISTRY_ADDRESS=0x… BIND=127.0.0.1:8081 nvnmchain-anchoring serve
+
+GET /health                     how far the index this answers from reaches
+GET /registries                 every registry the wrapper announced, in id order
+GET /registries/{id}/records    each record decoded, at its newest version
+GET /registries/{id}/roles      every role held, folded from the log
+```
+
+An unreadable id is a 400 and never reaches SQL; a missing `REGISTRY_ADDRESS` is
+a 500, since that is this process misconfigured rather than the one behind it;
+tidx unreachable or refusing is a 502. None of them is ever an empty result — an
+empty list means a registry with nothing in it.
+
+`/records` reads every head under the wrapper's namespace and keeps the registry
+asked for, because the key hashes the registry id in and leaves nothing for a
+`WHERE` to narrow on. `/roles` and `/registries` narrow in SQL, where the id is
+`topic1`.
+
+
 ```bash
 CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo run
 ```

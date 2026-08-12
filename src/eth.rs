@@ -59,6 +59,15 @@ pub fn word_to_u128(word: &[u8; 32]) -> Option<u128> {
 }
 
 /// The address in an indexed topic, right-aligned in its word.
+/// A 20-byte hex address, checksummed, or `None`. Strict on length and on every
+/// character: an address reaches SQL through string interpolation, so anything
+/// looser would query a different address and report it as empty.
+pub fn parse_address(value: &str) -> Option<String> {
+    let hexed = strip_hex(value.trim());
+    (hexed.len() == 40 && hexed.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| checksum_address(&normalize_hex(hexed)))
+}
+
 pub fn address_from_topic(topic: &str) -> Option<String> {
     let hexed = strip_hex(topic);
     if hexed.len() != 64 {

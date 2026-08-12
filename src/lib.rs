@@ -13,4 +13,5 @@ pub mod eth;
 pub mod precompile;
 pub mod registry;
 pub mod rpc;
+pub mod service;
 pub mod tidx;

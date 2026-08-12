@@ -9,7 +9,7 @@
 
 use nvnmchain_anchoring::eth::keccak_hex;
 use nvnmchain_anchoring::precompile::{ANCHORED_SIGNATURE, ANCHORED_TOPIC};
-use nvnmchain_anchoring::registry::REGISTRY_TOPICS;
+use nvnmchain_anchoring::registry::{REGISTRY_TOPICS, ROLE_EVENTS};
 use std::collections::BTreeSet;
 
 const FIXTURE: &str = include_str!("fixtures/contract-events.json");
@@ -100,4 +100,48 @@ fn vendored_signatures_hash_to_the_topics_in_use() {
         assert_eq!(&keccak_hex(signature.as_bytes()), topic, "{signature}");
     }
     assert_eq!(keccak_hex(ANCHORED_SIGNATURE.as_bytes()), ANCHORED_TOPIC);
+}
+
+/// A named signature's arguments, e.g. `uint256 indexed registryId`.
+fn arguments(named: &str) -> impl Iterator<Item = &str> {
+    named
+        .split_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .expect("a signature has parentheses")
+        .split(',')
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+}
+
+/// The canonical form of a named signature: types only, no names, no `indexed`.
+fn canonicalize(named: &str) -> String {
+    let name = named.split_once('(').expect("a signature has a name").0;
+    let types: Vec<&str> = arguments(named)
+        .map(|a| a.split_whitespace().next().expect("an argument has a type"))
+        .collect();
+    format!("{name}({})", types.join(","))
+}
+
+#[test]
+fn every_named_signature_is_a_canonical_one_said_differently() {
+    // Two spellings of the same events: these go to tidx as `?signature=`, the
+    // table is what a topic0 hashes from. A drift between them builds the query
+    // off some other topic0 and decodes an empty table rather than failing.
+    let canonical: BTreeSet<&str> = REGISTRY_TOPICS.iter().map(|(_, sig)| *sig).collect();
+    for named in ROLE_EVENTS {
+        let form = canonicalize(named);
+        assert!(
+            canonical.contains(form.as_str()),
+            "{named} canonicalizes to {form}, which no filtered topic matches"
+        );
+    }
+}
+
+#[test]
+fn the_roles_fold_reads_three_events_to_answer_about_two() {
+    // `addRegistry` writes the creator's registry admin into `member` directly
+    // and announces it only as a `RegistryAdded`, so the grant/revoke pair alone
+    // answers every registry one admin short.
+    assert_eq!(ROLE_EVENTS.len(), 3, "{ROLE_EVENTS:?}");
+    assert!(ROLE_EVENTS.iter().any(|e| e.starts_with("RegistryAdded(")));
 }

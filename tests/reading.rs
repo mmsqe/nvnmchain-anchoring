@@ -3,11 +3,17 @@
 
 mod common;
 
-use common::{bytes, REGISTRY_KEY, TAGGED_REGISTRY_COMMITMENT, TAGGED_REGISTRY_METADATA};
+use common::{
+    bytes, RECORD_KEY, REGISTRY_KEY, STATUS_KEY, TAGGED_RECORD_METADATA,
+    TAGGED_REGISTRY_COMMITMENT, TAGGED_REGISTRY_METADATA, TAGGED_STATUS_METADATA,
+};
 use nvnmchain_anchoring::eth::{checksum_address, keccak_hex};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
+use nvnmchain_anchoring::registry::{
+    parse_records, parse_registries, parse_roles, registries_sql, roles_sql, REGISTRY_SCOPE,
+};
 use nvnmchain_anchoring::tidx::{
-    cursor_after, heads_sql, parse_coverage, parse_heads, reject_truncated, Engine, Table,
+    cursor_after, heads_sql, parse_coverage, parse_heads, reject_truncated, Engine, Head, Table,
     HARD_LIMIT, HEADS_KEY,
 };
 use serde_json::json;
@@ -262,4 +268,118 @@ fn a_cursor_is_lexicographic_over_its_key_and_spelled_for_its_engine() {
     let by_block: nvnmchain_anchoring::tidx::Key = &[("block_num", "block_num")];
     let n = cursor_after(Engine::Postgres, &rows, by_block, &row).expect("a cursor");
     assert_eq!(n, " AND (block_num > 12)");
+}
+
+/// The wrapper every projection reads from: a deployment, not an enshrined
+/// address, so every query names one and that name is the whole partition.
+const WRAPPER: &str = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
+
+fn head(key: &str, metadata: &str) -> Head {
+    Head {
+        namespace: WRAPPER.to_string(),
+        key: key.to_string(),
+        commitment: String::new(),
+        metadata: bytes(metadata),
+    }
+}
+
+#[test]
+fn the_registries_query_is_scoped_to_one_wrapper_and_ordered_by_id() {
+    // Ordered because the wrapper assigns ids in that order, so an index into
+    // the answer is the id. Scoped because tidx's generated tables filter on
+    // topic0 alone -- any contract emitting the same event would answer too.
+    let hexed = WRAPPER.trim_start_matches("0x").to_lowercase();
+    let sql = registries_sql(Engine::Postgres, WRAPPER, 7, "");
+    assert!(sql.contains("FROM RegistryAdded"), "{sql}");
+    assert!(sql.contains(&format!("address = '\\x{hexed}'")), "{sql}");
+    assert!(sql.contains("AND block_num <= 7"), "{sql}");
+    assert!(sql.contains("ORDER BY block_num, log_idx"), "{sql}");
+}
+
+#[test]
+fn the_roles_fold_seeds_the_creators_admin_and_orders_revokes_against_grants() {
+    // Not "granted minus revoked": the same key can be granted, revoked and
+    // granted again, and a set difference answers that nobody holds it. The
+    // seed is a third arm at its own log position, ordered like any other.
+    let sql = roles_sql(Engine::Postgres, WRAPPER, 42, 99, "");
+    for table in ["RoleGranted", "RoleRevoked", "RegistryAdded"] {
+        assert!(
+            sql.contains(&format!("FROM {table} ")),
+            "no {table} arm in {sql}"
+        );
+    }
+    assert!(sql.contains(&REGISTRY_SCOPE.trim_start_matches("0x").to_lowercase()));
+    assert!(sql.contains(
+        "PARTITION BY \"checksumHash\", account, role \
+         ORDER BY block_num DESC, log_idx DESC"
+    ));
+    assert!(sql.contains("WHERE rn = 1 AND granted"));
+
+    // The wrapper fronts every registry, so the id narrows as well as the
+    // address -- and it is `topic1` on all three events, so this is a predicate
+    // rather than a decode.
+    assert!(sql.contains("\"registryId\" = 42"), "{sql}");
+    assert!(sql.contains("id = 42"), "{sql}");
+}
+
+#[test]
+fn records_are_read_out_of_the_envelopes_the_wrapper_anchored() {
+    // Every registry shares the wrapper's namespace, so the registry id comes
+    // out of the payload -- the key hashes it in, leaving nothing to filter on.
+    let records = parse_records(
+        &[
+            head(RECORD_KEY, TAGGED_RECORD_METADATA),
+            head(STATUS_KEY, TAGGED_STATUS_METADATA),
+        ],
+        1,
+    )
+    .expect("a record and its status");
+
+    assert_eq!(records.len(), 1, "the status is not a record of its own");
+    assert_eq!(records[0].record_id, 1);
+    assert_eq!(records[0].version, 1);
+    assert!(records[0].status.is_some(), "same version, so it applies");
+}
+
+#[test]
+fn another_registrys_records_are_not_this_ones() {
+    // The wrapper's whole problem: one namespace for every registry, so a
+    // projection that forgot to check the id would answer with all of them.
+    let records = parse_records(&[head(RECORD_KEY, TAGGED_RECORD_METADATA)], 2)
+        .expect("no records for registry 2");
+    assert!(records.is_empty(), "{records:?}");
+}
+
+#[test]
+fn a_head_that_is_not_a_registry_envelope_is_an_error() {
+    // Only the wrapper anchors here, and only in the shapes it knows. Skipping
+    // one would drop a record and still look like a full list.
+    assert!(parse_records(&[head(RECORD_KEY, "0xdeadbeef")], 1).is_err());
+}
+
+#[test]
+fn a_role_row_comes_back_with_its_name_rather_than_a_padded_word() {
+    let admin = format!("0x{:0<64}", hex::encode("admin"));
+    let rows = parse_roles(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["checksumHash", "account", "role", "block_num"],
+        "rows": [[topic("11"), "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0", admin, 9]],
+    })))
+    .expect("one held role");
+    assert_eq!(rows[0].role, "admin");
+    assert_eq!(rows[0].block_num, 9);
+}
+
+#[test]
+fn a_registry_row_carries_the_name_the_event_announced() {
+    let rows = parse_registries(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["id", "name", "creator", "block_num"],
+        "rows": [[3, "docs", topic("aa"), 11]],
+    })))
+    .expect("one registry");
+    assert_eq!(
+        (rows[0].id, rows[0].name.as_str(), rows[0].block_num),
+        (3, "docs", 11)
+    );
 }

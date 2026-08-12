@@ -133,7 +133,7 @@ impl Table {
         })
     }
 
-    fn index_of(&self, column: &str) -> Result<usize> {
+    pub fn index_of(&self, column: &str) -> Result<usize> {
         self.columns
             .iter()
             .position(|c| c.eq_ignore_ascii_case(column))
@@ -145,8 +145,19 @@ fn array(value: &Value) -> &[Value] {
     value.as_array().map_or(&[], Vec::as_slice)
 }
 
-fn text(row: &[Value], at: usize) -> &str {
+pub fn text(row: &[Value], at: usize) -> &str {
     row.get(at).and_then(Value::as_str).unwrap_or_default()
+}
+
+/// A numeric cell. tidx serializes integers as JSON numbers on one engine and
+/// as strings on the other, so reading only one of the two drops the column to
+/// zero without saying so.
+pub fn number(row: &[Value], at: usize) -> Option<u64> {
+    match row.get(at)? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 /// tidx's own per-query row cap (`HARD_LIMIT_MAX`), which is also its default:
@@ -256,15 +267,23 @@ impl Tidx {
 
     /// `GET /query`, over the base tables.
     pub async fn query(&self, sql: &str) -> Result<Table> {
-        reject_truncated(self.one_page(sql).await?, self.page)
+        self.query_with(sql, &[]).await
+    }
+
+    /// `GET /query` with generated event tables. Each signature becomes a table
+    /// named after its event, with argument names for columns. A signature tidx
+    /// cannot match builds its table off some other topic0 and returns no rows
+    /// rather than an error.
+    pub async fn query_with(&self, sql: &str, signatures: &[&str]) -> Result<Table> {
+        reject_truncated(self.one_page(sql, signatures).await?, self.page)
     }
 
     /// One page. Left un-checked for truncation because [`Self::paged`] answers a
     /// full page by asking for the next one, which is the whole point.
-    async fn one_page(&self, sql: &str) -> Result<Table> {
+    async fn one_page(&self, sql: &str, signatures: &[&str]) -> Result<Table> {
         let chain_id = self.chain_id.to_string();
         let limit = self.page.to_string();
-        let params = [
+        let mut params = vec![
             ("chainId", chain_id.as_str()),
             ("engine", self.engine.as_param()),
             // Asked for explicitly, though it is also tidx's default: the number
@@ -273,6 +292,7 @@ impl Tidx {
             ("limit", limit.as_str()),
             ("sql", sql),
         ];
+        params.extend(signatures.iter().map(|s| ("signature", *s)));
         Table::from_response(&self.get_json("/query", &params).await?)
     }
 
@@ -286,8 +306,13 @@ impl Tidx {
     /// boundary that falls inside a partition would compute "newest per key"
     /// from half a key's rows. Aligned to the partition, every page's window is
     /// as correct as the unpaged one's.
-    pub async fn paged(&self, key: Key<'_>, build: impl Fn(&str) -> String) -> Result<Table> {
-        let mut all = self.one_page(&build("")).await?;
+    pub async fn paged(
+        &self,
+        signatures: &[&str],
+        key: Key<'_>,
+        build: impl Fn(&str) -> String,
+    ) -> Result<Table> {
+        let mut all = self.one_page(&build(""), signatures).await?;
         let (mut fetched, mut after) = (all.rows.len(), String::new());
         while fetched >= self.page {
             let last = all
@@ -304,7 +329,7 @@ impl Tidx {
                 bail!("paging stalled: {} does not advance", columns.join(", "));
             }
             after = next;
-            let mut page = self.one_page(&build(&after)).await?;
+            let mut page = self.one_page(&build(&after), signatures).await?;
             fetched = page.rows.len();
             all.rows.append(&mut page.rows);
         }
@@ -315,7 +340,7 @@ impl Tidx {
     /// audit compares against the chain's storage at that same block.
     pub async fn heads(&self, up_to: u64) -> Result<Vec<Head>> {
         let table = self
-            .paged(HEADS_KEY, |after| heads_sql(self.engine, up_to, after))
+            .paged(&[], HEADS_KEY, |after| heads_sql(self.engine, up_to, after))
             .await?;
         parse_heads(&table)
     }
@@ -344,12 +369,29 @@ impl Tidx {
 pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
 
 pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
+    heads_where(engine, None, up_to, after)
+}
+
+/// The same rule narrowed to one namespace — the wrapper's own heads, for a
+/// projection over its records rather than an audit over the whole chain.
+pub fn namespace_heads_sql(engine: Engine, namespace: &str, up_to: u64, after: &str) -> String {
+    heads_where(engine, Some(namespace), up_to, after)
+}
+
+fn heads_where(engine: Engine, namespace: Option<&str>, up_to: u64, after: &str) -> String {
+    let scope = namespace.map_or_else(String::new, |ns| {
+        // `topic1` is a 32-byte word with the address right-aligned, not the
+        // 20-byte `address` column beside it. Comparing the bare address matches
+        // no row at all, which reads as a namespace that has anchored nothing.
+        let word = format!("{:0>64}", strip_hex(ns));
+        format!(" AND topic1 = {}", engine.bytes_literal(&word))
+    });
     format!(
         "SELECT namespace, key, data FROM (\
            SELECT topic1 AS namespace, topic2 AS key, data, \
                   ROW_NUMBER() OVER (PARTITION BY topic1, topic2 \
                                      ORDER BY block_num DESC, log_idx DESC) AS rn \
-           FROM logs WHERE address = {} AND selector = {} \
+           FROM logs WHERE address = {} AND selector = {}{scope} \
                  AND block_num <= {up_to}{after}\
          ) heads WHERE rn = 1 ORDER BY namespace, key",
         engine.bytes_literal(ADDRESS),
