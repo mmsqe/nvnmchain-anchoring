@@ -68,20 +68,28 @@ fn every_filtered_signature_is_one_the_contracts_emit() {
 
 #[test]
 fn every_domain_event_is_filtered() {
+    let (compiled, at) = (compiled_signatures(), fixture_commit());
     // Inherited solady/UUPS events, plus the precompile's own. Named rather than silently
     // skipped, so a new contract event fails until someone picks a side for it.
     const NOT_INDEXED: &[&str] = &[
         "Anchored(address,bytes32,bytes32,bytes)", // the precompile's own, filtered separately
-        "ImplementationUpgraded(address)",
-        "Initialized(uint64)",
         "OwnershipHandoverCanceled(address)",
         "OwnershipHandoverRequested(address)",
         "OwnershipTransferred(address,address)",
-        "Upgraded(address)",
     ];
 
+    // A skip that names nothing stops skipping anything, and would wave through
+    // an event of the same name if one came back. The three that went with the
+    // proxies were caught this way.
+    for skipped in NOT_INDEXED {
+        assert!(
+            compiled.contains(*skipped),
+            "{skipped} is skipped but no contract at {at} emits it"
+        );
+    }
+
     let filtered: BTreeSet<&str> = REGISTRY_TOPICS.iter().map(|(_, sig)| *sig).collect();
-    for signature in compiled_signatures() {
+    for signature in &compiled {
         if NOT_INDEXED.contains(&signature.as_str()) {
             continue;
         }

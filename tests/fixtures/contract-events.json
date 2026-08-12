@@ -1,6 +1,6 @@
 {
   "source": "git@github.com:NVNM-Chain/nvnmchain-contracts.git",
-  "commit": "f188164573b296299f780d63f12b145177961713",
+  "commit": "a9f1b8781601bf6990afe2908898acc2f3a08fe5",
   "note": "Regenerate with: make fixtures",
   "events": [
     {
@@ -17,30 +17,6 @@
         },
         {
           "type": "bytes"
-        }
-      ]
-    },
-    {
-      "name": "ImplementationUpgraded",
-      "inputs": [
-        {
-          "type": "address"
-        }
-      ]
-    },
-    {
-      "name": "Initialized",
-      "inputs": [
-        {
-          "type": "uint64"
-        }
-      ]
-    },
-    {
-      "name": "Initialized",
-      "inputs": [
-        {
-          "type": "uint64"
         }
       ]
     },
@@ -144,14 +120,6 @@
         },
         {
           "type": "bytes32"
-        }
-      ]
-    },
-    {
-      "name": "Upgraded",
-      "inputs": [
-        {
-          "type": "address"
         }
       ]
     }
