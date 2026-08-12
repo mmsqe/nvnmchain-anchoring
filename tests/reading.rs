@@ -9,8 +9,8 @@ use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, A
 use std::collections::BTreeMap;
 
 use nvnmchain_anchoring::registry::{
-    parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql, roles_sql,
-    RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
+    parse_record_ids, parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql,
+    roles_sql, RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
 };
 use nvnmchain_anchoring::tidx::{
     cursor_after, heads_sql, namespace_heads_sql, parse_coverage, parse_heads, reject_truncated,
@@ -188,7 +188,7 @@ fn the_address_literal_is_spelled_for_its_engine() {
     // Uncast, everywhere: tidx's pushdown extractor reads a bare literal and
     // not a cast expression. `tempo-e2e` sends the same spelling to a running
     // tidx, so this is the form with a live proof behind it.
-    assert!(!roles_sql(Engine::Postgres, REGISTRY, 7).contains("::bytea"));
+    assert!(!roles_sql(Engine::Postgres, REGISTRY, 7, "").contains("::bytea"));
     assert!(!heads_sql(Engine::Postgres, 7, "").contains("::bytea"));
 }
 
@@ -205,7 +205,7 @@ fn the_roles_query_orders_revokes_against_grants() {
     // granted again, and a set difference answers that nobody holds it. The
     // partition is every field of the key the wrapper hashes an `acl` envelope
     // under, so two roles for one account stay apart.
-    let sql = roles_sql(Engine::Postgres, REGISTRY, 99);
+    let sql = roles_sql(Engine::Postgres, REGISTRY, 99, "");
     assert!(sql.contains(
         "PARTITION BY \"checksumHash\", account, role \
          ORDER BY block_num DESC, log_idx DESC"
@@ -226,26 +226,29 @@ fn the_roles_query_needs_no_seed_for_the_creators_admin() {
     // The old wrapper wrote `member` directly in addRegistry and announced the creator's
     // admin only in RegistryAdded, so the fold needed that event as a third arm. A registry
     // announces it as an ordinary RoleGranted at deployment, so two arms answer in full.
-    let sql = roles_sql(Engine::Postgres, REGISTRY, 99);
+    let sql = roles_sql(Engine::Postgres, REGISTRY, 99, "");
     assert!(!sql.contains("RegistryAdded"), "{sql}");
     assert_eq!(ROLE_EVENTS.len(), 2, "{ROLE_EVENTS:?}");
 }
 
 #[test]
 fn record_numbering_counts_records_and_not_versions() {
-    // The whole reason for the inner window. Numbering the rows themselves would
+    // The window keeps each checksum's *first* appearance; anything looser would
     // give every version its own id, so re-anchoring an early record would
     // renumber it and shift every record after it.
-    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99);
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99, "");
     assert!(
         sql.contains("ROW_NUMBER() OVER (PARTITION BY topic1 ORDER BY block_num, log_idx) AS rn")
     );
     assert!(sql.contains("WHERE rn = 1"));
-    assert!(sql.contains("ROW_NUMBER() OVER (ORDER BY block_num, log_idx) AS record_id"));
 
-    // Ascending in both, where the head queries are descending: this one wants
-    // the oldest row per key, not the newest.
+    // Ascending, where the head queries are descending: this one wants the
+    // oldest row per key, not the newest.
     assert!(!sql.contains("DESC"), "{sql}");
+
+    // The numbering itself is no longer in SQL, and cannot be: the query pages
+    // on the checksum hash, and no page knows how many records preceded it.
+    assert!(!sql.contains("record_id"), "{sql}");
 }
 
 #[test]
@@ -253,7 +256,7 @@ fn record_numbering_reads_topics_and_not_the_data_section() {
     // Why it can fold at all where a whole records projection cannot: the
     // checksum hash is indexed, so the query never meets the dynamic argument
     // tidx would hand back as an ABI offset word.
-    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99);
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99, "");
     assert!(sql.contains("topic1 AS checksum_hash"));
     assert!(sql.contains("FROM logs "), "{sql}");
     assert!(
@@ -269,11 +272,11 @@ fn record_numbering_is_scoped_to_one_deployment_and_bounded() {
     // without the address any registry's records would be numbered together.
     let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
     let topic0 = RECORD_ADDED_TOPIC.trim_start_matches("0x");
-    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 7);
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 7, "");
     assert!(sql.contains(&format!("address = '\\x{hexed}'")));
     assert!(sql.contains(&format!("selector = '\\x{topic0}'")));
     assert!(sql.contains("AND block_num <= 7"));
-    assert!(record_ids_sql(Engine::ClickHouse, REGISTRY, 7).contains(&format!("'0x{hexed}'")));
+    assert!(record_ids_sql(Engine::ClickHouse, REGISTRY, 7, "").contains(&format!("'0x{hexed}'")));
     assert!(!sql.contains("::bytea"));
 }
 
@@ -285,9 +288,9 @@ fn the_roles_query_is_scoped_to_one_deployment() {
     // breath, since both predicates ride the pushdown together.
     let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
     let bound = "AND block_num <= 7";
-    assert!(roles_sql(Engine::Postgres, REGISTRY, 7)
+    assert!(roles_sql(Engine::Postgres, REGISTRY, 7, "")
         .contains(&format!("address = '\\x{hexed}' {bound}")));
-    assert!(roles_sql(Engine::ClickHouse, REGISTRY, 7)
+    assert!(roles_sql(Engine::ClickHouse, REGISTRY, 7, "")
         .contains(&format!("address = '0x{hexed}' {bound}")));
 }
 
@@ -368,7 +371,7 @@ fn the_registries_query_is_scoped_to_one_factory_and_ordered_by_deployment() {
     // tidx's tables filter on topic0 alone, so every factory would answer.
     let hexed = FACTORY.trim_start_matches("0x").to_lowercase();
     let topic0 = REGISTRY_DEPLOYED_TOPIC.trim_start_matches("0x");
-    let sql = registries_sql(Engine::Postgres, FACTORY, 7);
+    let sql = registries_sql(Engine::Postgres, FACTORY, 7, "");
     assert!(sql.contains(&format!("address = '\\x{hexed}'")), "{sql}");
     assert!(sql.contains(&format!("selector = '\\x{topic0}'")), "{sql}");
     assert!(sql.contains("AND block_num <= 7"), "{sql}");
@@ -521,7 +524,7 @@ fn a_namespace_scoped_heads_query_narrows_on_the_caller_topic() {
     // is the assertion that would have.
     let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
     let word = format!("{hexed:0>64}");
-    let scoped = namespace_heads_sql(Engine::Postgres, REGISTRY, 7);
+    let scoped = namespace_heads_sql(Engine::Postgres, REGISTRY, 7, "");
     assert!(
         scoped.contains(&format!("topic1 = '\\x{word}'")),
         "{scoped}"
@@ -567,6 +570,27 @@ fn the_row_cap_is_the_one_tidx_enforces() {
     // Pinned against tidx's `HARD_LIMIT_MAX`. If they diverge, the check fires
     // late or never — and never is a silent short answer.
     assert_eq!(HARD_LIMIT, 10_000);
+}
+
+#[test]
+fn records_are_numbered_in_first_anchor_order_whatever_order_they_arrive_in() {
+    // The query pages on the checksum hash, so rows come back in hash order and
+    // no page knows what preceded it. The id is the position once they are put
+    // back in log order — which is the order the contract's counter used.
+    let ids = parse_record_ids(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["checksum_hash", "block_num", "log_idx"],
+        "rows": [
+            [topic("cc"), 9, 1],   // hash order puts this first...
+            [topic("aa"), 4, 2],   // ...but this record is older
+            [topic("bb"), 4, 7],   // same block, later in it
+        ],
+    })))
+    .expect("three first-appearances");
+
+    assert_eq!(ids[&topic("aa")], 1);
+    assert_eq!(ids[&topic("bb")], 2, "same block, ordered by log_idx");
+    assert_eq!(ids[&topic("cc")], 3);
 }
 
 #[test]

@@ -23,7 +23,7 @@ use serde::Serialize;
 
 use crate::envelope::{bytes32_label, decode_envelope, decode_strings};
 use crate::eth::{address_from_topic, normalize_hex, strip_hex};
-use crate::tidx::{number, text, Engine, Head, Table};
+use crate::tidx::{number, text, Engine, Head, Key, Table};
 
 /// `RegistryDeployed`'s topic0, the selector [`registries_sql`] filters on.
 /// The factory's event, not a registry's -- but it belongs in the same table so
@@ -87,12 +87,19 @@ pub const ROLE_EVENTS: &[&str] = &[
 /// contract per registry is what removed the registry id from the key, the seed
 /// arm that used to supply the creator's admin, and the `topic1` narrowing that
 /// used to keep one registry's answer out of another's.
-pub fn roles_sql(engine: Engine, registry: &str, up_to: u64) -> String {
+/// What [`roles_sql`] pages on, which is the role key its window partitions by.
+pub const ROLES_KEY: Key<'static> = &[
+    ("checksumHash", "\"checksumHash\""),
+    ("account", "account"),
+    ("role", "role"),
+];
+
+pub fn roles_sql(engine: Engine, registry: &str, up_to: u64, after: &str) -> String {
     // Repeated into both arms on purpose. tidx pushes these predicates into the
     // CTEs it generates, and PostgreSQL inlines those CTEs and pushes them again;
     // the copies here are what filters if either ever stops.
     let filter = format!(
-        "address = {} AND block_num <= {up_to}",
+        "address = {} AND block_num <= {up_to}{after}",
         engine.bytes_literal(registry),
     );
     // The role key: what the projection returns, and what it partitions by.
@@ -110,7 +117,7 @@ pub fn roles_sql(engine: Engine, registry: &str, up_to: u64) -> String {
                   ROW_NUMBER() OVER (PARTITION BY {key} \
                                      ORDER BY block_num DESC, log_idx DESC) AS rn \
            FROM acl\
-         ) held WHERE rn = 1 AND granted",
+         ) held WHERE rn = 1 AND granted ORDER BY {key}",
         granted = arm("RoleGranted", "TRUE"),
         revoked = arm("RoleRevoked", "FALSE"),
     )
@@ -124,11 +131,15 @@ pub fn roles_sql(engine: Engine, registry: &str, up_to: u64) -> String {
 /// `topic1`, so numbering never touches the data section and needs no
 /// `?signature=`.
 ///
-/// Two windows, not one. The inner keeps each checksum's *first* appearance, the
-/// outer numbers those; numbering the rows would give every version an id, so
-/// re-anchoring an early record would shift every record after it. Ascending,
-/// where [`crate::tidx::heads_sql`] is descending — that wants the newest row
-/// per key, this one the oldest.
+/// The window keeps each checksum's *first* appearance — numbering the rows
+/// themselves would give every version an id, so re-anchoring an early record
+/// would shift every record after it. Ascending, where
+/// [`crate::tidx::heads_sql`] is descending: that wants the newest row per key,
+/// this one the oldest.
+///
+/// Ordered by the hash so it can page on its own partition; the numbering is
+/// applied to the result by [`parse_record_ids`], since no page knows what came
+/// before it.
 ///
 /// Cost tracks the registry's own `RecordAdded` rows, not the chain. Measured on
 /// tidx's schema in PostgreSQL 16, index-backed with no sequential scan:
@@ -139,18 +150,22 @@ pub fn roles_sql(engine: Engine, registry: &str, up_to: u64) -> String {
 /// | this, 200k-record registry | 600k | 200k | 468ms |
 /// | `heads_sql`, for scale | 200k | 40k | 153ms |
 ///
-/// A full recomputation, with no cheap single-record path — a number is a
-/// property of the whole ordering. Materialize it for a large registry rather
+/// A full walk, with no cheap single-record path — a number is a property of
+/// the whole ordering. Materialize it for a large registry rather
 /// than answering a page load with it.
-pub fn record_ids_sql(engine: Engine, registry: &str, up_to: u64) -> String {
+/// What [`record_ids_sql`] pages on: the checksum hash, which is its window's
+/// partition, so a page holds every row of every record it reports on.
+pub const RECORD_IDS_KEY: Key<'static> = &[("checksum_hash", "topic1")];
+
+pub fn record_ids_sql(engine: Engine, registry: &str, up_to: u64, after: &str) -> String {
     format!(
-        "SELECT checksum_hash, ROW_NUMBER() OVER (ORDER BY block_num, log_idx) AS record_id \
-         FROM (\
+        "SELECT checksum_hash, block_num, log_idx FROM (\
            SELECT topic1 AS checksum_hash, block_num, log_idx, \
                   ROW_NUMBER() OVER (PARTITION BY topic1 \
                                      ORDER BY block_num, log_idx) AS rn \
-           FROM logs WHERE address = {} AND selector = {} AND block_num <= {up_to}\
-         ) firsts WHERE rn = 1",
+           FROM logs WHERE address = {} AND selector = {} \
+                 AND block_num <= {up_to}{after}\
+         ) firsts WHERE rn = 1 ORDER BY checksum_hash",
         engine.bytes_literal(registry),
         engine.bytes_literal(RECORD_ADDED_TOPIC),
     )
@@ -169,10 +184,14 @@ pub fn record_ids_sql(engine: Engine, registry: &str, up_to: u64) -> String {
 /// address is a parameter for the reason it is everywhere else here -- tidx's
 /// tables filter on topic0 alone, so without it any contract emitting the same
 /// event answers too.
-pub fn registries_sql(engine: Engine, factory: &str, up_to: u64) -> String {
+/// What [`registries_sql`] pages on. No window to align to — deployment order
+/// *is* the order, so the cursor is the last row's place in the log.
+pub const REGISTRIES_KEY: Key<'static> = &[("block_num", "block_num"), ("log_idx", "log_idx")];
+
+pub fn registries_sql(engine: Engine, factory: &str, up_to: u64, after: &str) -> String {
     format!(
-        "SELECT topic1 AS registry, topic2 AS creator, data, block_num \
-         FROM logs WHERE address = {} AND selector = {} AND block_num <= {up_to} \
+        "SELECT topic1 AS registry, topic2 AS creator, data, block_num, log_idx \
+         FROM logs WHERE address = {} AND selector = {} AND block_num <= {up_to}{after} \
          ORDER BY block_num, log_idx",
         engine.bytes_literal(factory),
         engine.bytes_literal(REGISTRY_DEPLOYED_TOPIC),
@@ -278,22 +297,36 @@ pub fn parse_roles(table: &Table) -> Result<Vec<RoleHeld>> {
 }
 
 /// [`record_ids_sql`]'s rows, as `checksum_hash -> record_id`.
+///
+/// The numbering happens here rather than in SQL. The query pages on the
+/// checksum hash, so it arrives in hash order and no page knows how many
+/// records came before it — but sorted back into first-anchor order, a record's
+/// position *is* the id the contract used to assign.
 pub fn parse_record_ids(table: &Table) -> Result<BTreeMap<String, u64>> {
-    let (hash, id) = (
+    let (hash, block, idx) = (
         table.index_of("checksum_hash")?,
-        table.index_of("record_id")?,
+        table.index_of("block_num")?,
+        table.index_of("log_idx")?,
     );
-    table
+    let mut firsts = table
         .rows
         .iter()
         .enumerate()
         .map(|(i, row)| {
+            let at = |name| format!("row {i}: no {name}");
             Ok((
+                number(row, block).with_context(|| at("block_num"))?,
+                number(row, idx).with_context(|| at("log_idx"))?,
                 normalize_hex(text(row, hash)),
-                number(row, id).with_context(|| format!("row {i}: no record_id"))?,
             ))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    firsts.sort_unstable();
+    Ok(firsts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, _, hash))| (hash, i as u64 + 1))
+        .collect())
 }
 
 /// One record at its newest version, with the status anchored against that

@@ -34,11 +34,14 @@ refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since that is this
 process misconfigured rather than the one behind it. None of them is ever an
 empty result — an empty list means a registry with nothing in it.
 
-**The projections refuse rather than truncate.** tidx caps a query at 10,000
-rows and says nothing when it hits that, so a registry past that size errors
-instead of answering short — a short list would be indistinguishable from a
-complete one. The audit walks its heads by cursor and has no such ceiling;
-paging the projections the same way is not written yet.
+**Paged, and it refuses rather than truncates.** tidx caps a query at 10,000
+rows and says nothing when it hits that, so every projection walks by cursor
+until a page comes back short. The cursor is the query's own ordering, which for
+a windowed query is also its partition — a page boundary that fell inside a
+partition would fold "newest per key" from half a key's rows. Anything that
+somehow arrives full anyway is an error: a short list is indistinguishable from
+a complete one. `PAGE_SIZE` lowers the rows per round trip, which is only worth
+doing to watch the loop work.
 
 ```bash
 CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo run

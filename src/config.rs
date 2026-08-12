@@ -22,15 +22,15 @@ pub struct Settings {
     /// The precompile arrives at T10, so an index reaching this far back has
     /// seen every anchor there is.
     pub first_block: u64,
-    /// Rows per tidx round trip. Only worth setting below the default to make
-    /// the paging loop observable in a test.
-    pub page_size: usize,
     /// The `RegistryFactory` whose deployments `/registries` lists. Optional
     /// because the audit needs no factory; the endpoint says so rather than
     /// listing every contract that emits the same event.
     pub factory: Option<String>,
     /// Where `serve` listens.
     pub bind: String,
+    /// Rows per tidx round trip. Only worth setting below the default to make
+    /// the paging loop observable in a test.
+    pub page_size: usize,
 }
 
 impl Settings {
@@ -57,10 +57,6 @@ impl Settings {
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(0),
-            page_size: env::var("PAGE_SIZE")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(HARD_LIMIT),
             // Validated at startup, not per request: a typo here would query a
             // real-looking other address and list nothing.
             factory: match env::var("FACTORY_ADDRESS") {
@@ -71,6 +67,10 @@ impl Settings {
                 Err(_) => None,
             },
             bind: env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
+            page_size: env::var("PAGE_SIZE")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(HARD_LIMIT),
         })
     }
 }

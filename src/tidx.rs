@@ -298,8 +298,7 @@ impl Tidx {
             ("sql", sql),
         ];
         params.extend(signatures.iter().map(|s| ("signature", *s)));
-        let table = Table::from_response(&self.get_json("/query", &params).await?)?;
-        reject_truncated(table, HARD_LIMIT)
+        Table::from_response(&self.get_json("/query", &params).await?)
     }
 
     /// A query walked to exhaustion, one page per round trip.
@@ -312,8 +311,23 @@ impl Tidx {
     /// boundary that falls inside a partition would compute "newest per key"
     /// from half a key's rows. Aligned to the partition, every page's window is
     /// as correct as the unpaged one's.
-    pub async fn paged(&self, key: Key<'_>, build: impl Fn(&str) -> String) -> Result<Table> {
-        let mut all = self.one_page(&build(""), &[]).await?;
+    /// A query walked to exhaustion, one page per round trip.
+    ///
+    /// `build` is handed an `AND …` predicate placing it after the last row
+    /// seen, and `key` names the columns that predicate is over — which must be
+    /// the columns the query orders by.
+    ///
+    /// For a windowed query those columns must also be the *partition*: a page
+    /// boundary that falls inside a partition would compute "newest per key"
+    /// from half a key's rows. Aligned to the partition, every page's window is
+    /// as correct as the unpaged one's.
+    pub async fn paged(
+        &self,
+        signatures: &[&str],
+        key: Key<'_>,
+        build: impl Fn(&str) -> String,
+    ) -> Result<Table> {
+        let mut all = self.one_page(&build(""), signatures).await?;
         let (mut fetched, mut after) = (all.rows.len(), String::new());
         while fetched >= self.page {
             let last = all
@@ -330,7 +344,7 @@ impl Tidx {
                 bail!("paging stalled: {} does not advance", columns.join(", "));
             }
             after = next;
-            let mut page = self.one_page(&build(&after), &[]).await?;
+            let mut page = self.one_page(&build(&after), signatures).await?;
             fetched = page.rows.len();
             all.rows.append(&mut page.rows);
         }
@@ -341,7 +355,7 @@ impl Tidx {
     /// audit compares against the chain's storage at that same block.
     pub async fn heads(&self, up_to: u64) -> Result<Vec<Head>> {
         let table = self
-            .paged(HEADS_KEY, |after| heads_sql(self.engine, up_to, after))
+            .paged(&[], HEADS_KEY, |after| heads_sql(self.engine, up_to, after))
             .await?;
         parse_heads(&table)
     }
@@ -365,21 +379,21 @@ impl Tidx {
 /// Bounded at `up_to` because tidx's realtime sync runs ahead of its contiguous
 /// interval: an unbounded query can return a head newer than the block the
 /// audit reads state at, which reports as a mismatch that is really skew.
-/// What [`heads_sql`] pages on: the indexed caller and key, which are also its
-/// window's partition, so a page boundary never splits one.
-pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
-
 pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
     heads_where(engine, None, up_to, after)
 }
+
+/// What [`heads_sql`] pages on: the indexed caller and key, which are also its
+/// window's partition, so a page boundary never splits one.
+pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
 
 /// The same rule narrowed to one namespace — one registry's heads, for a
 /// projection over its records rather than an audit over the whole chain.
 ///
 /// `topic1` is the caller, and `idx_logs_address_topic1` leads on it, so this is
 /// the cheaper query of the two despite doing the same thing.
-pub fn namespace_heads_sql(engine: Engine, namespace: &str, up_to: u64) -> String {
-    heads_where(engine, Some(namespace), up_to, "")
+pub fn namespace_heads_sql(engine: Engine, namespace: &str, up_to: u64, after: &str) -> String {
+    heads_where(engine, Some(namespace), up_to, after)
 }
 
 fn heads_where(engine: Engine, namespace: Option<&str>, up_to: u64, after: &str) -> String {

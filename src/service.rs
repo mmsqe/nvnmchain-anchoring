@@ -27,9 +27,9 @@ use crate::config::Settings;
 use crate::eth::parse_address;
 use crate::registry::{
     parse_record_ids, parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql,
-    roles_sql, ROLE_EVENTS,
+    roles_sql, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
 };
-use crate::tidx::{namespace_heads_sql, parse_heads, Tidx};
+use crate::tidx::{namespace_heads_sql, parse_heads, Tidx, HEADS_KEY};
 
 pub struct Ctx {
     pub tidx: Tidx,
@@ -100,7 +100,9 @@ async fn registries(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError
     let at = ctx.tidx.coverage().await?.tip_num;
     let table = ctx
         .tidx
-        .query(&registries_sql(ctx.cfg.engine, factory, at))
+        .paged(&[], REGISTRIES_KEY, |after| {
+            registries_sql(ctx.cfg.engine, factory, at, after)
+        })
         .await?;
     Ok(Json(json!({
         "factory": factory,
@@ -117,7 +119,9 @@ async fn roles(
     let at = ctx.tidx.coverage().await?.tip_num;
     let table = ctx
         .tidx
-        .query_with(&roles_sql(ctx.cfg.engine, &registry, at), ROLE_EVENTS)
+        .paged(ROLE_EVENTS, ROLES_KEY, |after| {
+            roles_sql(ctx.cfg.engine, &registry, at, after)
+        })
         .await?;
     Ok(Json(json!({
         "registry": registry,
@@ -136,12 +140,16 @@ async fn records(
     // one state of the chain rather than two.
     let ids = parse_record_ids(
         &ctx.tidx
-            .query(&record_ids_sql(ctx.cfg.engine, &registry, at))
+            .paged(&[], RECORD_IDS_KEY, |after| {
+                record_ids_sql(ctx.cfg.engine, &registry, at, after)
+            })
             .await?,
     )?;
     let heads = parse_heads(
         &ctx.tidx
-            .query(&namespace_heads_sql(ctx.cfg.engine, &registry, at))
+            .paged(&[], HEADS_KEY, |after| {
+                namespace_heads_sql(ctx.cfg.engine, &registry, at, after)
+            })
             .await?,
     )?;
     Ok(Json(json!({
