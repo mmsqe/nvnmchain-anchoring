@@ -380,30 +380,69 @@ impl Tidx {
 /// interval: an unbounded query can return a head newer than the block the
 /// audit reads state at, which reports as a mismatch that is really skew.
 pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
-    heads_where(engine, None, up_to, after)
+    heads_where(engine, Scope::default(), up_to, after)
 }
 
 /// What [`heads_sql`] pages on: the indexed caller and key, which are also its
 /// window's partition, so a page boundary never splits one.
 pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
 
-/// The same rule narrowed to one namespace — one registry's heads, for a
-/// projection over its records rather than an audit over the whole chain.
+/// Which heads to keep, on the two indexed topics — `topic1` is the caller,
+/// `topic2` the key — independently: one namespace's records, one key across
+/// every namespace, or both.
 ///
-/// `topic1` is the caller, and `idx_logs_address_topic1` leads on it, so this is
-/// the cheaper query of the two despite doing the same thing.
-pub fn namespace_heads_sql(engine: Engine, namespace: &str, up_to: u64, after: &str) -> String {
-    heads_where(engine, Some(namespace), up_to, after)
+/// Narrowing on the key is what a lookup *by checksum* is: a record's key derives
+/// from its checksum and nothing else, so the same checksum anchored by two
+/// registries is one key under two namespaces.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scope<'a> {
+    pub namespace: Option<&'a str>,
+    /// Empty for every key. More than one only to fetch a set of derived keys —
+    /// the statuses of a record's versions — in one round trip.
+    pub keys: &'a [String],
 }
 
-fn heads_where(engine: Engine, namespace: Option<&str>, up_to: u64, after: &str) -> String {
-    let scope = namespace.map_or_else(String::new, |ns| {
+impl<'a> Scope<'a> {
+    pub fn of(namespace: &'a str) -> Self {
+        Self {
+            namespace: Some(namespace),
+            keys: &[],
+        }
+    }
+
+    pub fn keyed(keys: &'a [String]) -> Self {
+        Self {
+            namespace: None,
+            keys,
+        }
+    }
+}
+
+/// The heads rule under a [`Scope`].
+pub fn scoped_heads_sql(engine: Engine, scope: Scope<'_>, up_to: u64, after: &str) -> String {
+    heads_where(engine, scope, up_to, after)
+}
+
+fn heads_where(engine: Engine, scope: Scope<'_>, up_to: u64, after: &str) -> String {
+    let namespace = scope.namespace.map_or_else(String::new, |ns| {
         // `topic1` is a 32-byte word with the address right-aligned, not the
         // 20-byte `address` column beside it. Comparing the bare address matches
         // no row at all, which reads as a registry that has anchored nothing.
         let word = format!("{:0>64}", strip_hex(ns));
         format!(" AND topic1 = {}", engine.bytes_literal(&word))
     });
+    let keys = match scope.keys {
+        [] => String::new(),
+        [one] => format!(" AND topic2 = {}", engine.bytes_literal(one)),
+        many => format!(
+            " AND topic2 IN ({})",
+            many.iter()
+                .map(|key| engine.bytes_literal(key))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let scope = format!("{namespace}{keys}");
     format!(
         "SELECT namespace, key, data FROM (\
            SELECT topic1 AS namespace, topic2 AS key, data, \
@@ -415,6 +454,52 @@ fn heads_where(engine: Engine, namespace: Option<&str>, up_to: u64, after: &str)
         engine.bytes_literal(ADDRESS),
         engine.bytes_literal(ANCHORED_TOPIC),
     )
+}
+
+/// One anchor as it was written, rather than the head it may since have stopped
+/// being. Carries the block so a version history can say when each one landed.
+#[derive(Debug, Clone)]
+pub struct Anchor {
+    pub head: Head,
+    pub block_num: u64,
+}
+
+/// Every anchor under one `(namespace, key)`, oldest first.
+///
+/// The one query here that does not fold to heads: the chain keeps a single word
+/// per key, so a record's earlier versions exist only as the log rows the head
+/// replaced. Bounded and ordered like the rest.
+pub fn anchors_sql(engine: Engine, namespace: &str, key: &str, up_to: u64, after: &str) -> String {
+    let word = format!("{:0>64}", strip_hex(namespace));
+    format!(
+        "SELECT topic1 AS namespace, topic2 AS key, data, block_num, log_idx \
+         FROM logs WHERE address = {} AND selector = {} AND topic1 = {} AND topic2 = {} \
+               AND block_num <= {up_to}{after} ORDER BY block_num, log_idx",
+        engine.bytes_literal(ADDRESS),
+        engine.bytes_literal(ANCHORED_TOPIC),
+        engine.bytes_literal(&word),
+        engine.bytes_literal(key),
+    )
+}
+
+/// What [`anchors_sql`] pages on: its place in the log, which is also its order.
+/// No window to align to — every row is returned, not one per partition.
+pub const ANCHORS_KEY: Key<'static> = &[("block_num", "block_num"), ("log_idx", "log_idx")];
+
+/// [`anchors_sql`]'s rows. Same decode as a head, plus the block it landed in.
+pub fn parse_anchors(table: &Table) -> Result<Vec<Anchor>> {
+    let block = table.index_of("block_num")?;
+    parse_heads(table)?
+        .into_iter()
+        .zip(table.rows.iter())
+        .map(|(head, row)| {
+            Ok(Anchor {
+                block_num: number(row, block)
+                    .with_context(|| format!("key {}: no block_num", head.key))?,
+                head,
+            })
+        })
+        .collect()
 }
 
 /// Rows into heads. Every log this query returns was written by the precompile,
