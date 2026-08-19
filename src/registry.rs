@@ -198,6 +198,24 @@ pub fn registries_sql(engine: Engine, factory: &str, up_to: u64, after: &str) ->
     )
 }
 
+/// Whether one address is a registry this factory deployed.
+///
+/// The announced address is `topic1` and indexed, so this is a lookup where
+/// [`registries_sql`] is a walk. It answers the question the module answered with
+/// "registry 999 does not exist": an id was a number the module could check
+/// against its counter, and the address that replaced it carries no such fact —
+/// the deployment log is where it went.
+pub fn deployment_sql(engine: Engine, factory: &str, registry: &str, up_to: u64) -> String {
+    let word = format!("{:0>64}", strip_hex(registry));
+    format!(
+        "SELECT block_num FROM logs WHERE address = {} AND selector = {} AND topic1 = {} \
+               AND block_num <= {up_to} ORDER BY block_num",
+        engine.bytes_literal(factory),
+        engine.bytes_literal(REGISTRY_DEPLOYED_TOPIC),
+        engine.bytes_literal(&word),
+    )
+}
+
 /// One registry, as the deployment log announces it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Deployed {

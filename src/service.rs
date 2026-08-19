@@ -28,9 +28,9 @@ use crate::config::Settings;
 use crate::envelope::{record_key, status_key};
 use crate::eth::{keccak_hex, parse_address};
 use crate::registry::{
-    parse_record_ids, parse_records, parse_records_at, parse_registries, parse_roles,
-    parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql, RECORD_IDS_KEY,
-    REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
+    deployment_sql, parse_record_ids, parse_records, parse_records_at, parse_registries,
+    parse_roles, parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql,
+    RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
 };
 use crate::tidx::{
     anchors_sql, namespace_heads_sql, parse_anchors, parse_heads, scoped_heads_sql, Scope, Tidx,
@@ -115,6 +115,7 @@ async fn versions(
     let hash = keccak_hex(checksum.as_bytes());
     let key = record_key(&hash).expect("a keccak digest is a 32-byte word");
     let at = ctx.tidx.coverage().await?.tip_num;
+    require_deployed(&ctx, &registry, at).await?;
 
     let anchors = parse_anchors(
         &ctx.tidx
@@ -161,6 +162,29 @@ async fn versions(
         "at_block": at,
         "versions": versions,
     })))
+}
+
+/// Whether this address is a registry at all, when there is a factory to ask.
+///
+/// "registry 999 does not exist" was a number held against a counter. The address
+/// that replaced the id carries no such fact, but the factory announced every
+/// registry it deployed — so the same question goes to the log. Without a
+/// `FACTORY_ADDRESS` there is nothing to ask and every address is answered for,
+/// which is the audit-only configuration rather than a registry that exists.
+async fn require_deployed(ctx: &Ctx, registry: &str, at: u64) -> Result<(), ApiError> {
+    let Some(factory) = ctx.cfg.factory.as_deref() else {
+        return Ok(());
+    };
+    let deployments = ctx
+        .tidx
+        .query(&deployment_sql(ctx.cfg.engine, factory, registry, at))
+        .await?;
+    if deployments.rows.is_empty() {
+        return Err(not_found(format!(
+            "{registry} is not a registry deployed by {factory}"
+        )));
+    }
+    Ok(())
 }
 
 /// The statuses currently held under `keys`, as
@@ -276,6 +300,7 @@ async fn roles(
 ) -> Result<Json<Value>, ApiError> {
     let registry = registry_of(&address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
+    require_deployed(&ctx, &registry, at).await?;
     let table = ctx
         .tidx
         .paged(ROLE_EVENTS, ROLES_KEY, |after| {
@@ -295,6 +320,7 @@ async fn records(
 ) -> Result<Json<Value>, ApiError> {
     let registry = registry_of(&address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
+    require_deployed(&ctx, &registry, at).await?;
     // Both bounded at the same block, so the numbering and the heads describe
     // one state of the chain rather than two.
     let ids = parse_record_ids(

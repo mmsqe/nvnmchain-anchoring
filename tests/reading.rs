@@ -10,9 +10,9 @@ use std::collections::BTreeMap;
 
 use nvnmchain_anchoring::envelope::{record_key, status_key};
 use nvnmchain_anchoring::registry::{
-    parse_record_ids, parse_records, parse_records_at, parse_registries, parse_roles,
-    parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql, RECORD_ADDED_TOPIC,
-    REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
+    deployment_sql, parse_record_ids, parse_records, parse_records_at, parse_registries,
+    parse_roles, parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql,
+    RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
 };
 use nvnmchain_anchoring::tidx::{
     anchors_sql, cursor_after, heads_sql, namespace_heads_sql, parse_coverage, parse_heads,
@@ -647,6 +647,27 @@ fn a_strangers_anchor_under_the_same_key_is_counted_not_fatal() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].registry, REGISTRY);
     assert_eq!(other, 1, "and the answer says what it left out");
+}
+
+#[test]
+fn one_deployment_is_looked_up_rather_than_walked_for() {
+    // "registry 999 does not exist" was a number held against a counter. The
+    // address that replaced the id carries no such fact, so the deployment log
+    // answers instead — on `topic1`, which is indexed, and scoped to the one
+    // factory whose registries this service knows.
+    let sql = deployment_sql(Engine::Postgres, NAMESPACE, REGISTRY, 7);
+    let factory = NAMESPACE.trim_start_matches("0x").to_lowercase();
+    let word = format!("{:0>64}", REGISTRY.trim_start_matches("0x").to_lowercase());
+    assert!(sql.contains(&format!("address = '\\x{factory}'")), "{sql}");
+    assert!(sql.contains(&format!("topic1 = '\\x{word}'")), "{sql}");
+    assert!(
+        sql.contains(&format!(
+            "selector = '\\x{}'",
+            REGISTRY_DEPLOYED_TOPIC.trim_start_matches("0x")
+        )),
+        "{sql}"
+    );
+    assert!(sql.contains("block_num <= 7"), "bounded like every other");
 }
 
 #[test]

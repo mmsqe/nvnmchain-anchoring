@@ -46,10 +46,17 @@ and one filter on an indexed topic answers for all of them. It carries no
 never walks; and a payload that is not a record is counted in `other` rather than
 failing the request, since anyone may anchor under any key.
 
-A malformed address is a 400 and never reaches SQL; tidx being unreachable or
-refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since that is this
-process misconfigured rather than the one behind it. None of them is ever an
-empty result — an empty list means a registry with nothing in it.
+A malformed address is a 400 and never reaches SQL; an address the factory never
+deployed, or a checksum with nothing anchored under it, is a 404; tidx being
+unreachable or refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since
+that is this process misconfigured rather than the one behind it. None of them is
+ever an empty result — an empty list means a registry with nothing in it.
+
+The 404 is the module's "registry 999 does not exist", restored where the log can
+still establish it: an id was a number to hold against a counter, and the address
+that replaced it is a registry only because the factory announced it. Without a
+`FACTORY_ADDRESS` (the audit-only setup) every address is answered for, since
+nothing then distinguishes a registry from any other address.
 
 **Paged, and it refuses rather than truncates.** tidx caps a query at 10,000
 rows and says nothing when it hits that, so every projection walks by cursor
