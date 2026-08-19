@@ -27,7 +27,24 @@ GET /health                          how far the index this answers from reaches
 GET /registries                      every registry the factory deployed, in order
 GET /registries/{address}/records    each record decoded, at its newest version
 GET /registries/{address}/roles      every role held, folded from the log
+GET /registries/{address}/records/{checksum}   one record's versions, oldest first
+GET /records/{checksum}              every registry that anchored this checksum
 ```
+
+The version list is the one projection that does not fold to heads: the chain
+keeps a single word per key, so every version before the newest exists only as
+the log row the head replaced. A checksum with nothing anchored under it there is
+a 404 — the one "does not exist" an index can establish about a record, the query
+being over the registry's own namespace at a derived key.
+
+`/records/{checksum}` is the lookup no per-registry path can serve, and what the
+module answered for `records(registry_id = 0, checksum, …)`. A record's key is
+`keccak256(abi.encode("record", keccak256(checksum)))` — the checksum and nothing
+else — so the same checksum in two registries is one key under two namespaces,
+and one filter on an indexed topic answers for all of them. It carries no
+`number`, which is a property of one registry's whole ordering that this query
+never walks; and a payload that is not a record is counted in `other` rather than
+failing the request, since anyone may anchor under any key.
 
 A malformed address is a 400 and never reaches SQL; tidx being unreachable or
 refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since that is this
@@ -124,11 +141,14 @@ rather than closing it: a run reports when the index has not reached back to
 
 ## Status
 
-The decoder, the audit, and `serve` over registries, records and roles are in.
-Version *history* is not: `/records` answers at each record's newest version,
-because that is what the chain keeps — one word per key. Earlier versions are in
-the log and want their own endpoint rather than a field that could quietly be
-short.
+The decoder, the audit, and `serve` over registries, records, roles, one
+checksum across every registry, and one record's versions are in.
+
+`/registries/{address}/records` still answers at each record's newest version,
+because that is what the chain keeps — one word per key. History got the separate
+endpoint it wanted rather than a field on the listing that could quietly be
+short: `/registries/{address}/records/{checksum}` returns every version from the
+log, each with its own envelope and the status anchored against it.
 
 `records` is where the decoder earns the repo: four of `Record`'s ten fields
 exist only inside the anchored payload, and `metadata` is a dynamic `bytes` that

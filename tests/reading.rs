@@ -8,13 +8,15 @@ use nvnmchain_anchoring::eth::{checksum_address, keccak_hex, parse_address};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
 use std::collections::BTreeMap;
 
+use nvnmchain_anchoring::envelope::{record_key, status_key};
 use nvnmchain_anchoring::registry::{
-    parse_record_ids, parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql,
-    roles_sql, RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
+    parse_record_ids, parse_records, parse_records_at, parse_registries, parse_roles,
+    parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql, RECORD_ADDED_TOPIC,
+    REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
 };
 use nvnmchain_anchoring::tidx::{
-    cursor_after, heads_sql, namespace_heads_sql, parse_coverage, parse_heads, reject_truncated,
-    Engine, Head, Table, HARD_LIMIT, HEADS_KEY,
+    anchors_sql, cursor_after, heads_sql, namespace_heads_sql, parse_coverage, parse_heads,
+    reject_truncated, scoped_heads_sql, Anchor, Engine, Head, Scope, Table, HARD_LIMIT, HEADS_KEY,
 };
 use serde_json::json;
 
@@ -512,6 +514,180 @@ fn a_record_the_numbering_did_not_reach_keeps_its_place_and_says_so() {
     let records = parse_records(&[head(RECORD_KEY, RECORD_METADATA)], &BTreeMap::new())
         .expect("a record with no number");
     assert_eq!(records[0].number, None);
+}
+
+/// The fixture record payload with its version index moved. The key derives from
+/// the checksum alone, so this is the envelope the contract emits for the next
+/// version of the same record — one word apart, which is the whole difference.
+fn record_at_version(index: u64) -> String {
+    let mut raw = bytes(RECORD_METADATA);
+    let mut word = [0u8; 32];
+    word[24..].copy_from_slice(&index.to_be_bytes());
+    raw[64..96].copy_from_slice(&word);
+    format!("0x{}", hex::encode(raw))
+}
+
+fn anchor(metadata: &str, block_num: u64) -> Anchor {
+    Anchor {
+        head: head(RECORD_KEY, metadata),
+        block_num,
+    }
+}
+
+#[test]
+fn a_records_versions_come_back_in_log_order() {
+    // History lives only here: the chain keeps one word per key, so version 1 is
+    // whatever the head replaced. Every version carries its own envelope, so the
+    // fields are per version rather than the newest one's repeated.
+    let versions = parse_versions(&[
+        anchor(&record_at_version(1), 11),
+        anchor(&record_at_version(2), 22),
+    ])
+    .expect("two versions");
+
+    assert_eq!(
+        versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        versions.iter().map(|v| v.block_num).collect::<Vec<_>>(),
+        [11, 22]
+    );
+    assert!(versions.iter().all(|v| v.checksum == "0xabc"));
+    assert!(
+        versions.iter().all(|v| v.status.is_none()),
+        "attached after"
+    );
+}
+
+#[test]
+fn a_version_index_that_is_not_its_place_in_the_log_is_an_error() {
+    // The two orderings are the same fact twice: the contract increments the
+    // index once per anchor. Reading a history where they disagree would
+    // renumber somebody's versions silently.
+    let gap = parse_versions(&[
+        anchor(&record_at_version(1), 11),
+        anchor(&record_at_version(3), 22),
+    ]);
+    assert!(gap.is_err(), "{gap:?}");
+    assert!(gap.unwrap_err().to_string().contains("version 3"));
+}
+
+#[test]
+fn the_anchors_query_returns_every_row_under_one_key_oldest_first() {
+    // Not a heads query: this one keeps the rows the head replaced, which is the
+    // only place a version before the newest exists.
+    let sql = anchors_sql(Engine::Postgres, REGISTRY, RECORD_KEY, 7, "");
+    let word = format!("{:0>64}", REGISTRY.trim_start_matches("0x").to_lowercase());
+    assert!(sql.contains(&format!("topic1 = '\\x{word}'")), "{sql}");
+    assert!(
+        sql.contains(&format!(
+            "topic2 = '\\x{}'",
+            RECORD_KEY.trim_start_matches("0x")
+        )),
+        "{sql}"
+    );
+    assert!(!sql.contains("ROW_NUMBER"), "no fold to one row per key");
+    assert!(sql.contains("ORDER BY block_num, log_idx"), "{sql}");
+    assert!(sql.contains("block_num <= 7"), "{sql}");
+}
+
+#[test]
+fn the_anchored_keys_derive_from_the_checksum_alone() {
+    // What makes a lookup by checksum possible: the key is `keccak256(checksum)`
+    // put through the contract's own derivation, with no registry in it. Checked
+    // against payloads a forge run against the shipped contract emitted, so a
+    // drift in either derivation fails here rather than answering empty.
+    let hash = keccak_hex(b"0xabc");
+    assert_eq!(hash, FIXTURE_HASH);
+    assert_eq!(record_key(&hash).as_deref(), Some(RECORD_KEY));
+    assert_eq!(status_key(&hash, 1).as_deref(), Some(STATUS_KEY));
+    // A version that was never anchored still has a key; it just holds nothing.
+    assert_ne!(status_key(&hash, 2).as_deref(), Some(STATUS_KEY));
+}
+
+#[test]
+fn one_key_answers_for_every_registry_that_anchored_it() {
+    // The successor to `records(registry_id = 0, checksum, …)`: two registries
+    // holding the same checksum are two namespaces under one key.
+    let elsewhere = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E";
+    let mut theirs = head(RECORD_KEY, RECORD_METADATA);
+    theirs.namespace = elsewhere.to_string();
+
+    let (records, other) =
+        parse_records_at(&[head(RECORD_KEY, RECORD_METADATA), theirs]).expect("both registries");
+
+    assert_eq!(other, 0);
+    assert_eq!(
+        records
+            .iter()
+            .map(|r| r.registry.as_str())
+            .collect::<Vec<_>>(),
+        [elsewhere, REGISTRY],
+        "one row per registry, named by the address that anchored it"
+    );
+    assert!(records.iter().all(|r| r.record.checksum == "0xabc"));
+    // A number is a property of one registry's whole ordering, which a lookup
+    // filtered on a single key never walks.
+    assert!(records.iter().all(|r| r.record.number.is_none()));
+}
+
+#[test]
+fn a_strangers_anchor_under_the_same_key_is_counted_not_fatal() {
+    // Anyone may anchor under any key, so this lookup cannot treat a payload it
+    // does not recognise as its own copy gone bad — that would let one address
+    // take the answer away from every registry sharing the key. Left out and
+    // counted, where a registry's own namespace still errors.
+    let mut stranger = head(RECORD_KEY, "0xdeadbeef");
+    stranger.namespace = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E".to_string();
+
+    let (records, other) =
+        parse_records_at(&[head(RECORD_KEY, RECORD_METADATA), stranger]).expect("the registry's");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].registry, REGISTRY);
+    assert_eq!(other, 1, "and the answer says what it left out");
+}
+
+#[test]
+fn a_keyed_heads_query_narrows_on_the_key_topic() {
+    // `topic2` is the key. One key across every namespace is the cross-registry
+    // lookup; a set of them is one round trip for a record's statuses.
+    let one = [RECORD_KEY.to_string()];
+    let keyed = scoped_heads_sql(Engine::Postgres, Scope::keyed(&one), 7, "");
+    let bare = RECORD_KEY.trim_start_matches("0x");
+    assert!(keyed.contains(&format!("topic2 = '\\x{bare}'")), "{keyed}");
+    assert!(!keyed.contains("topic1 ="), "every namespace answers");
+
+    let both = [RECORD_KEY.to_string(), STATUS_KEY.to_string()];
+    let scope = Scope {
+        namespace: Some(REGISTRY),
+        keys: &both,
+    };
+    let many = scoped_heads_sql(Engine::Postgres, scope, 7, "");
+    assert!(many.contains("topic2 IN ("), "{many}");
+    assert!(many.contains(STATUS_KEY.trim_start_matches("0x")), "{many}");
+    assert!(many.contains("topic1 = "), "narrowed to one registry too");
+}
+
+#[test]
+fn statuses_are_keyed_by_the_namespace_that_anchored_them() {
+    // One status key is the same word in every registry holding that record at
+    // that version, so the namespace is the only thing keeping two apart.
+    let mut elsewhere = head(STATUS_KEY, STATUS_METADATA);
+    elsewhere.namespace = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E".to_string();
+    let statuses = parse_statuses(&[head(STATUS_KEY, STATUS_METADATA), elsewhere.clone()])
+        .expect("both statuses");
+
+    assert_eq!(statuses.len(), 2);
+    for namespace in [REGISTRY, elsewhere.namespace.as_str()] {
+        assert_eq!(
+            statuses
+                .get(&(namespace.to_string(), FIXTURE_HASH.to_string(), 1))
+                .map(String::as_str),
+            Some("approved"),
+        );
+    }
 }
 
 #[test]

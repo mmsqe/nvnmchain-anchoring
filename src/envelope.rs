@@ -1,6 +1,6 @@
 //! Reading a `Registry` payload out of anchored metadata.
 
-use crate::eth::{hex0x, keccak_hex, normalize_hex, word_to_u128, word_to_usize};
+use crate::eth::{hex0x, keccak_hex, normalize_hex, strip_hex, word_to_u128, word_to_usize};
 
 // Every envelope leads with a `bytes32` kind, so one word identifies the shape.
 // The ids in the payload must then reproduce the key it was anchored under,
@@ -178,6 +178,30 @@ pub fn bytes32_label(word: &[u8; 32]) -> String {
         }
         _ => hex0x(word),
     }
+}
+
+/// The key a record stream is anchored under, from its checksum hash —
+/// `Registry.recordKey`, derived rather than read from the contract.
+///
+/// Deriving it is what makes a lookup *by checksum* possible at all: the key is
+/// the only thing the index is filtered on, and it comes from the checksum and
+/// nothing else. Which is also why the same checksum in two registries is the
+/// same key under two namespaces.
+pub fn record_key(checksum_hash: &str) -> Option<String> {
+    Some(derive_key("record", &[word(checksum_hash)?]))
+}
+
+/// The key one version's status is anchored under — `Registry.statusKey`.
+pub fn status_key(checksum_hash: &str, index: u64) -> Option<String> {
+    Some(derive_key(
+        "status",
+        &[word(checksum_hash)?, usize_word(index as usize)],
+    ))
+}
+
+/// A 32-byte hex string as the word the contract hashed.
+fn word(hexed: &str) -> Option<[u8; 32]> {
+    hex::decode(strip_hex(hexed)).ok()?.try_into().ok()
 }
 
 /// `keccak256(abi.encode(kind, ids…))`, over the ids as their raw words so no
