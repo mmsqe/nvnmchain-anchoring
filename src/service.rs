@@ -13,11 +13,11 @@
 //! chain keeps — one word per key. Earlier versions are in the log, and want
 //! their own endpoint rather than a field that could quietly be short.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -30,7 +30,7 @@ use crate::eth::{keccak_hex, parse_address};
 use crate::registry::{
     deployment_sql, parse_record_ids, parse_records, parse_records_at, parse_registries,
     parse_roles, parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql,
-    RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
+    NameFilter, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
 };
 use crate::tidx::{
     anchors_sql, parse_anchors, parse_heads, scoped_heads_sql, Head, Scope, Tidx, ANCHORS_KEY,
@@ -309,12 +309,45 @@ pub async fn coverage(ctx: &Ctx) -> Result<Value, ApiError> {
     }))
 }
 
-async fn registries(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(deployments(&ctx).await?))
+/// `?name=`, `?name_prefix=`, `?name_suffix=`, `?name_contains=` — the module's
+/// `registriesByName`, spelled the way its proto did so a caller moving over
+/// keeps its query strings.
+///
+/// Anything else is a 400. A mistyped parameter that were ignored would answer
+/// with every registry the factory ever deployed and look like a filter that
+/// matched them all.
+fn filter_of(params: &HashMap<String, String>) -> Result<NameFilter, ApiError> {
+    let mut filter = NameFilter::default();
+    for (key, value) in params {
+        let field = match key.as_str() {
+            "name" => &mut filter.name,
+            "name_prefix" => &mut filter.prefix,
+            "name_suffix" => &mut filter.suffix,
+            "name_contains" => &mut filter.contains,
+            other => {
+                return Err(bad_request(format!(
+                    "`{other}` is not a filter; use name, name_prefix, name_suffix or name_contains"
+                )))
+            }
+        };
+        *field = Some(value.clone());
+    }
+    Ok(filter)
+}
+
+async fn registries(
+    State(ctx): State<Arc<Ctx>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(deployments(&ctx, &filter_of(&params)?).await?))
 }
 
 /// The projection behind `GET /registries`.
-pub async fn deployments(ctx: &Ctx) -> Result<Value, ApiError> {
+///
+/// The numbering is deployment order across the whole factory, assigned before
+/// the filter runs: a filtered listing reports the numbers the registries have,
+/// not their places in the answer.
+pub async fn deployments(ctx: &Ctx, filter: &NameFilter) -> Result<Value, ApiError> {
     let factory = ctx.cfg.factory.as_deref().ok_or_else(|| {
         misconfigured("FACTORY_ADDRESS is not set, so there is no factory to list from")
     })?;
@@ -325,10 +358,15 @@ pub async fn deployments(ctx: &Ctx) -> Result<Value, ApiError> {
             registries_sql(ctx.cfg.engine, factory, at, after)
         })
         .await?;
+    let deployed = parse_registries(&table)?;
+    let matched: Vec<_> = deployed
+        .into_iter()
+        .filter(|registry| filter.matches(&registry.name))
+        .collect();
     Ok(json!({
         "factory": factory,
         "at_block": at,
-        "registries": parse_registries(&table)?,
+        "registries": matched,
     }))
 }
 

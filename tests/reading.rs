@@ -12,7 +12,7 @@ use nvnmchain_anchoring::envelope::{record_key, status_key};
 use nvnmchain_anchoring::registry::{
     deployment_sql, parse_record_ids, parse_records, parse_records_at, parse_registries,
     parse_roles, parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql,
-    RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
+    NameFilter, RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
 };
 use nvnmchain_anchoring::tidx::{
     anchors_sql, cursor_after, heads_sql, parse_coverage, parse_heads, reject_truncated,
@@ -647,6 +647,67 @@ fn a_strangers_anchor_under_the_same_key_is_counted_not_fatal() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].registry, REGISTRY);
     assert_eq!(other, 1, "and the answer says what it left out");
+}
+
+#[test]
+fn a_name_filter_matches_bytes_and_nothing_near_them() {
+    // A name is not an identifier here -- the address is, and two registries may
+    // share a name -- so a filter that folded case or trimmed a space would be
+    // answering about a registry the caller did not name.
+    let exact = NameFilter {
+        name: Some("docs".into()),
+        ..Default::default()
+    };
+    assert!(exact.matches("docs"));
+    for near in ["Docs", "docs ", " docs", "doc", "docs2"] {
+        assert!(!exact.matches(near), "{near}");
+    }
+
+    let prefix = NameFilter {
+        prefix: Some("doc".into()),
+        ..Default::default()
+    };
+    assert!(prefix.matches("docs") && prefix.matches("doc"));
+    assert!(!prefix.matches("the-docs"), "a prefix stays anchored");
+
+    let suffix = NameFilter {
+        suffix: Some("-eu".into()),
+        ..Default::default()
+    };
+    assert!(suffix.matches("docs-eu"));
+    assert!(!suffix.matches("docs-eu-1"), "a suffix stays anchored");
+
+    let contains = NameFilter {
+        contains: Some("oc".into()),
+        ..Default::default()
+    };
+    assert!(contains.matches("docs") && contains.matches("the-docs-eu"));
+    assert!(!contains.matches("dcs"));
+}
+
+#[test]
+fn name_filters_all_have_to_match() {
+    // Set together they are an AND, so a contradictory pair returns nothing
+    // rather than one of them quietly winning.
+    let both = NameFilter {
+        prefix: Some("docs".into()),
+        suffix: Some("-eu".into()),
+        ..Default::default()
+    };
+    assert!(both.matches("docs-eu"));
+    assert!(!both.matches("docs-us"));
+    assert!(!both.matches("the-docs-eu"));
+
+    let contradiction = NameFilter {
+        name: Some("docs".into()),
+        suffix: Some("-eu".into()),
+        ..Default::default()
+    };
+    assert!(!contradiction.matches("docs"));
+    assert!(!contradiction.matches("docs-eu"));
+
+    // Nothing set is no filter at all, which is the unfiltered listing.
+    assert!(NameFilter::default().matches("anything"));
 }
 
 #[test]

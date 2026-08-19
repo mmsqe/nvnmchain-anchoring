@@ -230,6 +230,35 @@ pub struct Deployed {
     pub block_num: u64,
 }
 
+/// Which registries to keep, by name — the module's `registriesByName`.
+///
+/// Applied after decoding rather than in SQL, and not for convenience: the name
+/// is a dynamic `string` in the deployment event, which is exactly what tidx
+/// hands back as an ABI offset word. There is nothing to filter on in the query,
+/// so the walk is the one `/registries` already does and only the rows returned
+/// differ.
+///
+/// Byte-exact in every mode, because a name is not an identifier here — the
+/// address is — and a filter matching a name the caller did not write would be
+/// answering about a different registry. Every set filter has to match, so a
+/// contradictory pair returns nothing rather than one of them silently winning.
+#[derive(Debug, Clone, Default)]
+pub struct NameFilter {
+    pub name: Option<String>,
+    pub prefix: Option<String>,
+    pub suffix: Option<String>,
+    pub contains: Option<String>,
+}
+
+impl NameFilter {
+    pub fn matches(&self, name: &str) -> bool {
+        self.name.as_ref().is_none_or(|exact| name == exact)
+            && self.prefix.as_ref().is_none_or(|p| name.starts_with(p))
+            && self.suffix.as_ref().is_none_or(|s| name.ends_with(s))
+            && self.contains.as_ref().is_none_or(|c| name.contains(c))
+    }
+}
+
 /// [`registries_sql`]'s rows. The strings come out of raw `data` here, so a row
 /// that is not a `RegistryDeployed` payload is an error rather than a registry
 /// with empty fields — the query is scoped to one factory and one topic0, so a

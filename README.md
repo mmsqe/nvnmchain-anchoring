@@ -24,7 +24,8 @@ other log on the chain. This is what it structurally cannot do:
 CHAIN_ID=… FACTORY_ADDRESS=0x… BIND=127.0.0.1:8081 nvnmchain-anchoring serve
 
 GET /health                          how far the index this answers from reaches
-GET /registries                      every registry the factory deployed, in order
+GET /registries[?name=|?name_prefix=|?name_suffix=|?name_contains=]
+                                     every registry the factory deployed, in order
 GET /registries/{address}/records    each record decoded, at its newest version
 GET /registries/{address}/roles      every role held, folded from the log
 GET /registries/{address}/records/{checksum}   one record's versions, oldest first
@@ -45,6 +46,16 @@ and one filter on an indexed topic answers for all of them. It carries no
 `number`, which is a property of one registry's whole ordering that this query
 never walks; and a payload that is not a record is counted in `other` rather than
 failing the request, since anyone may anchor under any key.
+
+The `name…` filters are the module's `registriesByName`, spelled the way its
+proto did. They run after decoding rather than in SQL — the name is a dynamic
+`string` in the deployment event, which tidx hands back as an offset word — so
+the walk is the same and only the rows returned differ. Byte-exact in every mode,
+anchored at both ends, and an AND when several are set, so a contradictory pair
+returns nothing rather than one of them quietly winning. An unknown parameter is
+a 400, since ignoring a typo would answer with every registry there is. Numbering
+is deployment order, assigned before the filter: a filtered listing reports the
+numbers registries have, not their places in the answer.
 
 A malformed address is a 400 and never reaches SQL; an address the factory never
 deployed, or a checksum with nothing anchored under it, is a 404; tidx being
@@ -75,7 +86,7 @@ CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo
 |---|---|
 | `cargo run` / `cargo run -- audit` | check the index against the chain; non-zero on divergence |
 | `cargo run -- kinds` | what this chain carries |
-| `… registries` | every registry the factory deployed |
+| `… registries [--name=…]` | every registry the factory deployed, filtered by name |
 | `… records <registry>` | that registry's records, at their newest version |
 | `… roles <registry>` | every role it holds as granted |
 | `… record <registry> <checksum>` | one record's versions |
