@@ -387,15 +387,6 @@ pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
 /// window's partition, so a page boundary never splits one.
 pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
 
-/// The same rule narrowed to one namespace — one registry's heads, for a
-/// projection over its records rather than an audit over the whole chain.
-///
-/// `topic1` is the caller, and `idx_logs_address_topic1` leads on it, so this is
-/// the cheaper query of the two despite doing the same thing.
-pub fn namespace_heads_sql(engine: Engine, namespace: &str, up_to: u64, after: &str) -> String {
-    heads_where(engine, Scope::of(namespace), up_to, after)
-}
-
 /// Which heads to keep, on the two indexed topics — `topic1` is the caller,
 /// `topic2` the key — independently: one namespace's records, one key across
 /// every namespace, or both.

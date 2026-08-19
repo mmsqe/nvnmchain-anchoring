@@ -15,8 +15,8 @@ use nvnmchain_anchoring::registry::{
     RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
 };
 use nvnmchain_anchoring::tidx::{
-    anchors_sql, cursor_after, heads_sql, namespace_heads_sql, parse_coverage, parse_heads,
-    reject_truncated, scoped_heads_sql, Anchor, Engine, Head, Scope, Table, HARD_LIMIT, HEADS_KEY,
+    anchors_sql, cursor_after, heads_sql, parse_coverage, parse_heads, reject_truncated,
+    scoped_heads_sql, Anchor, Engine, Head, Scope, Table, HARD_LIMIT, HEADS_KEY,
 };
 use serde_json::json;
 
@@ -721,7 +721,7 @@ fn a_namespace_scoped_heads_query_narrows_on_the_caller_topic() {
     // is the assertion that would have.
     let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
     let word = format!("{hexed:0>64}");
-    let scoped = namespace_heads_sql(Engine::Postgres, REGISTRY, 7, "");
+    let scoped = scoped_heads_sql(Engine::Postgres, Scope::of(REGISTRY), 7, "");
     assert!(
         scoped.contains(&format!("topic1 = '\\x{word}'")),
         "{scoped}"

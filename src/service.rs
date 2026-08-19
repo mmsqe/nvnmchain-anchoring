@@ -33,8 +33,8 @@ use crate::registry::{
     RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
 };
 use crate::tidx::{
-    anchors_sql, namespace_heads_sql, parse_anchors, parse_heads, scoped_heads_sql, Scope, Tidx,
-    ANCHORS_KEY, HEADS_KEY,
+    anchors_sql, parse_anchors, parse_heads, scoped_heads_sql, Head, Scope, Tidx, ANCHORS_KEY,
+    HEADS_KEY,
 };
 
 pub struct Ctx {
@@ -42,11 +42,23 @@ pub struct Ctx {
     pub cfg: Settings,
 }
 
-/// A failed request. Everything here is either the caller's address being
-/// malformed or tidx being unreachable or refusing, so the split is 400 against
-/// 502 and the message says which — an empty result set is a legitimate answer
-/// and must never be how a failure looks.
-struct ApiError(StatusCode, String);
+/// A failed request: the status it answers with, and why.
+///
+/// Everything here is the caller naming something the log does not have, this
+/// process misconfigured, or tidx unreachable or refusing — 400/404 against 500
+/// against 502, and the message says which. An empty result set is a legitimate
+/// answer and must never be how a failure looks.
+///
+/// Public because the projections are: the same call serves an HTTP request and
+/// a command line, and a caller outside the router needs the status to decide
+/// what to do with it.
+pub struct ApiError(pub StatusCode, pub String);
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.0, self.1)
+    }
+}
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -98,24 +110,28 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
 
 /// One record's versions, oldest first — the history `/records` cannot carry.
 ///
-/// The only projection here that does not fold to heads. The chain keeps one word
+/// The only projection here that does not fold to heads: the chain keeps one word
 /// per key, so every version before the newest exists solely as the log row the
-/// head replaced; this is the endpoint the listing's `version` field points at
-/// rather than a field on it that could quietly be short.
+/// head replaced.
 ///
-/// A checksum with no anchors under this registry is a 404. It is the one
-/// "does not exist" this service can actually establish about a record: the query
-/// is over the registry's own namespace at a derived key, so an empty answer
-/// means nothing was ever anchored there rather than that something was missed.
+/// A checksum with nothing anchored under it here is a 404, and the one "does not
+/// exist" this service can establish about a record — the query is over the
+/// registry's own namespace at a derived key, so an empty answer means nothing was
+/// ever anchored there rather than that something was missed.
 async fn versions(
     State(ctx): State<Arc<Ctx>>,
     Path((address, checksum)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let registry = registry_of(&address)?;
+    Ok(Json(record_versions(&ctx, &address, &checksum).await?))
+}
+
+/// The projection behind `GET /registries/{address}/records/{checksum}`.
+pub async fn record_versions(ctx: &Ctx, address: &str, checksum: &str) -> Result<Value, ApiError> {
+    let registry = registry_of(address)?;
     let hash = keccak_hex(checksum.as_bytes());
     let key = record_key(&hash).expect("a keccak digest is a 32-byte word");
     let at = ctx.tidx.coverage().await?.tip_num;
-    require_deployed(&ctx, &registry, at).await?;
+    require_deployed(ctx, &registry, at).await?;
 
     let anchors = parse_anchors(
         &ctx.tidx
@@ -131,29 +147,17 @@ async fn versions(
         )));
     }
 
-    let status_keys: Vec<String> = versions
-        .iter()
-        .filter_map(|v| status_key(&hash, v.version))
-        .collect();
-    let statuses = statuses_under(&ctx, &status_keys, at).await?;
+    let keys = versions.iter().filter_map(|v| status_key(&hash, v.version));
+    let statuses = statuses_under(ctx, keys, at).await?;
     for version in &mut versions {
-        version.status = statuses
-            .get(&(registry.clone(), hash.clone(), version.version))
-            .cloned();
+        version.status = status_of(&statuses, &registry, &hash, version.version);
     }
 
     // The id the contract stopped assigning, so the detail view and the listing
-    // agree on it. A full walk of the registry's `RecordAdded` rows, which is
-    // what the listing costs too — a number is a property of the whole ordering.
-    let numbers = parse_record_ids(
-        &ctx.tidx
-            .paged(&[], RECORD_IDS_KEY, |after| {
-                record_ids_sql(ctx.cfg.engine, &registry, at, after)
-            })
-            .await?,
-    )?;
+    // agree on it.
+    let numbers = numbering(ctx, &registry, at).await?;
 
-    Ok(Json(json!({
+    Ok(json!({
         "registry": registry,
         "checksum": checksum,
         "checksum_hash": hash,
@@ -161,7 +165,7 @@ async fn versions(
         "number": numbers.get(&hash),
         "at_block": at,
         "versions": versions,
-    })))
+    }))
 }
 
 /// Whether this address is a registry at all, when there is a factory to ask.
@@ -187,70 +191,94 @@ async fn require_deployed(ctx: &Ctx, registry: &str, at: u64) -> Result<(), ApiE
     Ok(())
 }
 
-/// The statuses currently held under `keys`, as
-/// `(registry, checksum hash, version) -> status`. One round trip: a status key
-/// is the same word in every registry holding that record at that version, so
-/// the namespace only tells the answers apart afterwards.
-async fn statuses_under(
-    ctx: &Ctx,
-    keys: &[String],
-    at: u64,
-) -> Result<BTreeMap<(String, String, u64), String>> {
-    if keys.is_empty() {
-        return Ok(BTreeMap::new());
-    }
+/// Every head under `scope`, walked to exhaustion.
+async fn heads_under(ctx: &Ctx, scope: Scope<'_>, at: u64) -> Result<Vec<Head>> {
     let table = ctx
         .tidx
         .paged(&[], HEADS_KEY, |after| {
-            scoped_heads_sql(ctx.cfg.engine, Scope::keyed(keys), at, after)
+            scoped_heads_sql(ctx.cfg.engine, scope, at, after)
         })
         .await?;
-    parse_statuses(&parse_heads(&table)?)
+    parse_heads(&table)
 }
 
-/// Every registry that has anchored one checksum — what the module answered for
-/// `records(registry_id = 0, checksum, …)`, and the one lookup a per-registry
-/// path cannot serve.
+/// The numbering the contract stopped assigning. A full walk of one registry's
+/// `RecordAdded` rows, which the listing and a single record's detail both pay
+/// for -- a number is a property of the whole ordering.
+async fn numbering(ctx: &Ctx, registry: &str, at: u64) -> Result<BTreeMap<String, u64>> {
+    let table = ctx
+        .tidx
+        .paged(&[], RECORD_IDS_KEY, |after| {
+            record_ids_sql(ctx.cfg.engine, registry, at, after)
+        })
+        .await?;
+    parse_record_ids(&table)
+}
+
+/// What a status lookup answers: the status held against one
+/// `(registry, checksum hash, version)`.
+type Statuses = BTreeMap<(String, String, u64), String>;
+
+/// The statuses currently held under `keys`, in one round trip — a status key is
+/// the same word in every registry holding that record at that version, so the
+/// namespace only tells the answers apart afterwards.
+async fn statuses_under(
+    ctx: &Ctx,
+    keys: impl IntoIterator<Item = String>,
+    at: u64,
+) -> Result<Statuses> {
+    // Deduplicated here rather than at each caller: two registries at the same
+    // version are one key, and asking twice returns the same rows.
+    let keys: Vec<String> = keys
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if keys.is_empty() {
+        return Ok(Statuses::new());
+    }
+    parse_statuses(&heads_under(ctx, Scope::keyed(&keys), at).await?)
+}
+
+fn status_of(statuses: &Statuses, registry: &str, hash: &str, version: u64) -> Option<String> {
+    statuses
+        .get(&(registry.to_string(), hash.to_string(), version))
+        .cloned()
+}
+
+/// Every registry that has anchored one checksum — the module's
+/// `records(registry_id = 0, checksum, …)`, and the one lookup no per-registry
+/// path can serve.
 ///
-/// Takes the checksum itself rather than its hash. The key derives from
-/// `keccak256(checksum)` and from nothing else, which is exactly why one query
-/// over an indexed column answers for every registry at once.
+/// Takes the checksum rather than its hash: the key derives from
+/// `keccak256(checksum)` and nothing else, which is why one filter on an indexed
+/// column answers for every registry at once.
 async fn records_for_checksum(
     State(ctx): State<Arc<Ctx>>,
     Path(checksum): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    Ok(Json(anchored_anywhere(&ctx, &checksum).await?))
+}
+
+/// The projection behind `GET /records/{checksum}`.
+pub async fn anchored_anywhere(ctx: &Ctx, checksum: &str) -> Result<Value, ApiError> {
     let hash = keccak_hex(checksum.as_bytes());
     let key = record_key(&hash).expect("a keccak digest is a 32-byte word");
     let at = ctx.tidx.coverage().await?.tip_num;
 
     let keys = [key.clone()];
-    let heads = parse_heads(
-        &ctx.tidx
-            .paged(&[], HEADS_KEY, |after| {
-                scoped_heads_sql(ctx.cfg.engine, Scope::keyed(&keys), at, after)
-            })
-            .await?,
-    )?;
-    let (mut records, other) = parse_records_at(&heads)?;
+    let (mut records, other) = parse_records_at(&heads_under(ctx, Scope::keyed(&keys), at).await?)?;
 
-    let status_keys: Vec<String> = records
+    let keys = records
         .iter()
-        .filter_map(|r| status_key(&hash, r.record.version))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let statuses = statuses_under(&ctx, &status_keys, at).await?;
+        .filter_map(|r| status_key(&hash, r.record.version));
+    let statuses = statuses_under(ctx, keys, at).await?;
     for held in &mut records {
-        held.record.status = statuses
-            .get(&(
-                held.registry.clone(),
-                held.record.checksum_hash.clone(),
-                held.record.version,
-            ))
-            .cloned();
+        let version = held.record.version;
+        held.record.status = status_of(&statuses, &held.registry, &hash, version);
     }
 
-    Ok(Json(json!({
+    Ok(json!({
         "checksum": checksum,
         "checksum_hash": hash,
         "key": key,
@@ -261,22 +289,32 @@ async fn records_for_checksum(
         // failing on it — and says how much it left out, since silence there
         // would be indistinguishable from a key nobody else has touched.
         "other": other,
-    })))
+    }))
 }
 
 /// How far the index this answers from has reached. A caller comparing answers
 /// across time needs it: every projection is bounded at `tip_num`, so two calls
 /// either side of a block legitimately differ.
 async fn health(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(coverage(&ctx).await?))
+}
+
+/// The projection behind `GET /health`.
+pub async fn coverage(ctx: &Ctx) -> Result<Value, ApiError> {
     let coverage = ctx.tidx.coverage().await?;
-    Ok(Json(json!({
+    Ok(json!({
         "tip_num": coverage.tip_num,
         "lag": coverage.lag(),
         "reaches_first_block": coverage.reaches(ctx.cfg.first_block),
-    })))
+    }))
 }
 
 async fn registries(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError> {
+    Ok(Json(deployments(&ctx).await?))
+}
+
+/// The projection behind `GET /registries`.
+pub async fn deployments(ctx: &Ctx) -> Result<Value, ApiError> {
     let factory = ctx.cfg.factory.as_deref().ok_or_else(|| {
         misconfigured("FACTORY_ADDRESS is not set, so there is no factory to list from")
     })?;
@@ -287,61 +325,59 @@ async fn registries(State(ctx): State<Arc<Ctx>>) -> Result<Json<Value>, ApiError
             registries_sql(ctx.cfg.engine, factory, at, after)
         })
         .await?;
-    Ok(Json(json!({
+    Ok(json!({
         "factory": factory,
         "at_block": at,
         "registries": parse_registries(&table)?,
-    })))
+    }))
 }
 
 async fn roles(
     State(ctx): State<Arc<Ctx>>,
     Path(address): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let registry = registry_of(&address)?;
+    Ok(Json(roles_held(&ctx, &address).await?))
+}
+
+/// The projection behind `GET /registries/{address}/roles`.
+pub async fn roles_held(ctx: &Ctx, address: &str) -> Result<Value, ApiError> {
+    let registry = registry_of(address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
-    require_deployed(&ctx, &registry, at).await?;
+    require_deployed(ctx, &registry, at).await?;
     let table = ctx
         .tidx
         .paged(ROLE_EVENTS, ROLES_KEY, |after| {
             roles_sql(ctx.cfg.engine, &registry, at, after)
         })
         .await?;
-    Ok(Json(json!({
+    Ok(json!({
         "registry": registry,
         "at_block": at,
         "roles": parse_roles(&table)?,
-    })))
+    }))
 }
 
 async fn records(
     State(ctx): State<Arc<Ctx>>,
     Path(address): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let registry = registry_of(&address)?;
+    Ok(Json(records_held(&ctx, &address).await?))
+}
+
+/// The projection behind `GET /registries/{address}/records`.
+pub async fn records_held(ctx: &Ctx, address: &str) -> Result<Value, ApiError> {
+    let registry = registry_of(address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
-    require_deployed(&ctx, &registry, at).await?;
+    require_deployed(ctx, &registry, at).await?;
     // Both bounded at the same block, so the numbering and the heads describe
     // one state of the chain rather than two.
-    let ids = parse_record_ids(
-        &ctx.tidx
-            .paged(&[], RECORD_IDS_KEY, |after| {
-                record_ids_sql(ctx.cfg.engine, &registry, at, after)
-            })
-            .await?,
-    )?;
-    let heads = parse_heads(
-        &ctx.tidx
-            .paged(&[], HEADS_KEY, |after| {
-                namespace_heads_sql(ctx.cfg.engine, &registry, at, after)
-            })
-            .await?,
-    )?;
-    Ok(Json(json!({
+    let ids = numbering(ctx, &registry, at).await?;
+    let heads = heads_under(ctx, Scope::of(&registry), at).await?;
+    Ok(json!({
         "registry": registry,
         "at_block": at,
         "records": parse_records(&heads, &ids)?,
-    })))
+    }))
 }
 
 pub async fn serve(ctx: Arc<Ctx>, bind: &str) -> Result<()> {

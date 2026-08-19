@@ -75,6 +75,21 @@ CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo
 |---|---|
 | `cargo run` / `cargo run -- audit` | check the index against the chain; non-zero on divergence |
 | `cargo run -- kinds` | what this chain carries |
+| `… registries` | every registry the factory deployed |
+| `… records <registry>` | that registry's records, at their newest version |
+| `… roles <registry>` | every role it holds as granted |
+| `… record <registry> <checksum>` | one record's versions |
+| `… checksum <checksum>` | every registry that anchored it |
+
+The five query commands print the projections `serve` answers with, as JSON and
+straight from tidx — the read half of `nvnmchaind query anchoring …`, for an
+operator with no service running. They exit 2 for what the caller could ask
+differently (a malformed address, a registry the factory never deployed) and 1
+for this process or the index being wrong.
+
+The write half — `tx anchoring add-registry` — has no successor and wants none: a
+record is an EVM transaction now, so it belongs to whatever holds the key, and
+this process holds none.
 
 | Variable | Default | |
 |---|---|---|
