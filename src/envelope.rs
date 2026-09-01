@@ -1,6 +1,6 @@
 //! Reading a `Registry` payload out of anchored metadata.
 
-use crate::eth::{hex0x, keccak_hex, normalize_hex, word_to_u128, word_to_usize};
+use crate::eth::{hex0x, keccak_hex, normalize_hex, word_to_address, word_to_u128, word_to_usize};
 
 // Every envelope leads with a `bytes32` kind, so one word identifies the shape.
 // The ids in the payload must then reproduce the key it was anchored under,
@@ -24,6 +24,8 @@ enum Ty {
     /// Always hex: a keccak hash is never a label, and does not fit the `u128`
     /// [`Ty::Uint`] parses through -- reading one that way fails the decode.
     Hash,
+    /// Checksummed, so it compares equal to every other address this app produces.
+    Address,
     Str,
 }
 
@@ -54,6 +56,10 @@ const SCHEMAS: &[Schema] = &[
             ("checksum", Ty::Str),
             ("checksum_algo", Ty::Str),
             ("metadata", Ty::Str),
+            // The contract's `RecordCategory` enum as a uint8; its names are only in the source.
+            ("category", Ty::Uint),
+            ("data_pointer", Ty::Str),
+            ("author", Ty::Address),
             ("timestamp", Ty::Uint),
         ],
         key_ids: &[0],
@@ -65,6 +71,7 @@ const SCHEMAS: &[Schema] = &[
             ("checksum_hash", Ty::Hash),
             ("index", Ty::Uint),
             ("status", Ty::Str),
+            ("author", Ty::Address),
             ("seq", Ty::Uint),
         ],
         key_ids: &[0, 1],
@@ -220,6 +227,7 @@ fn decode_strict(fields: &[(&str, Ty)], data: &[u8]) -> Option<(Vec<String>, Vec
             Ty::Uint => values.push(word_to_u128(&word)?.to_string()),
             Ty::Bytes32 => values.push(bytes32_label(&word)),
             Ty::Hash => values.push(hex0x(&word)),
+            Ty::Address => values.push(word_to_address(&word)?),
             Ty::Str => {
                 if word_to_usize(&word)? != tail {
                     return None;

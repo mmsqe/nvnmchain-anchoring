@@ -9,7 +9,7 @@
 mod common;
 
 use common::{
-    bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_COMMITMENT, STATUS_KEY,
+    bytes, AUTHOR, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_COMMITMENT, STATUS_KEY,
     STATUS_METADATA,
 };
 use nvnmchain_anchoring::envelope::{decode_envelope, is_self_verifying, read_payload, Payload};
@@ -31,6 +31,15 @@ fn record_envelope_decodes() {
     assert_eq!(env.field("checksum"), "0xabc");
     assert_eq!(env.field("checksum_algo"), "sha256");
     assert_eq!(env.field("metadata"), "{}");
+    assert_eq!(
+        env.field("category"),
+        "0",
+        "Unspecified: a record claiming no category"
+    );
+    assert_eq!(env.field("data_pointer"), "");
+    // The precompile's own caller is the registry contract, so this is the only place the
+    // author of a version exists.
+    assert_eq!(env.field("author"), AUTHOR);
     assert!(env.field("timestamp").parse::<u128>().is_ok());
 }
 
@@ -44,6 +53,7 @@ fn status_envelope_decodes() {
     );
     assert_eq!(env.field("index"), "1");
     assert_eq!(env.field("status"), "approved");
+    assert_eq!(env.field("author"), AUTHOR);
     assert_eq!(env.field("seq"), "1");
 }
 
