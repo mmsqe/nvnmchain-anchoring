@@ -1,6 +1,6 @@
 {
   "source": "git@github.com:NVNM-Chain/nvnmchain-contracts.git",
-  "commit": "a9f1b8781601bf6990afe2908898acc2f3a08fe5",
+  "commit": "be289fc95a203bbfab19bd217098c34b7da66fa9",
   "note": "Regenerate with: make fixtures",
   "events": [
     {

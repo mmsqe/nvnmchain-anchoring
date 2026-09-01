@@ -5,7 +5,7 @@
 # working copy before the branch is pushed — but that path lands in the fixture's `source`, so
 # regenerate from the remote before committing. CONTRACTS_REF takes a branch, tag, or SHA.
 CONTRACTS_REPO ?= git@github.com:NVNM-Chain/nvnmchain-contracts.git
-CONTRACTS_REF ?= registry_factory
+CONTRACTS_REF ?= main
 CONTRACTS_WORK := .cache/nvnmchain-contracts
 FIXTURE := tests/fixtures/contract-events.json
 
