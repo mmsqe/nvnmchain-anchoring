@@ -1,17 +1,80 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::info;
 
 use nvnmchain_anchoring::config::Settings;
 use nvnmchain_anchoring::registry::NameFilter;
 use nvnmchain_anchoring::rpc::Rpc;
 use nvnmchain_anchoring::tidx::Tidx;
-use nvnmchain_anchoring::{audit, envelope, service};
+use nvnmchain_anchoring::{audit, envelope, migrate, service};
 use std::sync::Arc;
 
 const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds|serve|\n\
      registries [--name=|--name-prefix=|--name-suffix=|--name-contains=]|\n\
      records <registry>|roles <registry>|\n\
-     record <registry> <checksum>|checksum <checksum>]";
+     record <registry> <checksum>|checksum <checksum>|\n\
+     migrate --registries=<file> --manifest=<file> [--export=<dir>]\n\
+             [--threshold=<n>] [--root=merkle|sha256] [--uri-base=<url>]]";
+
+/// `--flag=value` off the command line, or the default.
+fn flag(name: &str, default: &str) -> String {
+    std::env::args()
+        .find_map(|arg| arg.strip_prefix(&format!("--{name}=")).map(str::to_string))
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn required(command: &str, name: &str) -> String {
+    let value = flag(name, "");
+    if value.is_empty() {
+        eprintln!("{command} needs --{name}=\n{USAGE}");
+        std::process::exit(2);
+    }
+    value
+}
+
+/// Plan the corpus onto the registry contracts, as JSONL on stdout.
+///
+/// Reads no chain: it needs the export and nothing else, so it runs before the
+/// settings every other command is configured by.
+fn print_plan() -> Result<()> {
+    let read = |name: &str| -> Result<Vec<u8>> {
+        let path = required("migrate", name);
+        std::fs::read(&path).with_context(|| format!("read {path}"))
+    };
+    let registries: Vec<migrate::RegistryImport> = serde_json::from_slice(&read("registries")?)?;
+    let manifest: migrate::Manifest = serde_json::from_slice(&read("manifest")?)?;
+    let opts = migrate::Options {
+        threshold: flag("threshold", "0").parse().context("--threshold")?,
+        root: match flag("root", "merkle").as_str() {
+            "merkle" => migrate::Root::Merkle,
+            "sha256" => migrate::Root::Sha256,
+            other => {
+                eprintln!("--root={other}: expected merkle or sha256\n{USAGE}");
+                std::process::exit(2);
+            }
+        },
+        export_dir: flag("export", ".").into(),
+        uri_base: flag("uri-base", "file://export"),
+    };
+
+    let plan = migrate::plan(&registries, &manifest, &opts)?;
+    for step in &plan.steps {
+        println!("{}", serde_json::to_string(step)?);
+    }
+
+    let by = |mode| plan.registries.iter().filter(move |r| r.mode == mode);
+    let count = |mode| (by(mode).count(), by(mode).map(|r| r.records).sum::<usize>());
+    let (by_record, record_rows) = count(migrate::Mode::Record);
+    let (by_root, root_rows) = count(migrate::Mode::Root);
+    eprintln!(
+        "{} registries: {by_record} by record ({record_rows} records), \
+         {by_root} by root ({root_rows} records)\n\
+         {} steps, ~{:.1}e9 gas",
+        plan.registries.len(),
+        plan.steps.len(),
+        plan.gas() as f64 / 1e9,
+    );
+    Ok(())
+}
 
 /// `--name=…` and friends, the command line's spelling of the query parameters
 /// `/registries` takes. Anything else is refused rather than ignored, since a
@@ -68,6 +131,11 @@ async fn main() -> Result<()> {
         // Logs to stderr, because stdout is a projection someone pipes into `jq`.
         .with_writer(std::io::stderr)
         .init();
+
+    // Planning reads an export, not a chain, so it runs before the settings.
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        return print_plan();
+    }
 
     let cfg = Settings::from_env()?;
     let rpc = Rpc::new(&cfg.rpc_url)?;
