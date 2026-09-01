@@ -58,6 +58,15 @@
         },
         {
           "type": "string"
+        },
+        {
+          "type": "uint8"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "address"
         }
       ]
     },
