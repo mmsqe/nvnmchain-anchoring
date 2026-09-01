@@ -35,7 +35,7 @@ pub const REGISTRY_DEPLOYED_TOPIC: &str =
 /// the query and the [`REGISTRY_TOPICS`] row checked against the contract cannot
 /// come apart.
 pub const RECORD_ADDED_TOPIC: &str =
-    "0xb4aaf705a3bf1baf4b094ef32b3517c8df84a8766f0d751a0c85aa41b63be45c";
+    "0x0024919acb3ad6f0be467a901b1e780b3d21245c92d17015954313ee46a28005";
 
 /// `(topic0, signature)` for every event the registry contracts emit, canonical
 /// form -- the factory's deployment announcement included.
@@ -48,7 +48,10 @@ pub const REGISTRY_TOPICS: &[(&str, &str)] = &[
         REGISTRY_DEPLOYED_TOPIC,
         "RegistryDeployed(address,address,string,string,string)",
     ),
-    (RECORD_ADDED_TOPIC, "RecordAdded(bytes32,uint256,string)"),
+    (
+        RECORD_ADDED_TOPIC,
+        "RecordAdded(bytes32,uint256,string,uint8,string,address)",
+    ),
     (
         "0x7735f518b96096d1410ef5122b09bdb190e8d94e93e6896cbeff28f034ea883c",
         "RecordStatusUpdated(bytes32,uint256,string)",
