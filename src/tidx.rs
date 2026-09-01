@@ -46,15 +46,20 @@ impl Engine {
             .find(|e| e.as_param().eq_ignore_ascii_case(value.trim()))
     }
 
-    /// A byte string as this engine's SQL literal. The PostgreSQL cast is
-    /// redundant — an unknown literal resolves against the `bytea` column it is
-    /// compared to — but it is the spelling `tempo-e2e` already proves against a
-    /// running tidx, and being explicit costs nothing.
+    /// A byte string as this engine's SQL literal.
+    ///
+    /// Uncast, though PostgreSQL would take `::bytea`. The cast is redundant —
+    /// an unknown literal resolves against the column it is compared to, in a
+    /// predicate and across a `UNION` alike — and tidx's pushdown extractor
+    /// reads a bare literal but not a cast expression.
     ///
     /// Hex digits only, by construction. These queries are built by string
-    /// interpolation, and a cursor splices a value tidx handed back into the
-    /// next page's predicate -- so anything that is not a hex digit is dropped
-    /// rather than escaped, and a quote cannot reach the literal at all.
+    /// interpolation, and two callers now put an outside value into one: an
+    /// HTTP path segment, and a cursor splicing back a value tidx handed out.
+    /// Anything that is not a hex digit is dropped rather than escaped — a
+    /// quote cannot reach the literal at all. A backstop, not the validation:
+    /// a *filtered* address would query some other address and answer "nothing
+    /// here", so callers reject a malformed one up front.
     pub fn bytes_literal(self, value: &str) -> String {
         let hexed: String = strip_hex(value)
             .chars()
@@ -62,7 +67,7 @@ impl Engine {
             .map(|c| c.to_ascii_lowercase())
             .collect();
         match self {
-            Self::Postgres => format!("'\\x{hexed}'::bytea"),
+            Self::Postgres => format!("'\\x{hexed}'"),
             Self::ClickHouse => format!("'0x{hexed}'"),
         }
     }
@@ -149,17 +154,6 @@ pub fn text(row: &[Value], at: usize) -> &str {
     row.get(at).and_then(Value::as_str).unwrap_or_default()
 }
 
-/// A numeric cell. tidx serializes integers as JSON numbers on one engine and
-/// as strings on the other, so reading only one of the two drops the column to
-/// zero without saying so.
-pub fn number(row: &[Value], at: usize) -> Option<u64> {
-    match row.get(at)? {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.trim().parse().ok(),
-        _ => None,
-    }
-}
-
 /// tidx's own per-query row cap (`HARD_LIMIT_MAX`), which is also its default:
 /// it truncates at this many rows and says nothing about having done so. Pinned
 /// here because the only defence is knowing the number — see
@@ -219,6 +213,17 @@ pub fn cursor_after(engine: Engine, table: &Table, key: Key, row: &[Value]) -> R
     Ok(format!(" AND ({predicate})"))
 }
 
+/// A numeric cell. tidx serializes integers as JSON numbers on one engine and
+/// as strings on the other, so reading only one of the two drops the column to
+/// zero without saying so.
+pub fn number(row: &[Value], at: usize) -> Option<u64> {
+    match row.get(at)? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 pub struct Tidx {
     client: Client,
     url: String,
@@ -271,9 +276,9 @@ impl Tidx {
     }
 
     /// `GET /query` with generated event tables. Each signature becomes a table
-    /// named after its event, with argument names for columns. A signature tidx
-    /// cannot match builds its table off some other topic0 and returns no rows
-    /// rather than an error.
+    /// named after its event, with argument names for columns; without one only
+    /// the base tables exist. A signature tidx cannot match builds its table off
+    /// some other topic0 and returns no rows rather than an error.
     pub async fn query_with(&self, sql: &str, signatures: &[&str]) -> Result<Table> {
         reject_truncated(self.one_page(sql, signatures).await?, self.page)
     }
@@ -296,6 +301,16 @@ impl Tidx {
         Table::from_response(&self.get_json("/query", &params).await?)
     }
 
+    /// A query walked to exhaustion, one page per round trip.
+    ///
+    /// `build` is handed an `AND …` predicate placing it after the last row
+    /// seen, and `key` names the columns that predicate is over — which must be
+    /// the columns the query orders by.
+    ///
+    /// For a windowed query those columns must also be the *partition*: a page
+    /// boundary that falls inside a partition would compute "newest per key"
+    /// from half a key's rows. Aligned to the partition, every page's window is
+    /// as correct as the unpaged one's.
     /// A query walked to exhaustion, one page per round trip.
     ///
     /// `build` is handed an `AND …` predicate placing it after the last row
@@ -364,16 +379,19 @@ impl Tidx {
 /// Bounded at `up_to` because tidx's realtime sync runs ahead of its contiguous
 /// interval: an unbounded query can return a head newer than the block the
 /// audit reads state at, which reports as a mismatch that is really skew.
-/// What [`heads_sql`] pages on: the indexed caller and key, which are also its
-/// window's partition, so a page boundary never splits one.
-pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
-
 pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
     heads_where(engine, None, up_to, after)
 }
 
-/// The same rule narrowed to one namespace — the wrapper's own heads, for a
+/// What [`heads_sql`] pages on: the indexed caller and key, which are also its
+/// window's partition, so a page boundary never splits one.
+pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
+
+/// The same rule narrowed to one namespace — one registry's heads, for a
 /// projection over its records rather than an audit over the whole chain.
+///
+/// `topic1` is the caller, and `idx_logs_address_topic1` leads on it, so this is
+/// the cheaper query of the two despite doing the same thing.
 pub fn namespace_heads_sql(engine: Engine, namespace: &str, up_to: u64, after: &str) -> String {
     heads_where(engine, Some(namespace), up_to, after)
 }
@@ -382,7 +400,7 @@ fn heads_where(engine: Engine, namespace: Option<&str>, up_to: u64, after: &str)
     let scope = namespace.map_or_else(String::new, |ns| {
         // `topic1` is a 32-byte word with the address right-aligned, not the
         // 20-byte `address` column beside it. Comparing the bare address matches
-        // no row at all, which reads as a namespace that has anchored nothing.
+        // no row at all, which reads as a registry that has anchored nothing.
         let word = format!("{:0>64}", strip_hex(ns));
         format!(" AND topic1 = {}", engine.bytes_literal(&word))
     });

@@ -58,7 +58,15 @@ pub fn word_to_u128(word: &[u8; 32]) -> Option<u128> {
     Some(u128::from_be_bytes(buf))
 }
 
-/// The address in an indexed topic, right-aligned in its word.
+/// A word as a checksummed address. The upper twelve bytes must be zero: that is
+/// what distinguishes an address from a word that merely sits where one is expected.
+pub fn word_to_address(word: &[u8; 32]) -> Option<String> {
+    if word[..12].iter().any(|b| *b != 0) {
+        return None;
+    }
+    Some(checksum_address(&hex0x(&word[12..])))
+}
+
 /// A 20-byte hex address, checksummed, or `None`. Strict on length and on every
 /// character: an address reaches SQL through string interpolation, so anything
 /// looser would query a different address and report it as empty.
@@ -68,6 +76,7 @@ pub fn parse_address(value: &str) -> Option<String> {
         .then(|| checksum_address(&normalize_hex(hexed)))
 }
 
+/// The address in an indexed topic, right-aligned in its word.
 pub fn address_from_topic(topic: &str) -> Option<String> {
     let hexed = strip_hex(topic);
     if hexed.len() != 64 {

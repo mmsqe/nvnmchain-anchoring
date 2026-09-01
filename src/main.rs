@@ -33,19 +33,12 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref().unwrap_or("audit") {
         "kinds" => {
             // What this chain actually carries — the quickest way to see
-            // whether a namespace is anchoring registry envelopes at all, and
-            // whether they are tagged.
+            // whether a namespace is anchoring registry envelopes at all.
             let heads = tidx.heads(tidx.coverage().await?.tip_num).await?;
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
             for head in &heads {
                 let name = match envelope::read_payload(&head.key, &head.metadata) {
-                    envelope::Payload::Envelope(e) => {
-                        format!(
-                            "{} ({})",
-                            e.kind,
-                            if e.tagged { "tagged" } else { "untagged" }
-                        )
-                    }
+                    envelope::Payload::Envelope(e) => e.kind.to_string(),
                     envelope::Payload::Json(_) => "json".into(),
                     envelope::Payload::Text(_) => "text".into(),
                     envelope::Payload::Opaque => "opaque".into(),

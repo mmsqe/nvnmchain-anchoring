@@ -17,28 +17,31 @@ other log on the chain. This is what it structurally cannot do:
 
 ## Running
 
-`serve` exposes the projections over HTTP, read from the log rather than from
-the module that retired them:
+`serve` exposes the projections over HTTP, which is what the explorer's
+`ANCHORING_URL` links to:
 
 ```
-CHAIN_ID=… REGISTRY_ADDRESS=0x… BIND=127.0.0.1:8081 nvnmchain-anchoring serve
+CHAIN_ID=… FACTORY_ADDRESS=0x… BIND=127.0.0.1:8081 nvnmchain-anchoring serve
 
-GET /health                     how far the index this answers from reaches
-GET /registries                 every registry the wrapper announced, in id order
-GET /registries/{id}/records    each record decoded, at its newest version
-GET /registries/{id}/roles      every role held, folded from the log
+GET /health                          how far the index this answers from reaches
+GET /registries                      every registry the factory deployed, in order
+GET /registries/{address}/records    each record decoded, at its newest version
+GET /registries/{address}/roles      every role held, folded from the log
 ```
 
-An unreadable id is a 400 and never reaches SQL; a missing `REGISTRY_ADDRESS` is
-a 500, since that is this process misconfigured rather than the one behind it;
-tidx unreachable or refusing is a 502. None of them is ever an empty result — an
-empty list means a registry with nothing in it.
+A malformed address is a 400 and never reaches SQL; tidx being unreachable or
+refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since that is this
+process misconfigured rather than the one behind it. None of them is ever an
+empty result — an empty list means a registry with nothing in it.
 
-`/records` reads every head under the wrapper's namespace and keeps the registry
-asked for, because the key hashes the registry id in and leaves nothing for a
-`WHERE` to narrow on. `/roles` and `/registries` narrow in SQL, where the id is
-`topic1`.
-
+**Paged, and it refuses rather than truncates.** tidx caps a query at 10,000
+rows and says nothing when it hits that, so every projection walks by cursor
+until a page comes back short. The cursor is the query's own ordering, which for
+a windowed query is also its partition — a page boundary that fell inside a
+partition would fold "newest per key" from half a key's rows. Anything that
+somehow arrives full anyway is an error: a short list is indistinguishable from
+a complete one. `PAGE_SIZE` lowers the rows per round trip, which is only worth
+doing to watch the loop work.
 
 ```bash
 CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo run
@@ -83,15 +86,16 @@ the contiguous marker below it.
 
 ## Envelopes
 
-`AnchoringRegistry` anchors in two formats — a bare `abi.encode`, and a newer
-one leading with a `bytes32` kind (`registry`, `record`, `status`, `acl`). Only
-the tagged form has ever been emitted; the untagged reading stays dead until a
-build predating the kind tags ships.
+A registry anchors two kinds, each leading with a `bytes32` tag: `record` and
+`status`. One word identifies the shape, and the ids inside must then reproduce
+the key the payload was anchored under, `keccak256(abi.encode(kind, ids…))` —
+which catches a schema that has drifted from the contract, and binds the payload
+to its key. Anything else reads as JSON, then text, then opaque.
 
-Either way the ids must reproduce the key the payload was anchored under,
-`keccak256(abi.encode(kind, ids…))` — the only thing identifying an untagged
-shape, and still a check that a tagged one has not drifted from the contract.
-Anything else reads as JSON, then text, then opaque.
+No registry id in any key: a registry is a deployment, so the address a payload
+was anchored under is the registry. A payload only means something with its
+namespace beside it — the same commitment under two registries is two different
+records.
 
 ## `audit`
 
@@ -120,14 +124,49 @@ rather than closing it: a run reports when the index has not reached back to
 
 ## Status
 
-The decoder and the audit are in. The projection into registries, records,
-versions and roles, and the query API over it, are not.
+The decoder, the audit, and `serve` over registries, records and roles are in.
+Version *history* is not: `/records` answers at each record's newest version,
+because that is what the chain keeps — one word per key. Earlier versions are in
+the log and want their own endpoint rather than a field that could quietly be
+short.
 
-Two of those four fold in SQL over tidx alone. `registries` and `records` do
-not: the wrapper's events are narrower than the envelopes they accompany, so
-three of `Registry`'s six fields and four of `Record`'s ten exist only in the
-anchored payload. Worth matching the `proto/nvnmchain/anchoring/v1` shapes so
-callers of the old node queries move over unchanged.
+`records` is where the decoder earns the repo: four of `Record`'s ten fields
+exist only inside the anchored payload, and `metadata` is a dynamic `bytes` that
+tidx hands back as its ABI offset word. `registries` and `roles` needed none of
+that, so they went first. Still worth matching the
+`proto/nvnmchain/anchoring/v1` shapes so callers of the old node queries move
+over unchanged.
+
+Read-through, not materialized: every request queries tidx and nothing is kept
+here. A second store over the same log is what the explorer already is, and the
+measurements on `record_ids_sql` say read-through is comfortable at the sizes
+this chain has. Materializing is a decision to make against numbers later.
+
+### `roles`, over `?signature=`
+
+`RoleGranted` and `RoleRevoked` carry only `bytes32` outside the topics, so tidx
+decodes them where it cannot decode `Anchored`. The query orders the two against
+each other — newest row per `(checksumHash, account, role)` wins, kept if it
+granted — because revokes are not deletions and the same key can be granted,
+revoked and granted again.
+
+**Two signatures, not three.** A registry announces its creator's `admin` as an
+ordinary `RoleGranted` when the factory initializes it, so the grant/revoke pair
+answers in full. The wrapper needed a third — it wrote `member` directly in
+`addRegistry` and announced that admin only as a `RegistryAdded` — and the seed
+arm that supplied it went with the wrapper.
+
+It names the **address**, which is the whole partition: a registry is a
+deployment, tidx's generated CTEs filter on topic0 alone, and one contract per
+registry means that address selects exactly one registry's logs. The `topic1`
+narrowing this used to need is gone with the id it narrowed on — `topic1` is the
+role's scope now, not a registry id.
+
+That also retires the measurement this section used to carry (66 ms against
+2.4 ms over a synthetic 4M-log index): it compared an unscoped read of one
+wrapper's logs against a topic1-narrowed one, and neither shape exists any more.
+A registry's logs are only its own, so the address predicate is the narrowing.
+No replacement figure is quoted here because none has been taken.
 
 ## Tests
 

@@ -1,6 +1,6 @@
 {
   "source": "git@github.com:NVNM-Chain/nvnmchain-contracts.git",
-  "commit": "1761de6bbc0bf4584d350f6a1887e1f68ac9ddc6",
+  "commit": "be289fc95a203bbfab19bd217098c34b7da66fa9",
   "note": "Regenerate with: make fixtures",
   "events": [
     {
@@ -17,14 +17,6 @@
         },
         {
           "type": "bytes"
-        }
-      ]
-    },
-    {
-      "name": "Initialized",
-      "inputs": [
-        {
-          "type": "uint64"
         }
       ]
     },
@@ -59,41 +51,16 @@
       "name": "RecordAdded",
       "inputs": [
         {
-          "type": "uint256"
-        },
-        {
-          "type": "uint256"
-        },
-        {
-          "type": "uint256"
-        },
-        {
-          "type": "string"
-        }
-      ]
-    },
-    {
-      "name": "RecordStatusUpdated",
-      "inputs": [
-        {
-          "type": "uint256"
-        },
-        {
-          "type": "uint256"
+          "type": "bytes32"
         },
         {
           "type": "uint256"
         },
         {
           "type": "string"
-        }
-      ]
-    },
-    {
-      "name": "RegistryAdded",
-      "inputs": [
+        },
         {
-          "type": "uint256"
+          "type": "uint8"
         },
         {
           "type": "string"
@@ -104,11 +71,42 @@
       ]
     },
     {
-      "name": "RoleGranted",
+      "name": "RecordStatusUpdated",
       "inputs": [
+        {
+          "type": "bytes32"
+        },
         {
           "type": "uint256"
         },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "RegistryDeployed",
+      "inputs": [
+        {
+          "type": "address"
+        },
+        {
+          "type": "address"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "RoleGranted",
+      "inputs": [
         {
           "type": "bytes32"
         },
@@ -124,9 +122,6 @@
       "name": "RoleRevoked",
       "inputs": [
         {
-          "type": "uint256"
-        },
-        {
           "type": "bytes32"
         },
         {
@@ -134,14 +129,6 @@
         },
         {
           "type": "bytes32"
-        }
-      ]
-    },
-    {
-      "name": "Upgraded",
-      "inputs": [
-        {
-          "type": "address"
         }
       ]
     }

@@ -1,85 +1,95 @@
-//! `AnchoringRegistry`'s own events — the second source the projection reads.
+//! `Registry`'s own events — where role history lives.
 //!
-//! Grants and revokes anchor as `acl` envelopes, so the `Anchored` log alone
-//! rebuilds "who could write this record". The revision that emitted these
-//! events without anchoring them was never deployed, so there is no partial
-//! history for this source to complete.
+//! Role changes are not anchored: membership is each registry's state, read with
+//! `hasRole`, and history is these events, which carry every field they need. A
+//! third copy in the anchored log would only be something to drift.
 //!
-//! It stays because `roles` is the one projection these events serve
-//! *completely* — every field the retired queries returned is in them, so it
-//! folds in SQL over tidx with no payload decoded. The other three are lossy
-//! here: `RegistryAdded` carries neither description, metadata nor timestamp,
-//! and `RecordAdded` carries neither uri, checksum algorithm, metadata nor
-//! timestamp. Those live only in the envelope.
+//! `roles` folds in SQL over an index because every argument outside the topics
+//! is `bytes32`, which tidx decodes itself; a dynamic one comes back as its ABI
+//! offset word ([`crate::tidx::heads_sql`] reads raw `data` for that reason).
+//!
+//! A whole records projection does not fold that far, but its *numbering* does.
+//! [`record_ids_sql`] is where the record id went when the contract stopped
+//! assigning one.
+//!
+//! Neither query is run here. Both are what a caller sends tidx, and nothing in
+//! this crate reads the answer.
+
+use anyhow::{Context, Result};
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::envelope::decode_envelope;
+use crate::envelope::{bytes32_label, decode_envelope, decode_strings};
 use crate::eth::{address_from_topic, normalize_hex, strip_hex};
 use crate::tidx::{number, text, Engine, Head, Key, Table};
 
-/// `keccak256("")` — the `checksumHash` a registry-scoped role is announced
-/// under, which is what an empty checksum hashes to.
-pub const REGISTRY_SCOPE: &str =
-    "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470";
+/// `RegistryDeployed`'s topic0, the selector [`registries_sql`] filters on.
+/// The factory's event, not a registry's -- but it belongs in the same table so
+/// the same fixture check covers it.
+pub const REGISTRY_DEPLOYED_TOPIC: &str =
+    "0xf4b5c87afebf8726b6bcc7e82c820be7557069b4f32a003e37772dd4d67cd576";
 
-/// `"admin"` as the right-padded `bytes32` the contract compares.
-pub const ROLE_ADMIN: &str = "0x61646d696e000000000000000000000000000000000000000000000000000000";
+/// `RecordAdded`'s topic0, the selector [`record_ids_sql`] filters on. Named so
+/// the query and the [`REGISTRY_TOPICS`] row checked against the contract cannot
+/// come apart.
+pub const RECORD_ADDED_TOPIC: &str =
+    "0x0024919acb3ad6f0be467a901b1e780b3d21245c92d17015954313ee46a28005";
 
-/// `(topic0, signature)` for every event the wrapper emits, canonical form.
+/// `(topic0, signature)` for every event the registry contracts emit, canonical
+/// form -- the factory's deployment announcement included.
 /// `tests/signatures.rs` checks the hashes against these signatures and the
 /// signatures against the contract, so neither can sit here quietly matching
-/// nothing — a signature tidx cannot match decodes to an empty table just as
-/// surely as a mistyped topic used to scan an empty range.
+/// nothing — a signature that drifts builds its table off some other topic0
+/// and decodes empty rather than failing.
 pub const REGISTRY_TOPICS: &[(&str, &str)] = &[
     (
-        "0x3ce4563d134e2bed44925e6752673cb055ab97f4e4e9b1af57b1d10154f6a1a4",
-        "RegistryAdded(uint256,string,address)",
+        REGISTRY_DEPLOYED_TOPIC,
+        "RegistryDeployed(address,address,string,string,string)",
     ),
     (
-        "0x0a4df583ca8b06d3dca2af4cc0dc36563bd219e42732e15b156c95aee0e07f28",
-        "RecordAdded(uint256,uint256,uint256,string)",
+        RECORD_ADDED_TOPIC,
+        "RecordAdded(bytes32,uint256,string,uint8,string,address)",
     ),
     (
-        "0x989fc3f482c08205f3318acb67405437e026aa2b3ded15a815813fff11fa37c6",
-        "RecordStatusUpdated(uint256,uint256,uint256,string)",
+        "0x7735f518b96096d1410ef5122b09bdb190e8d94e93e6896cbeff28f034ea883c",
+        "RecordStatusUpdated(bytes32,uint256,string)",
     ),
     (
-        "0xec288ea680fc912ecd077dc712f1347911ee4709aff396bf18fd9d74e2a71eb3",
-        "RoleGranted(uint256,bytes32,address,bytes32)",
+        "0xd61bf855a7ed7c857a0c46025807cab964fad9226a03392763af3e0c57ea4ae2",
+        "RoleGranted(bytes32,address,bytes32)",
     ),
     (
-        "0x257eb2ed659fb75385b608c05a73049fa8c6b406644b5bd6933950a933b36e39",
-        "RoleRevoked(uint256,bytes32,address,bytes32)",
+        "0x3e24446ed0a47b5a935b76dac730872c525ce8eff3f3e5c159b83e0a7f0bd40d",
+        "RoleRevoked(bytes32,address,bytes32)",
     ),
 ];
 
-/// The events the projections are sent with, in the form `?signature=` takes:
-/// argument names become result columns, `indexed` says which come from the
-/// topics.
+/// The events [`roles_sql`] reads, in the form `?signature=` takes: argument
+/// names become result columns, `indexed` says which come from the topics.
 ///
-/// The same events as [`REGISTRY_TOPICS`] said twice — those are what a topic0
-/// hashes from, these are what tidx parses — so `tests/signatures.rs` checks one
-/// against the other. A drift decodes an empty table rather than failing.
-pub const REGISTRY_ADDED: &str =
-    "RegistryAdded(uint256 indexed id, string name, address indexed creator)";
-
-/// Three, not two. `addRegistry` writes the creator's registry `admin` into
-/// `member` directly and announces it only as a `RegistryAdded`, so the
-/// grant/revoke pair alone answers every registry one admin short.
+/// The same events as above said twice — those are what a topic0 hashes from,
+/// these are what tidx parses — so `tests/signatures.rs` checks one against the
+/// other. A drift decodes an empty table rather than failing.
+///
+/// Two, not three: a registry announces its creator's admin as an ordinary
+/// `RoleGranted` when the factory initializes it, so the fold needs no seed.
 pub const ROLE_EVENTS: &[&str] = &[
-    "RoleGranted(uint256 indexed registryId, bytes32 checksumHash, address indexed account, bytes32 role)",
-    "RoleRevoked(uint256 indexed registryId, bytes32 checksumHash, address indexed account, bytes32 role)",
-    REGISTRY_ADDED,
+    "RoleGranted(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
+    "RoleRevoked(bytes32 indexed checksumHash, address indexed account, bytes32 role)",
 ];
 
-/// What [`registries_sql`] pages on — its own place in the log, since a
-/// registry id is assigned in that order anyway.
-pub const REGISTRIES_KEY: Key<'static> = &[("block_num", "block_num"), ("log_idx", "log_idx")];
-
+/// A head query like the precompile's: newest row per `(checksumHash, account,
+/// role)` wins, kept only if it granted. Revokes are ordered against grants
+/// rather than subtracted from them — the same key can be granted, revoked and
+/// granted again.
+///
+/// The address is a parameter because a registry is a deployment, and tidx's
+/// generated CTEs filter on topic0 alone. It is also the whole partition: one
+/// contract per registry is what removed the registry id from the key, the seed
+/// arm that used to supply the creator's admin, and the `topic1` narrowing that
+/// used to keep one registry's answer out of another's.
 /// What [`roles_sql`] pages on, which is the role key its window partitions by.
 pub const ROLES_KEY: Key<'static> = &[
     ("checksumHash", "\"checksumHash\""),
@@ -87,62 +97,24 @@ pub const ROLES_KEY: Key<'static> = &[
     ("role", "role"),
 ];
 
-/// Every registry the wrapper announced, in the order it assigned their ids.
-///
-/// Over the table `?signature=` generates rather than raw `data`: `name` is the
-/// only argument outside the topics and it is a `string`, which tidx decodes.
-/// Description, metadata and timestamp are not here at all — they exist only in
-/// the `registry` envelope, which is why this projection is the lossy one.
-pub fn registries_sql(engine: Engine, wrapper: &str, up_to: u64, after: &str) -> String {
-    format!(
-        "SELECT id, name, creator, block_num, log_idx FROM RegistryAdded \
-         WHERE address = {} AND block_num <= {up_to}{after} \
-         ORDER BY block_num, log_idx",
-        engine.bytes_literal(wrapper),
-    )
-}
-
-/// Every role held in one registry: newest row per `(checksumHash, account,
-/// role)` wins, kept only if it granted.
-///
-/// Revokes are ordered against grants rather than subtracted from them — the
-/// same key can be granted, revoked and granted again, so a set difference
-/// answers that nobody holds it. The creator's admin joins as a third arm at its
-/// own log position, ordered like any other.
-///
-/// The registry id narrows in SQL because it is `topic1` on every one of these
-/// events; the wrapper's address alone would answer for every registry at once.
-pub fn roles_sql(
-    engine: Engine,
-    wrapper: &str,
-    registry_id: u64,
-    up_to: u64,
-    after: &str,
-) -> String {
-    let filter = |id_column: &str| {
-        format!(
-            "address = {} AND {id_column} = {registry_id} AND block_num <= {up_to}{after}",
-            engine.bytes_literal(wrapper),
-        )
-    };
+pub fn roles_sql(engine: Engine, registry: &str, up_to: u64, after: &str) -> String {
+    // Repeated into both arms on purpose. tidx pushes these predicates into the
+    // CTEs it generates, and PostgreSQL inlines those CTEs and pushes them again;
+    // the copies here are what filters if either ever stops.
+    let filter = format!(
+        "address = {} AND block_num <= {up_to}{after}",
+        engine.bytes_literal(registry),
+    );
+    // The role key: what the projection returns, and what it partitions by.
+    // Written once so the two cannot drift into answering different questions.
     let key = "\"checksumHash\", account, role";
     let arm = |table, granted| {
         format!(
-            "SELECT block_num, log_idx, {key}, {granted} AS granted FROM {table} WHERE {}",
-            filter("\"registryId\"")
+            "SELECT block_num, log_idx, {key}, {granted} AS granted FROM {table} WHERE {filter}"
         )
     };
-    // Built before the outer format!, which clippy would otherwise read as a
-    // nested one -- and it is easier to follow named than inline anyway.
-    let seed = format!(
-        "SELECT block_num, log_idx, {} AS \"checksumHash\", creator AS account, \
-         {} AS role, TRUE AS granted FROM RegistryAdded WHERE {}",
-        engine.bytes_literal(REGISTRY_SCOPE),
-        engine.bytes_literal(ROLE_ADMIN),
-        filter("id")
-    );
     format!(
-        "WITH acl AS ({granted} UNION ALL {revoked} UNION ALL {seed}) \
+        "WITH acl AS ({granted} UNION ALL {revoked}) \
          SELECT {key}, block_num FROM (\
            SELECT {key}, block_num, granted, \
                   ROW_NUMBER() OVER (PARTITION BY {key} \
@@ -154,21 +126,106 @@ pub fn roles_sql(
     )
 }
 
-/// One registry, as the wrapper announced it.
+/// The record ids the contract stopped assigning: `RecordAdded` in first-anchor
+/// order, numbered from 1 within one registry — the whole of what `recordCount`
+/// and `recordIdByChecksum` did before a record became `keccak256(checksum)`.
+///
+/// Reads the base `logs` table rather than a generated one: the checksum hash is
+/// `topic1`, so numbering never touches the data section and needs no
+/// `?signature=`.
+///
+/// The window keeps each checksum's *first* appearance — numbering the rows
+/// themselves would give every version an id, so re-anchoring an early record
+/// would shift every record after it. Ascending, where
+/// [`crate::tidx::heads_sql`] is descending: that wants the newest row per key,
+/// this one the oldest.
+///
+/// Ordered by the hash so it can page on its own partition; the numbering is
+/// applied to the result by [`parse_record_ids`], since no page knows what came
+/// before it.
+///
+/// Cost tracks the registry's own `RecordAdded` rows, not the chain. Measured on
+/// tidx's schema in PostgreSQL 16, index-backed with no sequential scan:
+///
+/// | query | rows scanned | rows out | time |
+/// |---|---|---|---|
+/// | this, 20k-record registry | 60k | 20k | 37ms |
+/// | this, 200k-record registry | 600k | 200k | 468ms |
+/// | `heads_sql`, for scale | 200k | 40k | 153ms |
+///
+/// A full walk, with no cheap single-record path — a number is a property of
+/// the whole ordering. Materialize it for a large registry rather
+/// than answering a page load with it.
+/// What [`record_ids_sql`] pages on: the checksum hash, which is its window's
+/// partition, so a page holds every row of every record it reports on.
+pub const RECORD_IDS_KEY: Key<'static> = &[("checksum_hash", "topic1")];
+
+pub fn record_ids_sql(engine: Engine, registry: &str, up_to: u64, after: &str) -> String {
+    format!(
+        "SELECT checksum_hash, block_num, log_idx FROM (\
+           SELECT topic1 AS checksum_hash, block_num, log_idx, \
+                  ROW_NUMBER() OVER (PARTITION BY topic1 \
+                                     ORDER BY block_num, log_idx) AS rn \
+           FROM logs WHERE address = {} AND selector = {} \
+                 AND block_num <= {up_to}{after}\
+         ) firsts WHERE rn = 1 ORDER BY checksum_hash",
+        engine.bytes_literal(registry),
+        engine.bytes_literal(RECORD_ADDED_TOPIC),
+    )
+}
+
+/// Every registry one factory deployed, in deployment order.
+///
+/// No envelope behind it: name, description and metadata are descriptive, set
+/// once, and ride in the event itself. They are dynamic `string`s, so the row
+/// carries raw `data` for [`crate::envelope::decode_strings`] rather than a
+/// column tidx generated -- the same reason [`crate::tidx::heads_sql`] reads
+/// raw `data`.
+///
+/// Ordered, because deployment order is the canonical numbering: an index into
+/// this list is what an on-chain counter would have assigned. The factory
+/// address is a parameter for the reason it is everywhere else here -- tidx's
+/// tables filter on topic0 alone, so without it any contract emitting the same
+/// event answers too.
+/// What [`registries_sql`] pages on. No window to align to — deployment order
+/// *is* the order, so the cursor is the last row's place in the log.
+pub const REGISTRIES_KEY: Key<'static> = &[("block_num", "block_num"), ("log_idx", "log_idx")];
+
+pub fn registries_sql(engine: Engine, factory: &str, up_to: u64, after: &str) -> String {
+    format!(
+        "SELECT topic1 AS registry, topic2 AS creator, data, block_num, log_idx \
+         FROM logs WHERE address = {} AND selector = {} AND block_num <= {up_to}{after} \
+         ORDER BY block_num, log_idx",
+        engine.bytes_literal(factory),
+        engine.bytes_literal(REGISTRY_DEPLOYED_TOPIC),
+    )
+}
+
+/// One registry, as the deployment log announces it.
 #[derive(Debug, Clone, Serialize)]
-pub struct Announced {
-    pub id: u64,
-    pub name: String,
+pub struct Deployed {
+    /// Deployment order, 1-based — what an on-chain counter would have assigned,
+    /// and the same rule [`record_ids_sql`] applies one level down.
+    pub number: u64,
+    pub address: String,
     pub creator: String,
+    pub name: String,
+    pub description: String,
+    pub metadata: String,
     pub block_num: u64,
 }
 
-/// [`registries_sql`]'s rows.
-pub fn parse_registries(table: &Table) -> Result<Vec<Announced>> {
-    let (id, name, creator, block) = (
-        table.index_of("id")?,
-        table.index_of("name")?,
+/// [`registries_sql`]'s rows. The strings come out of raw `data` here, so a row
+/// that is not a `RegistryDeployed` payload is an error rather than a registry
+/// with empty fields — the query is scoped to one factory and one topic0, so a
+/// payload that will not decode means the schema moved, not that a caller
+/// anchored something odd.
+pub fn parse_registries(table: &Table) -> Result<Vec<Deployed>> {
+    const STRINGS: &[&str] = &["name", "description", "metadata"];
+    let (registry, creator, data, block) = (
+        table.index_of("registry")?,
         table.index_of("creator")?,
+        table.index_of("data")?,
         table.index_of("block_num")?,
     );
     table
@@ -176,13 +233,27 @@ pub fn parse_registries(table: &Table) -> Result<Vec<Announced>> {
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let at = |what| format!("row {i}: no {what}");
-            Ok(Announced {
-                id: number(row, id).with_context(|| at("id"))?,
-                name: text(row, name).to_string(),
+            let at = || format!("row {i}");
+            let fields = hex::decode(strip_hex(text(row, data)))
+                .ok()
+                .and_then(|raw| decode_strings(STRINGS, &raw))
+                .with_context(|| format!("{}: not a RegistryDeployed payload", at()))?;
+            let field = |name: &str| {
+                fields
+                    .iter()
+                    .find(|(k, _)| *k == name)
+                    .map_or(String::new(), |(_, v)| v.clone())
+            };
+            Ok(Deployed {
+                number: i as u64 + 1,
+                address: address_from_topic(text(row, registry))
+                    .with_context(|| format!("{}: malformed registry topic", at()))?,
                 creator: address_from_topic(text(row, creator))
-                    .unwrap_or_else(|| normalize_hex(text(row, creator))),
-                block_num: number(row, block).with_context(|| at("block_num"))?,
+                    .with_context(|| format!("{}: malformed creator topic", at()))?,
+                name: field("name"),
+                description: field("description"),
+                metadata: field("metadata"),
+                block_num: number(row, block).with_context(|| format!("{}: no block_num", at()))?,
             })
         })
         .collect()
@@ -218,103 +289,144 @@ pub fn parse_roles(table: &Table) -> Result<Vec<RoleHeld>> {
                 scope: normalize_hex(text(row, scope)),
                 account: address_from_topic(text(row, account))
                     .unwrap_or_else(|| normalize_hex(text(row, account))),
-                role: bytes32_label_of(text(row, role)),
+                role: hex::decode(strip_hex(text(row, role)))
+                    .ok()
+                    .and_then(|raw| <[u8; 32]>::try_from(raw.as_slice()).ok())
+                    .map_or_else(|| normalize_hex(text(row, role)), |w| bytes32_label(&w)),
                 block_num: number(row, block).with_context(|| format!("row {i}: no block_num"))?,
             })
         })
         .collect()
 }
 
+/// [`record_ids_sql`]'s rows, as `checksum_hash -> record_id`.
+///
+/// The numbering happens here rather than in SQL. The query pages on the
+/// checksum hash, so it arrives in hash order and no page knows how many
+/// records came before it — but sorted back into first-anchor order, a record's
+/// position *is* the id the contract used to assign.
+pub fn parse_record_ids(table: &Table) -> Result<BTreeMap<String, u64>> {
+    let (hash, block, idx) = (
+        table.index_of("checksum_hash")?,
+        table.index_of("block_num")?,
+        table.index_of("log_idx")?,
+    );
+    let mut firsts = table
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let at = |name| format!("row {i}: no {name}");
+            Ok((
+                number(row, block).with_context(|| at("block_num"))?,
+                number(row, idx).with_context(|| at("log_idx"))?,
+                normalize_hex(text(row, hash)),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    firsts.sort_unstable();
+    Ok(firsts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, _, hash))| (hash, i as u64 + 1))
+        .collect())
+}
+
 /// One record at its newest version, with the status anchored against that
 /// version if there is one.
 #[derive(Debug, Clone, Serialize)]
 pub struct Record {
-    pub record_id: u64,
-    /// The newest version index. The head holds only this one — earlier versions
-    /// are in the log, not in state.
+    /// The id the contract stopped assigning, from [`parse_record_ids`]. `None`
+    /// only if the two queries disagree, which is worth seeing rather than
+    /// hiding behind a zero.
+    pub number: Option<u64>,
+    pub checksum_hash: String,
+    /// The newest version index. The head holds only this one — earlier
+    /// versions are in the log, not in state.
     pub version: u64,
     pub uri: String,
     pub checksum: String,
     pub checksum_algo: String,
     pub metadata: String,
+    /// The contract's `RecordCategory` as its uint8; the names are only in the source.
+    pub category: u8,
+    /// Identifies the data, where `checksum` identifies the bytes.
+    pub data_pointer: String,
+    /// Who wrote this version. The precompile's caller is the registry contract, so the
+    /// envelope is the only place this exists.
+    pub author: String,
     pub timestamp: u64,
     pub status: Option<String>,
 }
 
-/// One registry's records, from the wrapper's heads.
+/// A registry's records, from its heads.
 ///
-/// Every registry shares the wrapper's namespace, so the heads arrive together
-/// and the registry id is read out of each envelope rather than filtered in SQL
-/// — the key a record is anchored under hashes that id in, so there is nothing
-/// for a `WHERE` to match on. A head that will not decode is an error: only the
-/// wrapper anchors here, and skipping one would drop a record while still
-/// looking like a full list.
-///
-/// Statuses attach only to the version they name. A status against version 2 of
-/// a record now at version 3 is not the current status.
-pub fn parse_records(heads: &[Head], registry_id: u64) -> Result<Vec<Record>> {
-    let mut records: BTreeMap<u64, Record> = BTreeMap::new();
-    let mut statuses: BTreeMap<(u64, u64), String> = BTreeMap::new();
+/// A head that will not decode is an error: only this registry anchors under its
+/// namespace and only in these two shapes, so skipping one would drop a record
+/// and still look like a full list. Statuses attach only to the version they
+/// name — one against version 2 of a record now at 3 is not its status.
+pub fn parse_records(heads: &[Head], numbers: &BTreeMap<String, u64>) -> Result<Vec<Record>> {
+    let mut records: BTreeMap<String, Record> = BTreeMap::new();
+    let mut statuses: BTreeMap<(String, u64), String> = BTreeMap::new();
 
     for head in heads {
         let envelope = decode_envelope(&head.key, &head.metadata)
             .with_context(|| format!("key {}: not a registry envelope", head.key))?;
-        let field = |name: &str| -> Result<u64> {
-            envelope
-                .field(name)
-                .parse()
-                .with_context(|| format!("key {}: {name} {:?}", head.key, envelope.field(name)))
-        };
-        // `registry` and `acl` envelopes describe the registry, not its records.
-        if !matches!(envelope.kind, "record" | "status") {
-            continue;
-        }
-        if field("registry_id")? != registry_id {
-            continue;
-        }
-        let (record_id, index) = (field("record_id")?, field("index")?);
+        let hash = normalize_hex(envelope.field("checksum_hash"));
+        let index = envelope
+            .field("index")
+            .parse::<u64>()
+            .with_context(|| format!("key {}: index {:?}", head.key, envelope.field("index")))?;
         match envelope.kind {
             "record" => {
                 records.insert(
-                    record_id,
+                    hash.clone(),
                     Record {
-                        record_id,
+                        number: numbers.get(&hash).copied(),
+                        checksum_hash: hash,
                         version: index,
                         uri: envelope.field("uri").to_string(),
                         checksum: envelope.field("checksum").to_string(),
                         checksum_algo: envelope.field("checksum_algo").to_string(),
                         metadata: envelope.field("metadata").to_string(),
-                        timestamp: field("timestamp")?,
+                        category: envelope.field("category").parse().with_context(|| {
+                            format!(
+                                "key {}: category {:?}",
+                                head.key,
+                                envelope.field("category")
+                            )
+                        })?,
+                        data_pointer: envelope.field("data_pointer").to_string(),
+                        author: envelope.field("author").to_string(),
+                        timestamp: envelope.field("timestamp").parse().with_context(|| {
+                            format!(
+                                "key {}: timestamp {:?}",
+                                head.key,
+                                envelope.field("timestamp")
+                            )
+                        })?,
                         status: None,
                     },
                 );
             }
-            _ => {
-                statuses.insert((record_id, index), envelope.field("status").to_string());
+            "status" => {
+                statuses.insert((hash, index), envelope.field("status").to_string());
             }
+            other => anyhow::bail!("key {}: unknown envelope kind {other}", head.key),
         }
     }
 
-    Ok(records
+    let mut out: Vec<Record> = records
         .into_values()
         .map(|mut record| {
-            record.status = statuses.get(&(record.record_id, record.version)).cloned();
+            record.status = statuses
+                .get(&(record.checksum_hash.clone(), record.version))
+                .cloned();
             record
         })
-        .collect())
-}
-
-/// A right-padded `bytes32` string ("admin") as text, anything else as the hex
-/// it came in as — how Solidity writes role names.
-fn bytes32_label_of(hexed: &str) -> String {
-    let Ok(raw) = hex::decode(strip_hex(hexed)) else {
-        return normalize_hex(hexed);
-    };
-    let text = raw.split(|b| *b == 0).next().unwrap_or(&[]);
-    match std::str::from_utf8(text) {
-        Ok(label) if !label.is_empty() && label.chars().all(|c| c.is_ascii_graphic()) => {
-            label.to_string()
-        }
-        _ => normalize_hex(hexed),
-    }
+        .collect();
+    // In the order the contract would have numbered them; unnumbered last, so a
+    // disagreement between the two queries stands out instead of sorting as 0.
+    out.sort_by_key(|r| (r.number.is_none(), r.number, r.checksum_hash.clone()));
+    Ok(out)
 }

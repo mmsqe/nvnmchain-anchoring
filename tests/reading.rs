@@ -4,21 +4,26 @@
 mod common;
 
 use common::{
-    bytes, RECORD_KEY, REGISTRY_KEY, STATUS_KEY, TAGGED_RECORD_METADATA,
-    TAGGED_REGISTRY_COMMITMENT, TAGGED_REGISTRY_METADATA, TAGGED_STATUS_METADATA,
+    bytes, AUTHOR, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_KEY, STATUS_METADATA,
 };
-use nvnmchain_anchoring::eth::{checksum_address, keccak_hex};
+use nvnmchain_anchoring::eth::{checksum_address, keccak_hex, parse_address};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
+use std::collections::BTreeMap;
+
 use nvnmchain_anchoring::registry::{
-    parse_records, parse_registries, parse_roles, registries_sql, roles_sql, REGISTRY_SCOPE,
+    parse_record_ids, parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql,
+    roles_sql, RECORD_ADDED_TOPIC, REGISTRY_DEPLOYED_TOPIC, ROLE_EVENTS,
 };
 use nvnmchain_anchoring::tidx::{
-    cursor_after, heads_sql, parse_coverage, parse_heads, reject_truncated, Engine, Head, Table,
-    HARD_LIMIT, HEADS_KEY,
+    cursor_after, heads_sql, namespace_heads_sql, parse_coverage, parse_heads, reject_truncated,
+    Engine, Head, Table, HARD_LIMIT, HEADS_KEY,
 };
 use serde_json::json;
 
 const NAMESPACE: &str = "0x44DA54d3f5416A9Ae699d54EcB83c3043c41319E";
+/// A registry, which is a deployment rather than an enshrined address — every
+/// roles query names one, and that name is the whole partition.
+const REGISTRY: &str = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
 
 fn table(body: serde_json::Value) -> Table {
     Table::from_response(&body).expect("a query tidx accepted")
@@ -51,8 +56,8 @@ fn a_log_row_becomes_a_head() {
         "columns": ["namespace", "key", "data"],
         "rows": [[
             topic(&NAMESPACE.to_lowercase()),
-            REGISTRY_KEY,
-            anchored_data(TAGGED_REGISTRY_COMMITMENT, TAGGED_REGISTRY_METADATA),
+            RECORD_KEY,
+            anchored_data(RECORD_COMMITMENT, RECORD_METADATA),
         ]],
         "row_count": 1,
     })))
@@ -61,9 +66,9 @@ fn a_log_row_becomes_a_head() {
     assert_eq!(heads.len(), 1);
     // Checksummed on the way in, whatever case the index returned.
     assert_eq!(heads[0].namespace, NAMESPACE);
-    assert_eq!(heads[0].key, REGISTRY_KEY);
-    assert_eq!(heads[0].commitment, TAGGED_REGISTRY_COMMITMENT);
-    assert_eq!(heads[0].metadata, bytes(TAGGED_REGISTRY_METADATA));
+    assert_eq!(heads[0].key, RECORD_KEY);
+    assert_eq!(heads[0].commitment, RECORD_COMMITMENT);
+    assert_eq!(heads[0].metadata, bytes(RECORD_METADATA));
 }
 
 #[test]
@@ -75,10 +80,10 @@ fn a_row_whose_payload_does_not_decode_is_an_error() {
     let corrupt = parse_heads(&table(json!({
         "ok": true,
         "columns": ["namespace", "key", "data"],
-        "rows": [[topic(NAMESPACE), REGISTRY_KEY, "0x00"]],
+        "rows": [[topic(NAMESPACE), RECORD_KEY, "0x00"]],
     })));
     assert!(corrupt.is_err());
-    assert!(corrupt.unwrap_err().to_string().contains(REGISTRY_KEY));
+    assert!(corrupt.unwrap_err().to_string().contains(RECORD_KEY));
 }
 
 #[test]
@@ -98,7 +103,7 @@ fn a_column_the_query_did_not_return_is_an_error() {
     let short = parse_heads(&table(json!({
         "ok": true,
         "columns": ["namespace", "key"],
-        "rows": [[topic(NAMESPACE), REGISTRY_KEY]],
+        "rows": [[topic(NAMESPACE), RECORD_KEY]],
     })));
     assert!(short.is_err());
     assert!(short.unwrap_err().to_string().contains("data"));
@@ -168,19 +173,25 @@ fn the_address_literal_is_spelled_for_its_engine() {
     let hexed = ANCHORING_ADDRESS.trim_start_matches("0x").to_lowercase();
     assert_eq!(
         Engine::Postgres.bytes_literal(ANCHORING_ADDRESS),
-        format!("'\\x{hexed}'::bytea")
+        format!("'\\x{hexed}'")
     );
     assert_eq!(
         Engine::ClickHouse.bytes_literal(ANCHORING_ADDRESS),
         format!("'0x{hexed}'")
     );
 
-    assert!(heads_sql(Engine::Postgres, 7, "").contains(&format!("'\\x{hexed}'::bytea")));
+    assert!(heads_sql(Engine::Postgres, 7, "").contains(&format!("'\\x{hexed}'")));
     assert!(heads_sql(Engine::ClickHouse, 7, "").contains(&format!("'0x{hexed}'")));
 
     // The topic goes through the same spelling — it is a bytea column too.
     let topic0 = ANCHORED_TOPIC.trim_start_matches("0x");
-    assert!(heads_sql(Engine::Postgres, 7, "").contains(&format!("'\\x{topic0}'::bytea")));
+    assert!(heads_sql(Engine::Postgres, 7, "").contains(&format!("'\\x{topic0}'")));
+
+    // Uncast, everywhere: tidx's pushdown extractor reads a bare literal and
+    // not a cast expression. `tempo-e2e` sends the same spelling to a running
+    // tidx, so this is the form with a live proof behind it.
+    assert!(!roles_sql(Engine::Postgres, REGISTRY, 7, "").contains("::bytea"));
+    assert!(!heads_sql(Engine::Postgres, 7, "").contains("::bytea"));
 }
 
 #[test]
@@ -188,6 +199,101 @@ fn heads_are_bounded_at_the_audited_block() {
     // tidx's realtime sync runs ahead of its contiguous interval; a head newer
     // than the block state is read at would report as a false mismatch.
     assert!(heads_sql(Engine::Postgres, 123, "").contains("block_num <= 123"));
+}
+
+#[test]
+fn the_roles_query_orders_revokes_against_grants() {
+    // Not "granted minus revoked": the same key can be granted, revoked and
+    // granted again, and a set difference answers that nobody holds it. The
+    // partition is every field of the key the wrapper hashes an `acl` envelope
+    // under, so two roles for one account stay apart.
+    let sql = roles_sql(Engine::Postgres, REGISTRY, 99, "");
+    assert!(sql.contains(
+        "PARTITION BY \"checksumHash\", account, role \
+         ORDER BY block_num DESC, log_idx DESC"
+    ));
+    assert!(sql.contains("WHERE rn = 1 AND granted"));
+
+    // Every event the query is sent with has an arm, or the ordering has
+    // nothing to order against. Read off ROLE_EVENTS rather than spelled again,
+    // so a fourth signature cannot be added without one.
+    for named in ROLE_EVENTS {
+        let event = named.split('(').next().expect("a signature has a name");
+        assert!(sql.contains(&format!("FROM {event} ")), "no {event} arm");
+    }
+}
+
+#[test]
+fn the_roles_query_needs_no_seed_for_the_creators_admin() {
+    // The old wrapper wrote `member` directly in addRegistry and announced the creator's
+    // admin only in RegistryAdded, so the fold needed that event as a third arm. A registry
+    // announces it as an ordinary RoleGranted at deployment, so two arms answer in full.
+    let sql = roles_sql(Engine::Postgres, REGISTRY, 99, "");
+    assert!(!sql.contains("RegistryAdded"), "{sql}");
+    assert_eq!(ROLE_EVENTS.len(), 2, "{ROLE_EVENTS:?}");
+}
+
+#[test]
+fn record_numbering_counts_records_and_not_versions() {
+    // The window keeps each checksum's *first* appearance; anything looser would
+    // give every version its own id, so re-anchoring an early record would
+    // renumber it and shift every record after it.
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99, "");
+    assert!(
+        sql.contains("ROW_NUMBER() OVER (PARTITION BY topic1 ORDER BY block_num, log_idx) AS rn")
+    );
+    assert!(sql.contains("WHERE rn = 1"));
+
+    // Ascending, where the head queries are descending: this one wants the
+    // oldest row per key, not the newest.
+    assert!(!sql.contains("DESC"), "{sql}");
+
+    // The numbering itself is no longer in SQL, and cannot be: the query pages
+    // on the checksum hash, and no page knows how many records preceded it.
+    assert!(!sql.contains("record_id"), "{sql}");
+}
+
+#[test]
+fn record_numbering_reads_topics_and_not_the_data_section() {
+    // Why it can fold at all where a whole records projection cannot: the
+    // checksum hash is indexed, so the query never meets the dynamic argument
+    // tidx would hand back as an ABI offset word.
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 99, "");
+    assert!(sql.contains("topic1 AS checksum_hash"));
+    assert!(sql.contains("FROM logs "), "{sql}");
+    assert!(
+        !sql.contains("RecordAdded"),
+        "reads the base table, not a generated one"
+    );
+    assert!(!sql.contains("data"), "{sql}");
+}
+
+#[test]
+fn record_numbering_is_scoped_to_one_deployment_and_bounded() {
+    // The same trap as the roles query: tidx's tables filter on topic0 alone, so
+    // without the address any registry's records would be numbered together.
+    let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
+    let topic0 = RECORD_ADDED_TOPIC.trim_start_matches("0x");
+    let sql = record_ids_sql(Engine::Postgres, REGISTRY, 7, "");
+    assert!(sql.contains(&format!("address = '\\x{hexed}'")));
+    assert!(sql.contains(&format!("selector = '\\x{topic0}'")));
+    assert!(sql.contains("AND block_num <= 7"));
+    assert!(record_ids_sql(Engine::ClickHouse, REGISTRY, 7, "").contains(&format!("'0x{hexed}'")));
+    assert!(!sql.contains("::bytea"));
+}
+
+#[test]
+fn the_roles_query_is_scoped_to_one_deployment() {
+    // tidx's generated CTEs filter on topic0 alone — the wrapper is a
+    // deployment, not a genesis address, so any contract emitting the same
+    // event answers too unless the query says which one. Bounded in the same
+    // breath, since both predicates ride the pushdown together.
+    let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
+    let bound = "AND block_num <= 7";
+    assert!(roles_sql(Engine::Postgres, REGISTRY, 7, "")
+        .contains(&format!("address = '\\x{hexed}' {bound}")));
+    assert!(roles_sql(Engine::ClickHouse, REGISTRY, 7, "")
+        .contains(&format!("address = '0x{hexed}' {bound}")));
 }
 
 #[test]
@@ -204,6 +310,249 @@ fn head_slot_derivation_matches_the_node_suite() {
 
     assert_eq!(head_slot("0xnothex", &key), None);
     assert_eq!(head_slot(NAMESPACE, "0x1234"), None);
+}
+
+/// `abi.encode(string, string, string)` — `RegistryDeployed`'s data section,
+/// built the way the ABI says rather than pasted, so a test that fails names a
+/// decoder bug and not a typo in a literal.
+fn deployed_data(strings: [&str; 3]) -> String {
+    let (mut head, mut tail) = (String::new(), String::new());
+    let mut offset = 3 * 32;
+    for value in strings {
+        head.push_str(&format!("{offset:064x}"));
+        let raw = value.as_bytes();
+        let words = raw.len().div_ceil(32);
+        tail.push_str(&format!("{:064x}", raw.len()));
+        if words > 0 {
+            tail.push_str(&format!(
+                "{:0<width$}",
+                hex::encode(raw),
+                width = words * 64
+            ));
+        }
+        offset += 32 + words * 32;
+    }
+    format!("0x{head}{tail}")
+}
+
+const FACTORY: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+
+#[test]
+fn a_literal_cannot_carry_a_quote_out_of_its_string() {
+    // The queries are string interpolation, and one caller is an HTTP path
+    // segment now. Non-hex is dropped rather than escaped, so there is nothing
+    // to escape wrong.
+    for hostile in ["aa' OR 1=1--", "aa\\x27; DROP TABLE logs; --", "0xaa'"] {
+        let literal = Engine::Postgres.bytes_literal(hostile);
+        assert_eq!(literal.matches('\'').count(), 2, "{literal}");
+        assert!(!literal.contains("OR"), "{literal}");
+        assert!(!literal.contains(';'), "{literal}");
+    }
+}
+
+#[test]
+fn an_address_is_rejected_rather_than_filtered_into_another_one() {
+    // Dropping non-hex would turn `0xAB!CD…` into a different, real-looking
+    // address and answer "nothing here" — so callers check before building SQL.
+    assert!(parse_address(REGISTRY).is_some());
+    assert!(parse_address(&REGISTRY.to_lowercase()).is_some());
+    for bad in [
+        "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6",     // 19 bytes
+        "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0e0", // 21 bytes
+        "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6g0",   // not hex
+        "",
+    ] {
+        assert!(parse_address(bad).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn the_registries_query_is_scoped_to_one_factory_and_ordered_by_deployment() {
+    // Ordered because deployment order *is* the numbering: an index into the
+    // answer is what an on-chain counter would have assigned. Scoped because
+    // tidx's tables filter on topic0 alone, so every factory would answer.
+    let hexed = FACTORY.trim_start_matches("0x").to_lowercase();
+    let topic0 = REGISTRY_DEPLOYED_TOPIC.trim_start_matches("0x");
+    let sql = registries_sql(Engine::Postgres, FACTORY, 7, "");
+    assert!(sql.contains(&format!("address = '\\x{hexed}'")), "{sql}");
+    assert!(sql.contains(&format!("selector = '\\x{topic0}'")), "{sql}");
+    assert!(sql.contains("AND block_num <= 7"), "{sql}");
+    assert!(sql.contains("ORDER BY block_num, log_idx"), "{sql}");
+    assert!(!sql.contains("::bytea"), "{sql}");
+}
+
+#[test]
+fn registries_are_numbered_by_the_order_they_were_deployed_in() {
+    let rows = parse_registries(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["registry", "creator", "data", "block_num"],
+        "rows": [
+            [topic("aa"), topic("bb"), deployed_data(["docs", "", "{}"]), 11],
+            [topic("cc"), topic("bb"), deployed_data(["photos", "mine", ""]), 12],
+        ],
+    })))
+    .expect("two RegistryDeployed rows");
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].number, rows[1].number), (1, 2));
+    assert_eq!(rows[0].name, "docs");
+    assert_eq!(rows[0].description, "");
+    assert_eq!(rows[0].metadata, "{}");
+    assert_eq!(rows[1].name, "photos");
+    assert_eq!(rows[1].description, "mine");
+    assert_eq!(rows[1].block_num, 12);
+    // Checksummed on the way out, as every address in this crate is.
+    assert!(
+        rows[0].address.to_lowercase().ends_with("aa"),
+        "{}",
+        rows[0].address
+    );
+}
+
+#[test]
+fn a_row_that_is_not_a_deployment_payload_is_an_error() {
+    // The query names one factory and one topic0, so a payload that will not
+    // decode means the event moved — not that someone anchored something odd.
+    // Empty strings would read as a registry with no name.
+    let bad = parse_registries(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["registry", "creator", "data", "block_num"],
+        "rows": [[topic("aa"), topic("bb"), "0xdeadbeef", 11]],
+    })));
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+#[test]
+fn roles_come_back_with_their_names_rather_than_padded_words() {
+    // `admin` is a right-padded bytes32 on the wire. A caller comparing against
+    // the string would never match the padding.
+    let admin = format!("0x{:0<64}", hex::encode("admin"));
+    let rows = parse_roles(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["checksumHash", "account", "role", "block_num"],
+        "rows": [[topic("11"), "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0", admin, 9]],
+    })))
+    .expect("one held role");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].role, "admin");
+    assert_eq!(rows[0].block_num, 9);
+}
+
+#[test]
+fn a_numeric_column_reads_on_either_engine() {
+    // tidx serializes integers as JSON numbers on one engine and strings on the
+    // other; reading only one drops block_num to zero without saying so.
+    for block in [serde_json::json!(12), serde_json::json!("12")] {
+        let rows = parse_registries(&table(serde_json::json!({
+            "ok": true,
+            "columns": ["registry", "creator", "data", "block_num"],
+            "rows": [[topic("aa"), topic("bb"), deployed_data(["docs", "", ""]), block]],
+        })))
+        .expect("a row");
+        assert_eq!(rows[0].block_num, 12);
+    }
+}
+
+/// The checksum hash the vendored fixtures are anchored under: `keccak256("0xabc")`.
+const FIXTURE_HASH: &str = "0x851bb152e67e6c958ab7da1431fcaed09ce0efc598885f69a750b3b4b81fc1dc";
+
+fn head(key: &str, metadata: &str) -> Head {
+    Head {
+        namespace: REGISTRY.to_string(),
+        key: key.to_string(),
+        commitment: String::new(),
+        metadata: bytes(metadata),
+    }
+}
+
+#[test]
+fn a_record_carries_the_status_anchored_against_its_own_version() {
+    // Both fixtures are version 1 of the same checksum, so the status belongs to
+    // the version the record is at and shows up on it.
+    let numbers = BTreeMap::from([(FIXTURE_HASH.to_string(), 1)]);
+    let records = parse_records(
+        &[
+            head(RECORD_KEY, RECORD_METADATA),
+            head(STATUS_KEY, STATUS_METADATA),
+        ],
+        &numbers,
+    )
+    .expect("a record and its status");
+
+    assert_eq!(records.len(), 1, "the status is not a record of its own");
+    let record = &records[0];
+    assert_eq!(record.number, Some(1));
+    assert_eq!(record.checksum_hash, FIXTURE_HASH);
+    assert_eq!(record.version, 1);
+    assert_eq!(record.checksum, "0xabc");
+    assert_eq!(record.uri, "ipfs://cid");
+    assert_eq!(record.status.as_deref(), Some("approved"));
+}
+
+#[test]
+fn a_status_without_its_record_is_not_a_record() {
+    // Statuses are keyed per version and only ever attach to one. Alone, it
+    // describes nothing — inventing a record around it would be worse.
+    let records = parse_records(&[head(STATUS_KEY, STATUS_METADATA)], &BTreeMap::new())
+        .expect("a status head alone is not an error");
+    assert!(records.is_empty(), "{records:?}");
+}
+
+#[test]
+fn a_head_that_is_not_a_registry_envelope_is_an_error() {
+    // Only the registry anchors under its own namespace, and only these two
+    // shapes. Skipping one would drop a record and still look like a full list.
+    let bad = parse_records(&[head(RECORD_KEY, "0xdeadbeef")], &BTreeMap::new());
+    assert!(bad.is_err(), "{bad:?}");
+}
+
+#[test]
+fn a_record_the_numbering_did_not_reach_keeps_its_place_and_says_so() {
+    // The two queries are bounded at the same block, so a gap means they
+    // disagree — worth seeing as a null rather than sorting as record 0.
+    let records = parse_records(&[head(RECORD_KEY, RECORD_METADATA)], &BTreeMap::new())
+        .expect("a record with no number");
+    assert_eq!(records[0].number, None);
+}
+
+#[test]
+fn a_record_carries_its_category_pointer_and_author() {
+    // Decoded from the envelope, the only place they exist: the precompile's own caller is
+    // the registry contract, so an author is unrecoverable from the log's topics.
+    let records = parse_records(&[head(RECORD_KEY, RECORD_METADATA)], &BTreeMap::new())
+        .expect("a classified record");
+    assert_eq!(
+        records[0].category, 0,
+        "Unspecified: the fixture claims no category"
+    );
+    assert_eq!(records[0].data_pointer, "");
+    assert_eq!(records[0].author, AUTHOR);
+}
+
+#[test]
+fn a_namespace_scoped_heads_query_narrows_on_the_caller_topic() {
+    // `topic1` is the caller, and one registry's projection wants only its own
+    // heads — the audit's chain-wide query would drag in every namespace.
+    // Padded to a full word: `topic1` is 32 bytes with the address right-aligned,
+    // and the bare 20-byte form matches nothing — which reads as a registry that
+    // anchored nothing rather than as a broken query. The e2e caught this; this
+    // is the assertion that would have.
+    let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
+    let word = format!("{hexed:0>64}");
+    let scoped = namespace_heads_sql(Engine::Postgres, REGISTRY, 7, "");
+    assert!(
+        scoped.contains(&format!("topic1 = '\\x{word}'")),
+        "{scoped}"
+    );
+    assert!(
+        !scoped.contains(&format!("topic1 = '\\x{hexed}'")),
+        "{scoped}"
+    );
+    assert!(scoped.contains("AND block_num <= 7"), "{scoped}");
+    // ...and the chain-wide one still is not scoped, or the audit would only
+    // ever check one namespace.
+    assert!(!heads_sql(Engine::Postgres, 7, "").contains("topic1 = "));
 }
 
 #[test]
@@ -240,6 +589,27 @@ fn the_row_cap_is_the_one_tidx_enforces() {
 }
 
 #[test]
+fn records_are_numbered_in_first_anchor_order_whatever_order_they_arrive_in() {
+    // The query pages on the checksum hash, so rows come back in hash order and
+    // no page knows what preceded it. The id is the position once they are put
+    // back in log order — which is the order the contract's counter used.
+    let ids = parse_record_ids(&table(serde_json::json!({
+        "ok": true,
+        "columns": ["checksum_hash", "block_num", "log_idx"],
+        "rows": [
+            [topic("cc"), 9, 1],   // hash order puts this first...
+            [topic("aa"), 4, 2],   // ...but this record is older
+            [topic("bb"), 4, 7],   // same block, later in it
+        ],
+    })))
+    .expect("three first-appearances");
+
+    assert_eq!(ids[&topic("aa")], 1);
+    assert_eq!(ids[&topic("bb")], 2, "same block, ordered by log_idx");
+    assert_eq!(ids[&topic("cc")], 3);
+}
+
+#[test]
 fn a_cursor_is_lexicographic_over_its_key_and_spelled_for_its_engine() {
     // (a, b) > (x, y) written out, because not every engine takes a row-value
     // comparison. Bytea literals go through the engine's spelling — carried
@@ -268,118 +638,4 @@ fn a_cursor_is_lexicographic_over_its_key_and_spelled_for_its_engine() {
     let by_block: nvnmchain_anchoring::tidx::Key = &[("block_num", "block_num")];
     let n = cursor_after(Engine::Postgres, &rows, by_block, &row).expect("a cursor");
     assert_eq!(n, " AND (block_num > 12)");
-}
-
-/// The wrapper every projection reads from: a deployment, not an enshrined
-/// address, so every query names one and that name is the whole partition.
-const WRAPPER: &str = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
-
-fn head(key: &str, metadata: &str) -> Head {
-    Head {
-        namespace: WRAPPER.to_string(),
-        key: key.to_string(),
-        commitment: String::new(),
-        metadata: bytes(metadata),
-    }
-}
-
-#[test]
-fn the_registries_query_is_scoped_to_one_wrapper_and_ordered_by_id() {
-    // Ordered because the wrapper assigns ids in that order, so an index into
-    // the answer is the id. Scoped because tidx's generated tables filter on
-    // topic0 alone -- any contract emitting the same event would answer too.
-    let hexed = WRAPPER.trim_start_matches("0x").to_lowercase();
-    let sql = registries_sql(Engine::Postgres, WRAPPER, 7, "");
-    assert!(sql.contains("FROM RegistryAdded"), "{sql}");
-    assert!(sql.contains(&format!("address = '\\x{hexed}'")), "{sql}");
-    assert!(sql.contains("AND block_num <= 7"), "{sql}");
-    assert!(sql.contains("ORDER BY block_num, log_idx"), "{sql}");
-}
-
-#[test]
-fn the_roles_fold_seeds_the_creators_admin_and_orders_revokes_against_grants() {
-    // Not "granted minus revoked": the same key can be granted, revoked and
-    // granted again, and a set difference answers that nobody holds it. The
-    // seed is a third arm at its own log position, ordered like any other.
-    let sql = roles_sql(Engine::Postgres, WRAPPER, 42, 99, "");
-    for table in ["RoleGranted", "RoleRevoked", "RegistryAdded"] {
-        assert!(
-            sql.contains(&format!("FROM {table} ")),
-            "no {table} arm in {sql}"
-        );
-    }
-    assert!(sql.contains(&REGISTRY_SCOPE.trim_start_matches("0x").to_lowercase()));
-    assert!(sql.contains(
-        "PARTITION BY \"checksumHash\", account, role \
-         ORDER BY block_num DESC, log_idx DESC"
-    ));
-    assert!(sql.contains("WHERE rn = 1 AND granted"));
-
-    // The wrapper fronts every registry, so the id narrows as well as the
-    // address -- and it is `topic1` on all three events, so this is a predicate
-    // rather than a decode.
-    assert!(sql.contains("\"registryId\" = 42"), "{sql}");
-    assert!(sql.contains("id = 42"), "{sql}");
-}
-
-#[test]
-fn records_are_read_out_of_the_envelopes_the_wrapper_anchored() {
-    // Every registry shares the wrapper's namespace, so the registry id comes
-    // out of the payload -- the key hashes it in, leaving nothing to filter on.
-    let records = parse_records(
-        &[
-            head(RECORD_KEY, TAGGED_RECORD_METADATA),
-            head(STATUS_KEY, TAGGED_STATUS_METADATA),
-        ],
-        1,
-    )
-    .expect("a record and its status");
-
-    assert_eq!(records.len(), 1, "the status is not a record of its own");
-    assert_eq!(records[0].record_id, 1);
-    assert_eq!(records[0].version, 1);
-    assert!(records[0].status.is_some(), "same version, so it applies");
-}
-
-#[test]
-fn another_registrys_records_are_not_this_ones() {
-    // The wrapper's whole problem: one namespace for every registry, so a
-    // projection that forgot to check the id would answer with all of them.
-    let records = parse_records(&[head(RECORD_KEY, TAGGED_RECORD_METADATA)], 2)
-        .expect("no records for registry 2");
-    assert!(records.is_empty(), "{records:?}");
-}
-
-#[test]
-fn a_head_that_is_not_a_registry_envelope_is_an_error() {
-    // Only the wrapper anchors here, and only in the shapes it knows. Skipping
-    // one would drop a record and still look like a full list.
-    assert!(parse_records(&[head(RECORD_KEY, "0xdeadbeef")], 1).is_err());
-}
-
-#[test]
-fn a_role_row_comes_back_with_its_name_rather_than_a_padded_word() {
-    let admin = format!("0x{:0<64}", hex::encode("admin"));
-    let rows = parse_roles(&table(serde_json::json!({
-        "ok": true,
-        "columns": ["checksumHash", "account", "role", "block_num"],
-        "rows": [[topic("11"), "0x9fe46736679d2d9a65f0992f2272de9f3c7fa6e0", admin, 9]],
-    })))
-    .expect("one held role");
-    assert_eq!(rows[0].role, "admin");
-    assert_eq!(rows[0].block_num, 9);
-}
-
-#[test]
-fn a_registry_row_carries_the_name_the_event_announced() {
-    let rows = parse_registries(&table(serde_json::json!({
-        "ok": true,
-        "columns": ["id", "name", "creator", "block_num"],
-        "rows": [[3, "docs", topic("aa"), 11]],
-    })))
-    .expect("one registry");
-    assert_eq!(
-        (rows[0].id, rows[0].name.as_str(), rows[0].block_num),
-        (3, "docs", 11)
-    );
 }

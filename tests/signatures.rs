@@ -68,19 +68,28 @@ fn every_filtered_signature_is_one_the_contracts_emit() {
 
 #[test]
 fn every_domain_event_is_filtered() {
+    let (compiled, at) = (compiled_signatures(), fixture_commit());
     // Inherited solady/UUPS events, plus the precompile's own. Named rather than silently
     // skipped, so a new contract event fails until someone picks a side for it.
     const NOT_INDEXED: &[&str] = &[
         "Anchored(address,bytes32,bytes32,bytes)", // the precompile's own, filtered separately
-        "Initialized(uint64)",
         "OwnershipHandoverCanceled(address)",
         "OwnershipHandoverRequested(address)",
         "OwnershipTransferred(address,address)",
-        "Upgraded(address)",
     ];
 
+    // A skip that names nothing stops skipping anything, and would wave through
+    // an event of the same name if one came back. The three that went with the
+    // proxies were caught this way.
+    for skipped in NOT_INDEXED {
+        assert!(
+            compiled.contains(*skipped),
+            "{skipped} is skipped but no contract at {at} emits it"
+        );
+    }
+
     let filtered: BTreeSet<&str> = REGISTRY_TOPICS.iter().map(|(_, sig)| *sig).collect();
-    for signature in compiled_signatures() {
+    for signature in &compiled {
         if NOT_INDEXED.contains(&signature.as_str()) {
             continue;
         }
@@ -92,56 +101,72 @@ fn every_domain_event_is_filtered() {
     }
 }
 
-#[test]
-fn vendored_signatures_hash_to_the_topics_in_use() {
-    // Closes the loop: the signatures come from the contract, these are the hashes sent to
-    // `eth_getLogs`.
-    for (topic, signature) in REGISTRY_TOPICS {
-        assert_eq!(&keccak_hex(signature.as_bytes()), topic, "{signature}");
-    }
-    assert_eq!(keccak_hex(ANCHORED_SIGNATURE.as_bytes()), ANCHORED_TOPIC);
-}
-
-/// A named signature's arguments, e.g. `uint256 indexed registryId`.
+/// A named signature's arguments, e.g. `uint256 indexed id`.
 fn arguments(named: &str) -> impl Iterator<Item = &str> {
     named
         .split_once('(')
-        .and_then(|(_, rest)| rest.strip_suffix(')'))
-        .expect("a signature has parentheses")
+        .expect("a signature has arguments")
+        .1
+        .trim_end_matches(')')
         .split(',')
         .map(str::trim)
-        .filter(|a| !a.is_empty())
 }
 
-/// The canonical form of a named signature: types only, no names, no `indexed`.
+/// `Name(uint256 indexed a, bytes32 b)` → `Name(uint256,bytes32)`, the way tidx
+/// canonicalizes a `?signature=` before hashing it to a topic0.
 fn canonicalize(named: &str) -> String {
     let name = named.split_once('(').expect("a signature has a name").0;
     let types: Vec<&str> = arguments(named)
-        .map(|a| a.split_whitespace().next().expect("an argument has a type"))
+        .map(|arg| {
+            arg.split_whitespace()
+                .next()
+                .expect("an argument has a type")
+        })
         .collect();
     format!("{name}({})", types.join(","))
 }
 
 #[test]
-fn every_named_signature_is_a_canonical_one_said_differently() {
-    // Two spellings of the same events: these go to tidx as `?signature=`, the
-    // table is what a topic0 hashes from. A drift between them builds the query
-    // off some other topic0 and decodes an empty table rather than failing.
+fn the_roles_query_names_the_events_the_topics_pin() {
+    // Two spellings of one event: these go to tidx, REGISTRY_TOPICS is what a
+    // topic0 hashes from. Drifted apart, the query builds its table off some
+    // other topic0 — no rows rather than an error.
     let canonical: BTreeSet<&str> = REGISTRY_TOPICS.iter().map(|(_, sig)| *sig).collect();
     for named in ROLE_EVENTS {
         let form = canonicalize(named);
         assert!(
             canonical.contains(form.as_str()),
-            "{named} canonicalizes to {form}, which no filtered topic matches"
+            "{named} canonicalizes to {form}, which is not a signature this crate pins"
+        );
+    }
+
+    // And that no seed crept back: a registry announces its creator's admin as an
+    // ordinary RoleGranted, so the grant/revoke pair answers in full.
+    assert_eq!(ROLE_EVENTS.len(), 2, "{ROLE_EVENTS:?}");
+}
+
+#[test]
+fn the_roles_query_reads_events_whose_scope_is_topic1() {
+    // `roles_sql` partitions by checksumHash, which it reads as a decoded column but which
+    // an index also seeks on as topic1. Reordered, a scoped answer would silently select on
+    // an account instead.
+    for named in ROLE_EVENTS {
+        let first = arguments(named)
+            .find(|arg| arg.contains(" indexed "))
+            .unwrap_or_else(|| panic!("{named} indexes nothing, so it has no topic1"));
+        assert_eq!(
+            first, "bytes32 indexed checksumHash",
+            "{named} puts {first:?} in topic1, not the role scope"
         );
     }
 }
 
 #[test]
-fn the_roles_fold_reads_three_events_to_answer_about_two() {
-    // `addRegistry` writes the creator's registry admin into `member` directly
-    // and announces it only as a `RegistryAdded`, so the grant/revoke pair alone
-    // answers every registry one admin short.
-    assert_eq!(ROLE_EVENTS.len(), 3, "{ROLE_EVENTS:?}");
-    assert!(ROLE_EVENTS.iter().any(|e| e.starts_with("RegistryAdded(")));
+fn vendored_signatures_hash_to_the_topics_in_use() {
+    // Closes the loop: the signatures come from the contract, and these hashes are what an
+    // indexer filters the log on.
+    for (topic, signature) in REGISTRY_TOPICS {
+        assert_eq!(&keccak_hex(signature.as_bytes()), topic, "{signature}");
+    }
+    assert_eq!(keccak_hex(ANCHORED_SIGNATURE.as_bytes()), ANCHORED_TOPIC);
 }
