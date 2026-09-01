@@ -13,6 +13,7 @@
 //! chain keeps — one word per key. Earlier versions are in the log, and want
 //! their own endpoint rather than a field that could quietly be short.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -24,12 +25,17 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::config::Settings;
-use crate::eth::parse_address;
+use crate::envelope::{record_key, status_key};
+use crate::eth::{keccak_hex, parse_address};
 use crate::registry::{
-    parse_record_ids, parse_records, parse_registries, parse_roles, record_ids_sql, registries_sql,
-    roles_sql, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
+    deployment_sql, parse_record_ids, parse_records, parse_records_at, parse_registries,
+    parse_roles, parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql,
+    RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
 };
-use crate::tidx::{namespace_heads_sql, parse_heads, Tidx, HEADS_KEY};
+use crate::tidx::{
+    anchors_sql, namespace_heads_sql, parse_anchors, parse_heads, scoped_heads_sql, Scope, Tidx,
+    ANCHORS_KEY, HEADS_KEY,
+};
 
 pub struct Ctx {
     pub tidx: Tidx,
@@ -58,6 +64,13 @@ fn bad_request(message: impl Into<String>) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, message.into())
 }
 
+/// Something the caller named that the log does not have. Only for what an
+/// answer over an index can actually establish — an empty projection is a
+/// legitimate result, and saying "not found" for one would be a guess.
+fn not_found(message: impl Into<String>) -> ApiError {
+    ApiError(StatusCode::NOT_FOUND, message.into())
+}
+
 /// This service configured wrong, which is neither the caller's fault nor
 /// tidx's — 502 would send an operator to look at the wrong process.
 fn misconfigured(message: impl Into<String>) -> ApiError {
@@ -78,7 +91,177 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
         .route("/registries", get(registries))
         .route("/registries/{address}/records", get(records))
         .route("/registries/{address}/roles", get(roles))
+        .route("/registries/{address}/records/{checksum}", get(versions))
+        .route("/records/{checksum}", get(records_for_checksum))
         .with_state(ctx)
+}
+
+/// One record's versions, oldest first — the history `/records` cannot carry.
+///
+/// The only projection here that does not fold to heads. The chain keeps one word
+/// per key, so every version before the newest exists solely as the log row the
+/// head replaced; this is the endpoint the listing's `version` field points at
+/// rather than a field on it that could quietly be short.
+///
+/// A checksum with no anchors under this registry is a 404. It is the one
+/// "does not exist" this service can actually establish about a record: the query
+/// is over the registry's own namespace at a derived key, so an empty answer
+/// means nothing was ever anchored there rather than that something was missed.
+async fn versions(
+    State(ctx): State<Arc<Ctx>>,
+    Path((address, checksum)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let registry = registry_of(&address)?;
+    let hash = keccak_hex(checksum.as_bytes());
+    let key = record_key(&hash).expect("a keccak digest is a 32-byte word");
+    let at = ctx.tidx.coverage().await?.tip_num;
+    require_deployed(&ctx, &registry, at).await?;
+
+    let anchors = parse_anchors(
+        &ctx.tidx
+            .paged(&[], ANCHORS_KEY, |after| {
+                anchors_sql(ctx.cfg.engine, &registry, &key, at, after)
+            })
+            .await?,
+    )?;
+    let mut versions = parse_versions(&anchors)?;
+    if versions.is_empty() {
+        return Err(not_found(format!(
+            "no record with checksum `{checksum}` in registry {registry}"
+        )));
+    }
+
+    let status_keys: Vec<String> = versions
+        .iter()
+        .filter_map(|v| status_key(&hash, v.version))
+        .collect();
+    let statuses = statuses_under(&ctx, &status_keys, at).await?;
+    for version in &mut versions {
+        version.status = statuses
+            .get(&(registry.clone(), hash.clone(), version.version))
+            .cloned();
+    }
+
+    // The id the contract stopped assigning, so the detail view and the listing
+    // agree on it. A full walk of the registry's `RecordAdded` rows, which is
+    // what the listing costs too — a number is a property of the whole ordering.
+    let numbers = parse_record_ids(
+        &ctx.tidx
+            .paged(&[], RECORD_IDS_KEY, |after| {
+                record_ids_sql(ctx.cfg.engine, &registry, at, after)
+            })
+            .await?,
+    )?;
+
+    Ok(Json(json!({
+        "registry": registry,
+        "checksum": checksum,
+        "checksum_hash": hash,
+        "key": key,
+        "number": numbers.get(&hash),
+        "at_block": at,
+        "versions": versions,
+    })))
+}
+
+/// Whether this address is a registry at all, when there is a factory to ask.
+///
+/// "registry 999 does not exist" was a number held against a counter. The address
+/// that replaced the id carries no such fact, but the factory announced every
+/// registry it deployed — so the same question goes to the log. Without a
+/// `FACTORY_ADDRESS` there is nothing to ask and every address is answered for,
+/// which is the audit-only configuration rather than a registry that exists.
+async fn require_deployed(ctx: &Ctx, registry: &str, at: u64) -> Result<(), ApiError> {
+    let Some(factory) = ctx.cfg.factory.as_deref() else {
+        return Ok(());
+    };
+    let deployments = ctx
+        .tidx
+        .query(&deployment_sql(ctx.cfg.engine, factory, registry, at))
+        .await?;
+    if deployments.rows.is_empty() {
+        return Err(not_found(format!(
+            "{registry} is not a registry deployed by {factory}"
+        )));
+    }
+    Ok(())
+}
+
+/// The statuses currently held under `keys`, as
+/// `(registry, checksum hash, version) -> status`. One round trip: a status key
+/// is the same word in every registry holding that record at that version, so
+/// the namespace only tells the answers apart afterwards.
+async fn statuses_under(
+    ctx: &Ctx,
+    keys: &[String],
+    at: u64,
+) -> Result<BTreeMap<(String, String, u64), String>> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let table = ctx
+        .tidx
+        .paged(&[], HEADS_KEY, |after| {
+            scoped_heads_sql(ctx.cfg.engine, Scope::keyed(keys), at, after)
+        })
+        .await?;
+    parse_statuses(&parse_heads(&table)?)
+}
+
+/// Every registry that has anchored one checksum — what the module answered for
+/// `records(registry_id = 0, checksum, …)`, and the one lookup a per-registry
+/// path cannot serve.
+///
+/// Takes the checksum itself rather than its hash. The key derives from
+/// `keccak256(checksum)` and from nothing else, which is exactly why one query
+/// over an indexed column answers for every registry at once.
+async fn records_for_checksum(
+    State(ctx): State<Arc<Ctx>>,
+    Path(checksum): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let hash = keccak_hex(checksum.as_bytes());
+    let key = record_key(&hash).expect("a keccak digest is a 32-byte word");
+    let at = ctx.tidx.coverage().await?.tip_num;
+
+    let keys = [key.clone()];
+    let heads = parse_heads(
+        &ctx.tidx
+            .paged(&[], HEADS_KEY, |after| {
+                scoped_heads_sql(ctx.cfg.engine, Scope::keyed(&keys), at, after)
+            })
+            .await?,
+    )?;
+    let (mut records, other) = parse_records_at(&heads)?;
+
+    let status_keys: Vec<String> = records
+        .iter()
+        .filter_map(|r| status_key(&hash, r.record.version))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let statuses = statuses_under(&ctx, &status_keys, at).await?;
+    for held in &mut records {
+        held.record.status = statuses
+            .get(&(
+                held.registry.clone(),
+                held.record.checksum_hash.clone(),
+                held.record.version,
+            ))
+            .cloned();
+    }
+
+    Ok(Json(json!({
+        "checksum": checksum,
+        "checksum_hash": hash,
+        "key": key,
+        "at_block": at,
+        "records": records,
+        // Namespaces holding something else under this key. Anyone may anchor
+        // anywhere, so this lookup leaves what is not a record out rather than
+        // failing on it — and says how much it left out, since silence there
+        // would be indistinguishable from a key nobody else has touched.
+        "other": other,
+    })))
 }
 
 /// How far the index this answers from has reached. A caller comparing answers
@@ -117,6 +300,7 @@ async fn roles(
 ) -> Result<Json<Value>, ApiError> {
     let registry = registry_of(&address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
+    require_deployed(&ctx, &registry, at).await?;
     let table = ctx
         .tidx
         .paged(ROLE_EVENTS, ROLES_KEY, |after| {
@@ -136,6 +320,7 @@ async fn records(
 ) -> Result<Json<Value>, ApiError> {
     let registry = registry_of(&address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
+    require_deployed(&ctx, &registry, at).await?;
     // Both bounded at the same block, so the numbering and the heads describe
     // one state of the chain rather than two.
     let ids = parse_record_ids(

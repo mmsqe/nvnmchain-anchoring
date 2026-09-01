@@ -27,12 +27,33 @@ GET /health                          how far the index this answers from reaches
 GET /registries                      every registry the factory deployed, in order
 GET /registries/{address}/records    each record decoded, at its newest version
 GET /registries/{address}/roles      every role held, folded from the log
+GET /registries/{address}/records/{checksum}   one record's versions, oldest first
+GET /records/{checksum}              every registry that anchored this checksum
 ```
 
-A malformed address is a 400 and never reaches SQL; tidx being unreachable or
-refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since that is this
-process misconfigured rather than the one behind it. None of them is ever an
-empty result — an empty list means a registry with nothing in it.
+The version list is the one projection that does not fold to heads: the chain
+keeps a single word per key, so every version before the newest exists only as
+the log row the head replaced.
+
+`/records/{checksum}` is the lookup no per-registry path can serve, and what the
+module answered for `records(registry_id = 0, checksum, …)`. A record's key is
+`keccak256(abi.encode("record", keccak256(checksum)))` — the checksum and nothing
+else — so the same checksum in two registries is one key under two namespaces,
+and one filter on an indexed topic answers for all of them. It carries no
+`number`, which is a property of one registry's whole ordering that this query
+never walks; and a payload that is not a record is counted in `other` rather than
+failing the request, since anyone may anchor under any key.
+
+A malformed address is a 400 and never reaches SQL; an address the factory never
+deployed, or a checksum with nothing anchored under it, is a 404; tidx being
+unreachable or refusing is a 502; a missing `FACTORY_ADDRESS` is a 500, since
+that is this process misconfigured rather than the one behind it. None of them is
+ever an empty result — an empty list means a registry with nothing in it.
+
+That 404 is the module's "registry 999 does not exist", restored where the log
+can still establish it: an address is a registry only because the factory
+announced it. Without a `FACTORY_ADDRESS` — the audit-only setup — nothing
+distinguishes one from any other address, so every address is answered for.
 
 **Paged, and it refuses rather than truncates.** tidx caps a query at 10,000
 rows and says nothing when it hits that, so every projection walks by cursor
@@ -124,11 +145,14 @@ rather than closing it: a run reports when the index has not reached back to
 
 ## Status
 
-The decoder, the audit, and `serve` over registries, records and roles are in.
-Version *history* is not: `/records` answers at each record's newest version,
-because that is what the chain keeps — one word per key. Earlier versions are in
-the log and want their own endpoint rather than a field that could quietly be
-short.
+The decoder, the audit, and `serve` over registries, records, roles, one
+checksum across every registry, and one record's versions are in.
+
+`/registries/{address}/records` still answers at each record's newest version,
+because that is what the chain keeps — one word per key. History got the separate
+endpoint it wanted rather than a field on the listing that could quietly be
+short: `/registries/{address}/records/{checksum}` returns every version from the
+log, each with its own envelope and the status anchored against it.
 
 `records` is where the decoder earns the repo: four of `Record`'s ten fields
 exist only inside the anchored payload, and `metadata` is a dynamic `bytes` that

@@ -21,9 +21,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::envelope::{bytes32_label, decode_envelope, decode_strings};
+use crate::envelope::{bytes32_label, decode_envelope, decode_strings, Envelope};
 use crate::eth::{address_from_topic, normalize_hex, strip_hex};
-use crate::tidx::{number, text, Engine, Head, Key, Table};
+use crate::tidx::{number, text, Anchor, Engine, Head, Key, Table};
 
 /// `RegistryDeployed`'s topic0, the selector [`registries_sql`] filters on.
 /// The factory's event, not a registry's -- but it belongs in the same table so
@@ -201,6 +201,24 @@ pub fn registries_sql(engine: Engine, factory: &str, up_to: u64, after: &str) ->
     )
 }
 
+/// Whether one address is a registry this factory deployed.
+///
+/// The announced address is `topic1` and indexed, so this is a lookup where
+/// [`registries_sql`] is a walk. It answers the question the module answered with
+/// "registry 999 does not exist": an id was a number the module could check
+/// against its counter, and the address that replaced it carries no such fact —
+/// the deployment log is where it went.
+pub fn deployment_sql(engine: Engine, factory: &str, registry: &str, up_to: u64) -> String {
+    let word = format!("{:0>64}", strip_hex(registry));
+    format!(
+        "SELECT block_num FROM logs WHERE address = {} AND selector = {} AND topic1 = {} \
+               AND block_num <= {up_to} ORDER BY block_num",
+        engine.bytes_literal(factory),
+        engine.bytes_literal(REGISTRY_DEPLOYED_TOPIC),
+        engine.bytes_literal(&word),
+    )
+}
+
 /// One registry, as the deployment log announces it.
 #[derive(Debug, Clone, Serialize)]
 pub struct Deployed {
@@ -337,8 +355,9 @@ pub fn parse_record_ids(table: &Table) -> Result<BTreeMap<String, u64>> {
 #[derive(Debug, Clone, Serialize)]
 pub struct Record {
     /// The id the contract stopped assigning, from [`parse_record_ids`]. `None`
-    /// only if the two queries disagree, which is worth seeing rather than
-    /// hiding behind a zero.
+    /// when the two queries disagree, which is worth seeing rather than hiding
+    /// behind a zero — and in the cross-registry lookup, which is filtered on one
+    /// key and never walks any registry's whole ordering to number it.
     pub number: Option<u64>,
     pub checksum_hash: String,
     /// The newest version index. The head holds only this one — earlier
@@ -373,43 +392,16 @@ pub fn parse_records(heads: &[Head], numbers: &BTreeMap<String, u64>) -> Result<
         let envelope = decode_envelope(&head.key, &head.metadata)
             .with_context(|| format!("key {}: not a registry envelope", head.key))?;
         let hash = normalize_hex(envelope.field("checksum_hash"));
-        let index = envelope
-            .field("index")
-            .parse::<u64>()
-            .with_context(|| format!("key {}: index {:?}", head.key, envelope.field("index")))?;
         match envelope.kind {
             "record" => {
-                records.insert(
-                    hash.clone(),
-                    Record {
-                        number: numbers.get(&hash).copied(),
-                        checksum_hash: hash,
-                        version: index,
-                        uri: envelope.field("uri").to_string(),
-                        checksum: envelope.field("checksum").to_string(),
-                        checksum_algo: envelope.field("checksum_algo").to_string(),
-                        metadata: envelope.field("metadata").to_string(),
-                        category: envelope.field("category").parse().with_context(|| {
-                            format!(
-                                "key {}: category {:?}",
-                                head.key,
-                                envelope.field("category")
-                            )
-                        })?,
-                        data_pointer: envelope.field("data_pointer").to_string(),
-                        author: envelope.field("author").to_string(),
-                        timestamp: envelope.field("timestamp").parse().with_context(|| {
-                            format!(
-                                "key {}: timestamp {:?}",
-                                head.key,
-                                envelope.field("timestamp")
-                            )
-                        })?,
-                        status: None,
-                    },
-                );
+                let mut record = record_from(&head.key, &envelope)?;
+                record.number = numbers.get(&hash).copied();
+                records.insert(hash, record);
             }
             "status" => {
+                let index: u64 = envelope.field("index").parse().with_context(|| {
+                    format!("key {}: index {:?}", head.key, envelope.field("index"))
+                })?;
                 statuses.insert((hash, index), envelope.field("status").to_string());
             }
             other => anyhow::bail!("key {}: unknown envelope kind {other}", head.key),
@@ -428,5 +420,161 @@ pub fn parse_records(heads: &[Head], numbers: &BTreeMap<String, u64>) -> Result<
     // In the order the contract would have numbered them; unnumbered last, so a
     // disagreement between the two queries stands out instead of sorting as 0.
     out.sort_by_key(|r| (r.number.is_none(), r.number, r.checksum_hash.clone()));
+    Ok(out)
+}
+
+/// One `record` envelope as a record. Unnumbered: a number is a property of a
+/// whole registry's ordering, which the caller attaches when it has one.
+fn record_from(key: &str, envelope: &Envelope) -> Result<Record> {
+    let at = |field: &str| format!("key {key}: {field} {:?}", envelope.field(field));
+    Ok(Record {
+        number: None,
+        checksum_hash: normalize_hex(envelope.field("checksum_hash")),
+        version: envelope
+            .field("index")
+            .parse()
+            .with_context(|| at("index"))?,
+        uri: envelope.field("uri").to_string(),
+        checksum: envelope.field("checksum").to_string(),
+        checksum_algo: envelope.field("checksum_algo").to_string(),
+        metadata: envelope.field("metadata").to_string(),
+        category: envelope
+            .field("category")
+            .parse()
+            .with_context(|| at("category"))?,
+        data_pointer: envelope.field("data_pointer").to_string(),
+        author: envelope.field("author").to_string(),
+        timestamp: envelope
+            .field("timestamp")
+            .parse()
+            .with_context(|| at("timestamp"))?,
+        status: None,
+    })
+}
+
+/// One registry's record for a checksum: what a registry listing carries, with
+/// the address it was anchored under beside it.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecordAt {
+    pub registry: String,
+    #[serde(flatten)]
+    pub record: Record,
+}
+
+/// Every registry holding a record under one key — the successor to the module's
+/// `records(registry_id = 0, checksum, …)`.
+///
+/// A payload that is not a `record` envelope is left out and counted, where
+/// [`parse_records`] treats one as an error. The difference is what the query was
+/// filtered on: there, one registry's own namespace, where only it writes and
+/// only in two shapes; here, a key alone, which anyone may anchor under. A
+/// stranger's anchor is not this crate's copy gone bad, and it must not be able
+/// to take the lookup down for the registries that share the key.
+pub fn parse_records_at(heads: &[Head]) -> Result<(Vec<RecordAt>, usize)> {
+    let (mut out, mut foreign) = (Vec::new(), 0);
+    for head in heads {
+        match decode_envelope(&head.key, &head.metadata) {
+            Some(envelope) if envelope.kind == "record" => out.push(RecordAt {
+                registry: head.namespace.clone(),
+                record: record_from(&head.key, &envelope)?,
+            }),
+            _ => foreign += 1,
+        }
+    }
+    out.sort_by(|a, b| a.registry.cmp(&b.registry));
+    Ok((out, foreign))
+}
+
+/// One version of a record, as the log has it.
+///
+/// Every field a [`Record`] decodes except `number`, which belongs to a registry's
+/// whole ordering rather than to one version of one record. `category`,
+/// `data_pointer` and `author` are per version and only here: the listing shows
+/// the newest version's, so a version's own is visible nowhere else.
+#[derive(Debug, Clone, Serialize)]
+pub struct Version {
+    pub version: u64,
+    pub uri: String,
+    pub checksum: String,
+    pub checksum_algo: String,
+    pub metadata: String,
+    pub category: u8,
+    pub data_pointer: String,
+    pub author: String,
+    pub timestamp: u64,
+    /// The status anchored against *this* version, if there is one. Statuses are
+    /// keyed per version, so the newest version carries none of an older one's.
+    pub status: Option<String>,
+    pub block_num: u64,
+}
+
+/// A record's versions, oldest first, from every anchor under its key.
+///
+/// The head is only the last of these. Version order is the log's own order
+/// rather than the `index` inside the envelope — which is asserted against it,
+/// because a stream whose indexes do not run 1..n is a contract that changed
+/// under the decoder, and reading it as a history would quietly renumber it.
+pub fn parse_versions(anchors: &[Anchor]) -> Result<Vec<Version>> {
+    anchors
+        .iter()
+        .enumerate()
+        .map(|(i, anchor)| {
+            let head = &anchor.head;
+            let envelope = decode_envelope(&head.key, &head.metadata)
+                .with_context(|| format!("key {}: not a registry envelope", head.key))?;
+            let record = record_from(&head.key, &envelope)?;
+            let expected = i as u64 + 1;
+            if record.version != expected {
+                anyhow::bail!(
+                    "key {}: version {} is the {expected} anchor under this key",
+                    head.key,
+                    record.version
+                );
+            }
+            Ok(Version {
+                version: record.version,
+                uri: record.uri,
+                checksum: record.checksum,
+                checksum_algo: record.checksum_algo,
+                metadata: record.metadata,
+                category: record.category,
+                data_pointer: record.data_pointer,
+                author: record.author,
+                timestamp: record.timestamp,
+                status: None,
+                block_num: anchor.block_num,
+            })
+        })
+        .collect()
+}
+
+/// The status each `(namespace, checksum hash, version)` currently holds, from
+/// heads under status keys.
+///
+/// Keyed by namespace as well as version because one status key is the same in
+/// every registry that has that record at that version — the key derives from the
+/// checksum and the index, and the namespace is what keeps the answers apart.
+pub fn parse_statuses(heads: &[Head]) -> Result<BTreeMap<(String, String, u64), String>> {
+    let mut out = BTreeMap::new();
+    for head in heads {
+        let Some(envelope) = decode_envelope(&head.key, &head.metadata) else {
+            continue;
+        };
+        if envelope.kind != "status" {
+            continue;
+        }
+        let index: u64 = envelope
+            .field("index")
+            .parse()
+            .with_context(|| format!("key {}: index {:?}", head.key, envelope.field("index")))?;
+        out.insert(
+            (
+                head.namespace.clone(),
+                normalize_hex(envelope.field("checksum_hash")),
+                index,
+            ),
+            envelope.field("status").to_string(),
+        );
+    }
     Ok(out)
 }
