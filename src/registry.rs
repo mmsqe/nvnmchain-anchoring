@@ -345,6 +345,13 @@ pub struct Record {
     pub checksum: String,
     pub checksum_algo: String,
     pub metadata: String,
+    /// The contract's `RecordCategory` as its uint8; the names are only in the source.
+    pub category: u8,
+    /// Identifies the data, where `checksum` identifies the bytes.
+    pub data_pointer: String,
+    /// Who wrote this version. The precompile's caller is the registry contract, so the
+    /// envelope is the only place this exists.
+    pub author: String,
     pub timestamp: u64,
     pub status: Option<String>,
 }
@@ -379,6 +386,15 @@ pub fn parse_records(heads: &[Head], numbers: &BTreeMap<String, u64>) -> Result<
                         checksum: envelope.field("checksum").to_string(),
                         checksum_algo: envelope.field("checksum_algo").to_string(),
                         metadata: envelope.field("metadata").to_string(),
+                        category: envelope.field("category").parse().with_context(|| {
+                            format!(
+                                "key {}: category {:?}",
+                                head.key,
+                                envelope.field("category")
+                            )
+                        })?,
+                        data_pointer: envelope.field("data_pointer").to_string(),
+                        author: envelope.field("author").to_string(),
                         timestamp: envelope.field("timestamp").parse().with_context(|| {
                             format!(
                                 "key {}: timestamp {:?}",

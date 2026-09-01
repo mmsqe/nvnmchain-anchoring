@@ -3,7 +3,9 @@
 
 mod common;
 
-use common::{bytes, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_KEY, STATUS_METADATA};
+use common::{
+    bytes, AUTHOR, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_KEY, STATUS_METADATA,
+};
 use nvnmchain_anchoring::eth::{checksum_address, keccak_hex, parse_address};
 use nvnmchain_anchoring::precompile::{head_slot, ADDRESS as ANCHORING_ADDRESS, ANCHORED_TOPIC};
 use std::collections::BTreeMap;
@@ -512,6 +514,20 @@ fn a_record_the_numbering_did_not_reach_keeps_its_place_and_says_so() {
     let records = parse_records(&[head(RECORD_KEY, RECORD_METADATA)], &BTreeMap::new())
         .expect("a record with no number");
     assert_eq!(records[0].number, None);
+}
+
+#[test]
+fn a_record_carries_its_category_pointer_and_author() {
+    // Decoded from the envelope, the only place they exist: the precompile's own caller is
+    // the registry contract, so an author is unrecoverable from the log's topics.
+    let records = parse_records(&[head(RECORD_KEY, RECORD_METADATA)], &BTreeMap::new())
+        .expect("a classified record");
+    assert_eq!(
+        records[0].category, 0,
+        "Unspecified: the fixture claims no category"
+    );
+    assert_eq!(records[0].data_pointer, "");
+    assert_eq!(records[0].author, AUTHOR);
 }
 
 #[test]
