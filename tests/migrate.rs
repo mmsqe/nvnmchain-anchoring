@@ -1,14 +1,15 @@
 //! Planning the legacy corpus: what each step will send, and what is refused
 //! before anything is sent at all.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use nvnmchain_anchoring::migrate::{
-    add_record_call, deploy_registry_call, merkle_root, plan, update_status_call, Kind, Manifest,
-    Mode, Options, RegistryImport, Root,
+    add_record_call, addressed, deploy_registry_call, merkle_root, plan, reconcile,
+    update_status_call, Held, Kind, Manifest, Mode, Options, RegistryImport, Root,
 };
 use sha2::{Digest, Sha256};
 
@@ -292,4 +293,193 @@ fn a_duplicate_registry_name_is_refused() {
         .expect_err("duplicate")
         .to_string()
         .contains("duplicate"));
+}
+
+/// One record as the listing serves it, at its newest version.
+fn served(
+    checksum: &str,
+    version: u64,
+    status: Option<&str>,
+) -> nvnmchain_anchoring::registry::Record {
+    serde_json::from_value(serde_json::json!({
+        "number": 1,
+        "checksum_hash": "0x00",
+        "version": version,
+        "uri": "ipfs://a",
+        "checksum": checksum,
+        "checksum_algo": "sha256",
+        "metadata": "{}",
+        "category": 0,
+        "data_pointer": "",
+        "author": "0x0000000000000000000000000000000000C0FFEE",
+        "timestamp": 0,
+        "status": status,
+    }))
+    .expect("a record")
+}
+
+fn plan_of(export: &Export, lines: &[String]) -> Vec<nvnmchain_anchoring::migrate::Step> {
+    let entry = export.tranche("r", lines);
+    plan(
+        &registries(&["r"]),
+        &manifest(vec![entry]),
+        &export.opts(1000),
+    )
+    .expect("a plan")
+    .steps
+}
+
+#[test]
+fn a_step_that_did_not_land_is_owed_and_one_sent_twice_is_a_divergence() {
+    let export = Export::new("compare");
+    let steps = plan_of(
+        &export,
+        &[
+            record("r", "aaa", "ipfs://a", ""),
+            record("r", "aaa", "ipfs://a2", "approved"),
+            record("r", "bbb", "ipfs://b", ""),
+        ],
+    );
+    let against = |records: Vec<nvnmchain_anchoring::registry::Record>| {
+        reconcile(&steps, &BTreeMap::from([("r".to_string(), Some(records))]))
+    };
+    let landed = || vec![served("aaa", 2, Some("approved")), served("bbb", 1, None)];
+
+    let clean = against(landed());
+    assert!(
+        clean.divergences.is_empty() && clean.remaining.is_empty(),
+        "{clean:?}"
+    );
+
+    // Not landed yet is the normal mid-run state, so it is owed rather than wrong.
+    let missing = against(vec![served("aaa", 2, Some("approved"))]);
+    assert!(missing.divergences.is_empty(), "{missing:?}");
+    assert_eq!(
+        missing
+            .remaining
+            .iter()
+            .filter_map(|s| s.checksum.as_deref())
+            .collect::<Vec<_>>(),
+        ["bbb"]
+    );
+
+    // The trap that resuming by step number rather than by chain state walks into:
+    // `addRecord` appends every time, so a replayed step leaves a version too many.
+    let twice = against(vec![served("aaa", 3, None), served("bbb", 1, None)]);
+    assert!(
+        twice
+            .divergences
+            .iter()
+            .any(|d| d.detail.contains("a step sent twice")),
+        "{twice:?}"
+    );
+
+    // A status that differs is closed by sending the status step again.
+    let wrong = against(vec![
+        served("aaa", 2, Some("redacted")),
+        served("bbb", 1, None),
+    ]);
+    assert!(wrong.divergences.is_empty(), "{wrong:?}");
+    assert!(
+        wrong.remaining.iter().any(|s| s.kind == Kind::Status),
+        "{wrong:?}"
+    );
+
+    let extra = against([landed(), vec![served("ccc", 1, None)]].concat());
+    assert!(extra.divergences[0]
+        .detail
+        .contains("the plan does not write it"));
+}
+
+#[test]
+fn what_is_left_to_send_is_decided_against_the_chain() {
+    let export = Export::new("remaining");
+    let steps = plan_of(
+        &export,
+        &[
+            record("r", "aaa", "ipfs://a", ""),
+            record("r", "aaa", "ipfs://a2", "approved"),
+            record("r", "bbb", "ipfs://b", ""),
+        ],
+    );
+    let left = |held: Held| {
+        reconcile(&steps, &BTreeMap::from([("r".to_string(), held)]))
+            .remaining
+            .iter()
+            .map(|s| (s.kind, s.checksum.clone(), s.version))
+            .collect::<Vec<_>>()
+    };
+
+    // Nothing deployed: the whole plan, deploy included.
+    assert_eq!(left(None).len(), steps.len());
+
+    // Deployed and empty: everything but the deploy.
+    assert_eq!(
+        left(Some(vec![])),
+        [
+            (Kind::Record, Some("aaa".into()), Some(1)),
+            (Kind::Record, Some("aaa".into()), Some(2)),
+            (Kind::Status, Some("aaa".into()), Some(2)),
+            (Kind::Record, Some("bbb".into()), Some(1)),
+        ]
+    );
+
+    // Stopped after `aaa` v1: its v2 and the rest, and *not* v1 again -- which is
+    // the whole point, since sending that again leaves a version too many.
+    assert_eq!(
+        left(Some(vec![served("aaa", 1, None)])),
+        [
+            (Kind::Record, Some("aaa".into()), Some(2)),
+            (Kind::Status, Some("aaa".into()), Some(2)),
+            (Kind::Record, Some("bbb".into()), Some(1)),
+        ]
+    );
+
+    // A run that landed has nothing left, and one whose status did not has that.
+    assert!(left(Some(vec![
+        served("aaa", 2, Some("approved")),
+        served("bbb", 1, None)
+    ]))
+    .is_empty());
+    assert_eq!(
+        left(Some(vec![served("aaa", 2, None), served("bbb", 1, None)])),
+        [(Kind::Status, Some("aaa".into()), Some(2))]
+    );
+
+    // A status names the version it sits after, so a record past that version is
+    // one whose status step has already gone by -- not one to send again.
+    assert!(
+        left(Some(vec![served("aaa", 3, None), served("bbb", 1, None)]))
+            .iter()
+            .all(|(kind, ..)| *kind != Kind::Status)
+    );
+}
+
+#[test]
+fn what_is_handed_back_names_its_target_where_that_is_knowable() {
+    let export = Export::new("addressed");
+    let steps = plan_of(&export, &[record("r", "aaa", "ipfs://a", "")]);
+    let mut other = steps.clone();
+    for step in &mut other {
+        step.registry = "s".into(); // the same shape under a registry that has not landed
+    }
+    let all = [steps, other].concat();
+
+    let landed = BTreeMap::from([("r", "0xR")]);
+    let targets: Vec<Option<String>> = addressed(all, "0xF", &landed)
+        .into_iter()
+        .map(|s| s.to)
+        .collect();
+
+    // r's deploy and record are addressed; s's deploy is, its record is not -- the
+    // address it needs is what that deploy will announce.
+    assert_eq!(
+        targets,
+        [
+            Some("0xF".into()),
+            Some("0xR".into()),
+            Some("0xF".into()),
+            None,
+        ]
+    );
 }

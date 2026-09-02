@@ -380,7 +380,7 @@ impl Tidx {
 /// interval: an unbounded query can return a head newer than the block the
 /// audit reads state at, which reports as a mismatch that is really skew.
 pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
-    scoped_heads_sql(engine, Scope::default(), up_to, after)
+    scoped_heads_sql(engine, &Scope::default(), up_to, after)
 }
 
 /// What [`heads_sql`] pages on: the indexed caller and key, which are also its
@@ -394,51 +394,69 @@ pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")
 /// Narrowing on the key is what a lookup *by checksum* is: a record's key derives
 /// from its checksum and nothing else, so the same checksum anchored by two
 /// registries is one key under two namespaces.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Scope<'a> {
-    pub namespace: Option<&'a str>,
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    /// Empty for every namespace; one for a registry's own records; several for the
+    /// bulk projection, which reads many registries in one walk rather than one each.
+    pub namespaces: Vec<String>,
     /// Empty for every key. More than one only to fetch a set of derived keys —
     /// the statuses of a record's versions — in one round trip.
-    pub keys: &'a [String],
+    pub keys: Vec<String>,
 }
 
-impl<'a> Scope<'a> {
-    pub fn of(namespace: &'a str) -> Self {
+impl Scope {
+    pub fn of(namespace: &str) -> Self {
+        Self::across(std::slice::from_ref(&namespace.to_string()))
+    }
+
+    /// Several namespaces at once. Empty is every namespace, as in [`heads_sql`] —
+    /// a caller that meant "none" must not ask.
+    pub fn across(namespaces: &[String]) -> Self {
         Self {
-            namespace: Some(namespace),
-            keys: &[],
+            namespaces: namespaces.to_vec(),
+            keys: Vec::new(),
         }
     }
 
-    pub fn keyed(keys: &'a [String]) -> Self {
+    pub fn keyed(keys: &[String]) -> Self {
         Self {
-            namespace: None,
-            keys,
+            namespaces: Vec::new(),
+            keys: keys.to_vec(),
         }
+    }
+}
+
+/// `AND column = x`, or `AND column IN (…)`, or nothing — the one shape both topics
+/// narrow with.
+fn narrow(engine: Engine, column: &str, words: &[String]) -> String {
+    match words {
+        [] => String::new(),
+        [one] => format!(" AND {column} = {}", engine.bytes_literal(one)),
+        many => format!(
+            " AND {column} IN ({})",
+            many.iter()
+                .map(|word| engine.bytes_literal(word))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
 /// The heads rule under a [`Scope`]; [`heads_sql`] is this over the whole chain.
-pub fn scoped_heads_sql(engine: Engine, scope: Scope<'_>, up_to: u64, after: &str) -> String {
-    let namespace = scope.namespace.map_or_else(String::new, |ns| {
-        // `topic1` is a 32-byte word with the address right-aligned, not the
-        // 20-byte `address` column beside it. Comparing the bare address matches
-        // no row at all, which reads as a registry that has anchored nothing.
-        let word = format!("{:0>64}", strip_hex(ns));
-        format!(" AND topic1 = {}", engine.bytes_literal(&word))
-    });
-    let keys = match scope.keys {
-        [] => String::new(),
-        [one] => format!(" AND topic2 = {}", engine.bytes_literal(one)),
-        many => format!(
-            " AND topic2 IN ({})",
-            many.iter()
-                .map(|key| engine.bytes_literal(key))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-    let narrowing = format!("{namespace}{keys}");
+pub fn scoped_heads_sql(engine: Engine, scope: &Scope, up_to: u64, after: &str) -> String {
+    // `topic1` is a 32-byte word with the address right-aligned, not the 20-byte
+    // `address` column beside it. Comparing the bare address matches no row at all,
+    // which reads as a registry that has anchored nothing.
+    let namespaces: Vec<String> = scope
+        .namespaces
+        .iter()
+        .map(|ns| format!("{:0>64}", strip_hex(ns)))
+        .collect();
+    let narrowing = format!(
+        "{}{}",
+        narrow(engine, "topic1", &namespaces),
+        narrow(engine, "topic2", &scope.keys)
+    );
     format!(
         "SELECT namespace, key, data FROM (\
            SELECT topic1 AS namespace, topic2 AS key, data, \

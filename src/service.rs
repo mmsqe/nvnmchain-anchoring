@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
@@ -30,7 +30,7 @@ use crate::eth::{keccak_hex, parse_address};
 use crate::registry::{
     deployment_sql, parse_record_ids, parse_records, parse_records_at, parse_registries,
     parse_roles, parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql,
-    NameFilter, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
+    Deployed, NameFilter, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
 };
 use crate::tidx::{
     anchors_sql, parse_anchors, parse_heads, scoped_heads_sql, Head, Scope, Tidx, ANCHORS_KEY,
@@ -105,6 +105,7 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
         .route("/registries/{address}/roles", get(roles))
         .route("/registries/{address}/records/{checksum}", get(versions))
         .route("/records/{checksum}", get(records_for_checksum))
+        .route("/registries/records", post(records_by_registry))
         .with_state(ctx)
 }
 
@@ -192,7 +193,7 @@ async fn require_deployed(ctx: &Ctx, registry: &str, at: u64) -> Result<(), ApiE
 }
 
 /// Every head under `scope`, walked to exhaustion.
-async fn heads_under(ctx: &Ctx, scope: Scope<'_>, at: u64) -> Result<Vec<Head>> {
+async fn heads_under(ctx: &Ctx, scope: &Scope, at: u64) -> Result<Vec<Head>> {
     let table = ctx
         .tidx
         .paged(&[], HEADS_KEY, |after| {
@@ -237,7 +238,7 @@ async fn statuses_under(
     if keys.is_empty() {
         return Ok(Statuses::new());
     }
-    parse_statuses(&heads_under(ctx, Scope::keyed(&keys), at).await?)
+    parse_statuses(&heads_under(ctx, &Scope::keyed(&keys), at).await?)
 }
 
 fn status_of(statuses: &Statuses, registry: &str, hash: &str, version: u64) -> Option<String> {
@@ -267,7 +268,8 @@ pub async fn anchored_anywhere(ctx: &Ctx, checksum: &str) -> Result<Value, ApiEr
     let at = ctx.tidx.coverage().await?.tip_num;
 
     let keys = [key.clone()];
-    let (mut records, other) = parse_records_at(&heads_under(ctx, Scope::keyed(&keys), at).await?)?;
+    let (mut records, other) =
+        parse_records_at(&heads_under(ctx, &Scope::keyed(&keys), at).await?)?;
 
     let keys = records
         .iter()
@@ -352,14 +354,8 @@ pub async fn deployments(ctx: &Ctx, filter: &NameFilter) -> Result<Value, ApiErr
         misconfigured("FACTORY_ADDRESS is not set, so there is no factory to list from")
     })?;
     let at = ctx.tidx.coverage().await?.tip_num;
-    let table = ctx
-        .tidx
-        .paged(&[], REGISTRIES_KEY, |after| {
-            registries_sql(ctx.cfg.engine, factory, at, after)
-        })
-        .await?;
-    let deployed = parse_registries(&table)?;
-    let matched: Vec<_> = deployed
+    let matched: Vec<_> = deployed_at(ctx, factory, at)
+        .await?
         .into_iter()
         .filter(|registry| filter.matches(&registry.name))
         .collect();
@@ -410,12 +406,86 @@ pub async fn records_held(ctx: &Ctx, address: &str) -> Result<Value, ApiError> {
     // Both bounded at the same block, so the numbering and the heads describe
     // one state of the chain rather than two.
     let ids = numbering(ctx, &registry, at).await?;
-    let heads = heads_under(ctx, Scope::of(&registry), at).await?;
+    let heads = heads_under(ctx, &Scope::of(&registry), at).await?;
     Ok(json!({
         "registry": registry,
         "at_block": at,
         "records": parse_records(&heads, &ids)?,
     }))
+}
+
+/// Every registry the factory announced, in deployment order — the walk both the
+/// listing and the bulk projection's 404 check are built on.
+async fn deployed_at(ctx: &Ctx, factory: &str, at: u64) -> Result<Vec<Deployed>> {
+    let table = ctx
+        .tidx
+        .paged(&[], REGISTRIES_KEY, |after| {
+            registries_sql(ctx.cfg.engine, factory, at, after)
+        })
+        .await?;
+    parse_registries(&table)
+}
+
+async fn records_by_registry(
+    State(ctx): State<Arc<Ctx>>,
+    Json(addresses): Json<Vec<String>>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(records_held_by(&ctx, &addresses).await?))
+}
+
+/// The projection behind `POST /registries/records`: several registries' records at
+/// their newest version, in one walk of the index rather than one per registry.
+///
+/// Unnumbered, where the per-registry listing is not. A number is a full walk of one
+/// registry's `RecordAdded` rows, and the caller this exists for — `reconcile`, over
+/// thousands of registries — never reads it; so, like `/records/{checksum}`, `number`
+/// is null here rather than paid for. An address the factory never announced fails
+/// the request by name, checked against one listing rather than one lookup each.
+///
+/// Returns early on no addresses: an empty scope is every namespace, and the answer
+/// to "which of nothing" must not be a walk of the whole chain.
+pub async fn records_held_by(ctx: &Ctx, addresses: &[String]) -> Result<Value, ApiError> {
+    let registries: Vec<String> = addresses
+        .iter()
+        .map(|address| registry_of(address))
+        .collect::<Result<_, _>>()?;
+    let at = ctx.tidx.coverage().await?.tip_num;
+    if registries.is_empty() {
+        return Ok(json!({ "at_block": at, "registries": {} }));
+    }
+    if let Some(factory) = ctx.cfg.factory.as_deref() {
+        let announced: BTreeSet<String> = deployed_at(ctx, factory, at)
+            .await?
+            .into_iter()
+            .map(|deployed| deployed.address.to_lowercase())
+            .collect();
+        if let Some(stranger) = registries
+            .iter()
+            .find(|registry| !announced.contains(&registry.to_lowercase()))
+        {
+            return Err(not_found(format!(
+                "{stranger} is not a registry deployed by {factory}"
+            )));
+        }
+    }
+
+    let mut by_registry: BTreeMap<String, Vec<Head>> = BTreeMap::new();
+    for head in heads_under(ctx, &Scope::across(&registries), at).await? {
+        by_registry
+            .entry(head.namespace.to_lowercase())
+            .or_default()
+            .push(head);
+    }
+    let unnumbered = BTreeMap::new();
+    let mut records = serde_json::Map::new();
+    for registry in registries {
+        let heads = by_registry
+            .get(&registry.to_lowercase())
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        records.insert(registry, json!(parse_records(heads, &unnumbered)?));
+    }
+    Ok(json!({ "at_block": at, "registries": records }))
 }
 
 pub async fn serve(ctx: Arc<Ctx>, bind: &str) -> Result<()> {

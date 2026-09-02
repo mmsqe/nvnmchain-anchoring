@@ -744,17 +744,17 @@ fn a_keyed_heads_query_narrows_on_the_key_topic() {
     // `topic2` is the key. One key across every namespace is the cross-registry
     // lookup; a set of them is one round trip for a record's statuses.
     let one = [RECORD_KEY.to_string()];
-    let keyed = scoped_heads_sql(Engine::Postgres, Scope::keyed(&one), 7, "");
+    let keyed = scoped_heads_sql(Engine::Postgres, &Scope::keyed(&one), 7, "");
     let bare = RECORD_KEY.trim_start_matches("0x");
     assert!(keyed.contains(&format!("topic2 = '\\x{bare}'")), "{keyed}");
     assert!(!keyed.contains("topic1 ="), "every namespace answers");
 
     let both = [RECORD_KEY.to_string(), STATUS_KEY.to_string()];
     let scope = Scope {
-        namespace: Some(REGISTRY),
-        keys: &both,
+        namespaces: vec![REGISTRY.to_string()],
+        keys: both.to_vec(),
     };
-    let many = scoped_heads_sql(Engine::Postgres, scope, 7, "");
+    let many = scoped_heads_sql(Engine::Postgres, &scope, 7, "");
     assert!(many.contains("topic2 IN ("), "{many}");
     assert!(many.contains(STATUS_KEY.trim_start_matches("0x")), "{many}");
     assert!(many.contains("topic1 = "), "narrowed to one registry too");
@@ -804,7 +804,7 @@ fn a_namespace_scoped_heads_query_narrows_on_the_caller_topic() {
     // is the assertion that would have.
     let hexed = REGISTRY.trim_start_matches("0x").to_lowercase();
     let word = format!("{hexed:0>64}");
-    let scoped = scoped_heads_sql(Engine::Postgres, Scope::of(REGISTRY), 7, "");
+    let scoped = scoped_heads_sql(Engine::Postgres, &Scope::of(REGISTRY), 7, "");
     assert!(
         scoped.contains(&format!("topic1 = '\\x{word}'")),
         "{scoped}"
@@ -902,4 +902,20 @@ fn a_cursor_is_lexicographic_over_its_key_and_spelled_for_its_engine() {
     let by_block: nvnmchain_anchoring::tidx::Key = &[("block_num", "block_num")];
     let n = cursor_after(Engine::Postgres, &rows, by_block, &row).expect("a cursor");
     assert_eq!(n, " AND (block_num > 12)");
+}
+
+#[test]
+fn several_namespaces_narrow_with_in_and_pad_each_to_a_word() {
+    // The bulk projection: many registries' heads in one walk. `topic1` holds an
+    // address right-aligned in a 32-byte word, so each has to be padded before it
+    // is a literal the column can match.
+    let registries = [REGISTRY.to_string(), format!("0x{}", "ab".repeat(20))];
+    let many = scoped_heads_sql(Engine::Postgres, &Scope::across(&registries), 7, "");
+    assert!(many.contains("topic1 IN ("), "{many}");
+    let word = format!("{:0>64}", REGISTRY.trim_start_matches("0x")).to_lowercase();
+    assert!(many.contains(&word), "{many}");
+    assert!(
+        !many.contains("topic2 =") && !many.contains("topic2 IN"),
+        "every key: {many}"
+    );
 }

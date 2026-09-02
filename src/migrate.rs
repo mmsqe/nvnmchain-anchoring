@@ -30,6 +30,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::eth::{hex0x, keccak256, normalize_hex, strip_hex};
+use crate::registry::{Deployed, NameFilter, Record};
+use crate::service::{self, Ctx};
 
 /// What one call costs, for the summary an operator sizes the run with. Measured
 /// against a dev node: a checksum's first version creates its head slot and pays
@@ -103,7 +105,7 @@ pub enum Mode {
 ///
 /// `registry` is the legacy name rather than an address: the address exists once
 /// the `deploy` step has landed, and `RegistryDeployed` announces it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub step: usize,
     pub kind: Kind,
@@ -114,6 +116,15 @@ pub struct Step {
     pub checksum: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<u64>,
+    /// What a `status` step sets, so the reconciliation can read it back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Where to send it, once that is knowable: the factory for a deploy, the registry
+    /// for anything under one that has landed. A plan cannot carry it — the address
+    /// exists once the deploy does — so `reconcile` stamps it on what it hands back,
+    /// and a sender resuming needs no log of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
 }
 
 /// Append a step numbered by its place in the plan, and hand it back for the
@@ -126,11 +137,13 @@ fn push<'a>(steps: &'a mut Vec<Step>, kind: Kind, registry: &str, data: String) 
         data,
         checksum: None,
         version: None,
+        status: None,
+        to: None,
     });
     steps.last_mut().expect("just pushed")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Deploy,
@@ -321,6 +334,7 @@ fn replay(
             let step = push(steps, Kind::Status, &registry.name, data);
             step.checksum = Some(record.checksum.clone());
             step.version = Some(*version);
+            step.status = Some(record.status.clone());
         }
     }
     Ok(gas)
@@ -520,4 +534,182 @@ pub fn update_status_call(checksum: &str, version: u64, status: &str) -> String 
         &[checksum, status],
         &[(1, version)],
     )
+}
+
+// -- reconciliation -----------------------------------------------------------
+
+/// What the chain holds for one registry: its records, or `None` when no registry
+/// carries the plan's name — so its deploy is still to send, and everything under
+/// it with it.
+pub type Held = Option<Vec<Record>>;
+
+/// One way the chain and the plan disagree, in the words an operator acts on.
+#[derive(Debug, Clone, Serialize)]
+pub struct Divergence {
+    pub registry: String,
+    pub detail: String,
+}
+
+/// What a plan is still owed, and what it cannot be.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Report {
+    /// What sending cannot fix. Non-empty is the one reason `reconcile` exits non-zero.
+    pub divergences: Vec<Divergence>,
+    /// The steps still to send, in plan order — how a stopped run resumes.
+    pub remaining: Vec<Step>,
+}
+
+/// A plan, read back off the chain.
+///
+/// Registries are matched by the name the plan deployed them under, because that
+/// is the only handle it has: the address exists once the deploy has landed, and
+/// a name the listing does not carry means that step did not.
+///
+/// Takes the plan's text rather than a path, so the rule below can be exercised
+/// against a listing without one on disk.
+pub async fn against_chain(ctx: &Ctx, plan: &str) -> Result<Report> {
+    let steps: Vec<Step> = plan
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()
+        .context("the plan is one JSON step per line")?;
+
+    let listing = service::deployments(ctx, &NameFilter::default())
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let factory = listing["factory"]
+        .as_str()
+        .context("the listing names the factory it was read from")?
+        .to_string();
+    let deployed: Vec<Deployed> = serde_json::from_value(listing["registries"].clone())?;
+    let mut by_name: BTreeMap<&str, Vec<&Deployed>> = BTreeMap::new();
+    for registry in &deployed {
+        by_name.entry(&registry.name).or_default().push(registry);
+    }
+
+    // Sort the plan's names into landed, not yet, and ambiguous — then read every
+    // landed one's records in a single walk, rather than one walk per registry.
+    let names: BTreeSet<&str> = steps.iter().map(|step| step.registry.as_str()).collect();
+    let (mut held, mut ambiguous) = (BTreeMap::new(), Vec::new());
+    let mut landed: BTreeMap<&str, &str> = BTreeMap::new();
+    for name in names {
+        match by_name.get(name).map(Vec::as_slice).unwrap_or(&[]) {
+            [registry] => {
+                landed.insert(name, registry.address.as_str());
+            }
+            // The plan refuses duplicate names, so two here came from elsewhere,
+            // and there is no telling which one it meant or resuming into it.
+            carried @ [_, _, ..] => ambiguous.push(Divergence {
+                registry: name.to_string(),
+                detail: format!("{} registries carry this name", carried.len()),
+            }),
+            [] => {
+                held.insert(name.to_string(), None);
+            }
+        }
+    }
+    let addresses: Vec<String> = landed.values().map(|at| at.to_string()).collect();
+    let served = service::records_held_by(ctx, &addresses)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for (name, address) in &landed {
+        let records: Vec<Record> = serde_json::from_value(served["registries"][*address].clone())?;
+        held.insert(name.to_string(), Some(records));
+    }
+
+    let mut report = reconcile(&steps, &held);
+    report.divergences.extend(ambiguous);
+    report.remaining = addressed(report.remaining, &factory, &landed);
+    Ok(report)
+}
+
+/// Stamp `to` on the steps still owed, wherever the address is already knowable: a
+/// deploy goes to the factory, and everything under a registry that has landed goes
+/// to that registry. Steps under one that has not stay unaddressed — their address
+/// is what its deploy will announce, so a sender resends the deploy and asks again.
+pub fn addressed(
+    mut remaining: Vec<Step>,
+    factory: &str,
+    landed: &BTreeMap<&str, &str>,
+) -> Vec<Step> {
+    for step in &mut remaining {
+        step.to = match step.kind {
+            Kind::Deploy => Some(factory.to_string()),
+            _ => landed.get(step.registry.as_str()).map(|at| at.to_string()),
+        };
+    }
+    remaining
+}
+
+/// Compare a plan against what the chain holds.
+///
+/// One question per step: would sending it close the gap? If so it is `remaining`,
+/// and that is not a divergence — a stopped run has steps left, and being mid-way
+/// is the normal state to reconcile from. Deciding it per step against the chain
+/// is what makes a stopped run resumable: `addRecord` appends a version every time
+/// it is called, so a re-sent step leaves one too many rather than doing nothing.
+///
+/// `divergences` is what sending cannot fix, so a human has to look: a record the
+/// chain holds *past* the version the plan writes, which is a step that went twice,
+/// and one the plan does not write at all.
+pub fn reconcile(steps: &[Step], held: &BTreeMap<String, Held>) -> Report {
+    let mut report = Report::default();
+    let records_of = |registry: &str| held.get(registry).and_then(Option::as_deref);
+
+    for step in steps {
+        let Some(records) = records_of(&step.registry) else {
+            report.remaining.push(step.clone()); // its deploy has not landed
+            continue;
+        };
+        let (Some(checksum), Some(version)) = (&step.checksum, step.version) else {
+            continue; // a deploy that landed
+        };
+        let record = records.iter().find(|r| r.checksum == *checksum);
+
+        let owed = match (step.kind, record) {
+            (Kind::Deploy, _) => false,
+            (Kind::Record, None) => true,
+            (Kind::Record, Some(held)) => held.version < version,
+            // A status is sent right after the version it names, so it cannot go
+            // before that version is there, and a record already past it is one
+            // whose status step went by.
+            (Kind::Status, None) => true,
+            (Kind::Status, Some(held)) if held.version < version => true,
+            (Kind::Status, Some(held)) if held.version > version => false,
+            (Kind::Status, Some(held)) => held.status.as_deref() != step.status.as_deref(),
+        };
+        if owed {
+            report.remaining.push(step.clone());
+        }
+    }
+
+    // The other direction: what the chain holds and the plan does not write.
+    let mut planned: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    for step in steps.iter().filter(|s| s.kind == Kind::Record) {
+        if let (Some(checksum), Some(version)) = (&step.checksum, step.version) {
+            let newest = planned.entry((&step.registry, checksum)).or_default();
+            *newest = (*newest).max(version);
+        }
+    }
+    for (registry, records) in held {
+        for record in records.iter().flatten() {
+            let detail = match planned.get(&(registry.as_str(), record.checksum.as_str())) {
+                None => format!(
+                    "`{}` is there and the plan does not write it",
+                    record.checksum
+                ),
+                Some(version) if record.version > *version => format!(
+                    "`{}` is at version {}, past the plan's {version} — a step sent twice",
+                    record.checksum, record.version
+                ),
+                Some(_) => continue,
+            };
+            report.divergences.push(Divergence {
+                registry: registry.clone(),
+                detail,
+            });
+        }
+    }
+    report
 }

@@ -13,7 +13,8 @@ const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds|serve|\n\
      records <registry>|roles <registry>|\n\
      record <registry> <checksum>|checksum <checksum>|\n\
      migrate --registries=<file> --manifest=<file> [--export=<dir>]\n\
-             [--threshold=<n>] [--root=merkle|sha256] [--uri-base=<url>]]";
+             [--threshold=<n>] [--root=merkle|sha256] [--uri-base=<url>]|\n\
+     reconcile --plan=<file> [--remaining=<file>]]";
 
 /// `--flag=value` off the command line, or the default.
 fn flag(name: &str, default: &str) -> String {
@@ -173,6 +174,36 @@ async fn main() -> Result<()> {
             let report = audit::run(&rpc, &tidx, cfg.first_block).await?;
             println!("{report}");
             if !report.is_clean() {
+                std::process::exit(1);
+            }
+        }
+        "reconcile" => {
+            let ctx = service::Ctx { tidx, cfg };
+            let path = required("reconcile", "plan");
+            let plan = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+            let report = migrate::against_chain(&ctx, &plan).await?;
+            // `--remaining` writes the steps still owed, which is how a stopped run
+            // resumes: by chain state, never by count. Empty when nothing is, so a
+            // shell loop can test the file rather than parse it.
+            let resume = flag("remaining", "");
+            if !resume.is_empty() {
+                let lines: String = report
+                    .remaining
+                    .iter()
+                    .map(|step| serde_json::to_string(step).map(|line| line + "\n"))
+                    .collect::<Result<_, _>>()?;
+                std::fs::write(&resume, lines).with_context(|| format!("write {resume}"))?;
+            }
+            eprintln!("{} step(s) still to send", report.remaining.len());
+            // Steps still owed are not a failure: sending them is the fix. Exit 1 is
+            // for what sending cannot fix, which is what a human has to look at.
+            let answer = serde_json::json!({
+                "divergences": report.divergences,
+                "remaining": report.remaining.len(),
+            });
+            println!("{}", serde_json::to_string_pretty(&answer)?);
+            if !report.divergences.is_empty() {
+                eprintln!("{} divergence(s)", report.divergences.len());
                 std::process::exit(1);
             }
         }

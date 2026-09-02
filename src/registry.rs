@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::envelope::{bytes32_label, decode_envelope, decode_strings, Envelope};
 use crate::eth::{address_from_topic, normalize_hex, strip_hex};
@@ -220,7 +220,7 @@ pub fn deployment_sql(engine: Engine, factory: &str, registry: &str, up_to: u64)
 }
 
 /// One registry, as the deployment log announces it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Deployed {
     /// Deployment order, 1-based — what an on-chain counter would have assigned,
     /// and the same rule [`record_ids_sql`] applies one level down.
@@ -381,7 +381,7 @@ pub fn parse_record_ids(table: &Table) -> Result<BTreeMap<String, u64>> {
 
 /// One record at its newest version, with the status anchored against that
 /// version if there is one.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
     /// The id the contract stopped assigning, from [`parse_record_ids`]. `None`
     /// when the two queries disagree, which is worth seeing rather than hiding

@@ -30,6 +30,7 @@ GET /registries/{address}/records    each record decoded, at its newest version
 GET /registries/{address}/roles      every role held, folded from the log
 GET /registries/{address}/records/{checksum}   one record's versions, oldest first
 GET /records/{checksum}              every registry that anchored this checksum
+POST /registries/records  [addr,…]   several registries' records in one walk, unnumbered
 ```
 
 The version list is the one projection that does not fold to heads: the chain
@@ -89,6 +90,7 @@ CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo
 | `… record <registry> <checksum>` | one record's versions |
 | `… checksum <checksum>` | every registry that anchored it |
 | `… migrate --registries= --manifest=` | plan the module's corpus onto the contracts |
+| `… reconcile --plan=` | read a plan back off the chain; non-zero only on what sending cannot fix |
 
 The five query commands print the projections `serve` answers with, as JSON and
 straight from tidx — the read half of `nvnmchaind query anchoring …`, for an
@@ -136,9 +138,22 @@ its `deploy` has landed and `RegistryDeployed` announces it.
 
 It plans and verifies; it does not sign. Whatever holds the key sends the steps,
 and can batch them — a tempo transaction carries several calls, all or nothing.
-Resuming after a partial run reads the chain rather than the plan: `addRecord`
-appends a version every time it is called, so a rerun would duplicate. Ask the
-registry for `versionCount(keccak256(checksum))` and skip what is already there.
+
+`reconcile --plan=plan.jsonl` reads it back off the chain, matching each registry
+by the name the plan deployed it under — the only handle a plan has — and reading
+every landed one's records in a single walk. What comes back is split in two.
+`--remaining=<file>` gets the steps still to send, each naming its target where
+that is already knowable (the factory for a deploy, the registry for anything
+under one that has landed), so a sender resuming needs no log of its own. What
+exits non-zero is only what sending cannot fix — a record past the version the
+plan writes, one the plan does not write at all, a name two registries carry — so
+the resume loop needs no parsing:
+
+    until reconcile --plan=plan.jsonl --remaining=left.jsonl && [ ! -s left.jsonl ]
+    do send left.jsonl; done
+
+It resumes by chain state, never by how far a run got: `addRecord` appends a
+version on every call, so a step re-sent by count leaves one too many.
 
 What the plan does not carry over, because nothing can: the registry ids (the
 module's own migration also let the chain assign them), `created_at`, the
