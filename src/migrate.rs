@@ -186,6 +186,15 @@ pub struct Options {
     /// Prefix a root record's `uri` is built from, so the file it commits to can
     /// be fetched: `{base}/{file}`.
     pub uri_base: String,
+    /// Omit status steps matching this value.
+    pub skip_status: Option<String>,
+}
+
+impl Options {
+    /// Whether this status produces a step.
+    fn sends_status(&self, status: &str) -> bool {
+        !status.is_empty() && self.skip_status.as_deref() != Some(status)
+    }
 }
 
 /// The plan, and what it adds up to.
@@ -328,7 +337,7 @@ fn replay(
         // Status was a field on the record and is a per-version anchor now, so a
         // record that carried one needs a second call against the version it
         // belongs to.
-        if !record.status.is_empty() {
+        if opts.sends_status(&record.status) {
             gas += GAS_FIRST_VERSION;
             let data = update_status_call(&record.checksum, *version, &record.status);
             let step = push(steps, Kind::Status, &registry.name, data);

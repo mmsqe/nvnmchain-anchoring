@@ -52,6 +52,7 @@ impl Export {
             root: Root::Merkle,
             export_dir: self.dir.clone(),
             uri_base: "https://export.example/legacy".into(),
+            skip_status: None,
         }
     }
 }
@@ -92,6 +93,37 @@ fn manifest(files: Vec<serde_json::Value>) -> Manifest {
         "files": files,
     }))
     .expect("manifest")
+}
+
+#[test]
+fn a_status_every_record_carries_can_be_left_out() {
+    let export = Export::new("skip-status");
+    let file = export.tranche(
+        "r",
+        &[
+            record("r", "aaa", "ipfs://a", "Active"),
+            record("r", "bbb", "ipfs://b", "revoked"),
+        ],
+    );
+    let statuses = |opts: &Options| -> Vec<Option<String>> {
+        plan(&registries(&["r"]), &manifest(vec![file.clone()]), opts)
+            .expect("a plan")
+            .steps
+            .into_iter()
+            .filter(|s| s.kind == Kind::Status)
+            .map(|s| s.status)
+            .collect()
+    };
+
+    assert_eq!(
+        statuses(&export.opts(10)),
+        [Some("Active".into()), Some("revoked".into())]
+    );
+    let skipping = Options {
+        skip_status: Some("Active".into()),
+        ..export.opts(10)
+    };
+    assert_eq!(statuses(&skipping), [Some("revoked".into())]);
 }
 
 #[test]

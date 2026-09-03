@@ -132,9 +132,10 @@ nvnmchain-anchoring migrate --registries=registries.json --manifest=manifest.jso
 Out comes one JSON step per line, in the order they must be sent: `deploy` for
 each registry, then its records, then a `status` for every record that carried
 one — `updateRecordStatus` against the version it belongs to, since a status was
-a field on the record and is a per-version anchor now. A step names its registry
-by the export's name rather than an address, because the address only exists once
-its `deploy` has landed and `RegistryDeployed` announces it.
+a field on the record and is a per-version anchor now. `--skip-status=<value>`
+leaves those out. A step names its registry by the export's name rather than an
+address, because the address only exists once its `deploy` has landed and
+`RegistryDeployed` announces it.
 
 It plans and verifies; it does not sign. Whatever holds the key sends the steps,
 and can batch them — a tempo transaction carries several calls, all or nothing.

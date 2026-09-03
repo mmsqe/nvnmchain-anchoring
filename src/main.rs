@@ -13,7 +13,8 @@ const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds|serve|\n\
      records <registry>|roles <registry>|\n\
      record <registry> <checksum>|checksum <checksum>|\n\
      migrate --registries=<file> --manifest=<file> [--export=<dir>]\n\
-             [--threshold=<n>] [--root=merkle|sha256] [--uri-base=<url>]|\n\
+             [--threshold=<n>] [--root=merkle|sha256] [--uri-base=<url>]\n\
+             [--skip-status=<value>]|\n\
      reconcile --plan=<file> [--remaining=<file>]]";
 
 /// `--flag=value` off the command line, or the default.
@@ -55,6 +56,7 @@ fn print_plan() -> Result<()> {
         },
         export_dir: flag("export", ".").into(),
         uri_base: flag("uri-base", "file://export"),
+        skip_status: Some(flag("skip-status", "")).filter(|s| !s.is_empty()),
     };
 
     let plan = migrate::plan(&registries, &manifest, &opts)?;
