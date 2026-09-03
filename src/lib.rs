@@ -10,6 +10,7 @@ pub mod audit;
 pub mod config;
 pub mod envelope;
 pub mod eth;
+pub mod migrate;
 pub mod precompile;
 pub mod registry;
 pub mod rpc;

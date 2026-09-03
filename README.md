@@ -30,6 +30,7 @@ GET /registries/{address}/records    each record decoded, at its newest version
 GET /registries/{address}/roles      every role held, folded from the log
 GET /registries/{address}/records/{checksum}   one record's versions, oldest first
 GET /records/{checksum}              every registry that anchored this checksum
+POST /registries/records  [addr,…]   several registries' records in one walk, unnumbered
 ```
 
 The version list is the one projection that does not fold to heads: the chain
@@ -88,6 +89,8 @@ CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo
 | `… roles <registry>` | every role it holds as granted |
 | `… record <registry> <checksum>` | one record's versions |
 | `… checksum <checksum>` | every registry that anchored it |
+| `… migrate --registries= --manifest=` | plan the module's corpus onto the contracts |
+| `… reconcile --plan=` | read a plan back off the chain; non-zero only on what sending cannot fix |
 
 The five query commands print the projections `serve` answers with, as JSON and
 straight from tidx — the read half of `nvnmchaind query anchoring …`, for an
@@ -98,6 +101,65 @@ for this process or the index being wrong.
 The write half — `tx anchoring add-registry` — has no successor and wants none: a
 record is an EVM transaction now, so it belongs to whatever holds the key, and
 this process holds none.
+
+## `migrate`
+
+The module seeded its corpus from an upgrade handler: no transactions, no gas. A
+record is an `Anchored` log entry now, and logs come only from transactions, so the
+corpus has to be replayed — and 1:1 that is about **3.1e12 gas** and gigabytes of
+log, permanently (`src/migrate.rs` has the arithmetic).
+
+So `migrate` splits it at `--threshold` records. Above it, the whole export file
+becomes one record whose checksum is a merkle root over its lines
+(`--root=merkle`, the default) — every row still proves against that root, so
+what a rooted registry gives up is not provability but being queryable from the
+chain: `/records/{checksum}` across registries, and the decoded fields the log
+would have carried. `--root=sha256` takes the digest the manifest already holds
+instead, so it plans without the export staged and verifies nothing; a row then
+proves by producing the whole file.
+
+Below the threshold a registry is replayed record by record and keeps all of
+that. It defaults to zero — everything rooted — because a replayed record is
+chain-permanent where raising the threshold later is not: 1:1 is ~8.4 GB of log
+and 1.6 GB of state, at 10,000 still 0.5 GB, at 1,000 0.08 GB, and a rooted
+registry can be replayed afterwards with the root it already carries staying true.
+
+```
+nvnmchain-anchoring migrate --registries=registries.json --manifest=manifest.json \
+  --export=<staged export dir> --threshold=10000 --uri-base=https://… > plan.jsonl
+```
+
+Out comes one JSON step per line, in the order they must be sent: `deploy` for
+each registry, then its records, then a `status` for every record that carried
+one — `updateRecordStatus` against the version it belongs to, since a status was
+a field on the record and is a per-version anchor now. A step names its registry
+by the export's name rather than an address, because the address only exists once
+its `deploy` has landed and `RegistryDeployed` announces it.
+
+It plans and verifies; it does not sign. Whatever holds the key sends the steps,
+and can batch them — a tempo transaction carries several calls, all or nothing.
+
+`reconcile --plan=plan.jsonl` reads it back off the chain, matching each registry
+by the name the plan deployed it under — the only handle a plan has — and reading
+every landed one's records in a single walk. What comes back is split in two.
+`--remaining=<file>` gets the steps still to send, each naming its target where
+that is already knowable (the factory for a deploy, the registry for anything
+under one that has landed), so a sender resuming needs no log of its own. What
+exits non-zero is only what sending cannot fix — a record past the version the
+plan writes, one the plan does not write at all, a name two registries carry — so
+the resume loop needs no parsing:
+
+    until reconcile --plan=plan.jsonl --remaining=left.jsonl && [ ! -s left.jsonl ]
+    do send left.jsonl; done
+
+It resumes by chain state, never by how far a run got: `addRecord` appends a
+version on every call, so a step re-sent by count leaves one too many.
+
+What the plan does not carry over, because nothing can: the registry ids (the
+module's own migration also let the chain assign them), `created_at`, the
+original creator, and the original anchoring time. The chain stamps its own —
+which is why the timing of the old corpus is something to commit to once, from
+the old chain, rather than something a replay reproduces.
 
 | Variable | Default | |
 |---|---|---|
