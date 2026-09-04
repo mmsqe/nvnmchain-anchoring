@@ -1,16 +1,17 @@
 //! Envelope payloads dumped from a forge run against the shipped `Registry`, so the
 //! decoder is checked against what the contract emits rather than against a re-encoding
-//! of the test author's guess. They were anchored by registry
+//! of the test author's guess. They were appended by registry
 //! `0xffD4505B3452Dc22f8473616d50503bA9E1710Ac` from [`AUTHOR`] — the namespace is not needed
 //! to decode one, but it is what a payload means something *with*, so regenerating them means
-//! regenerating from there.
+//! regenerating from there. The layout is `abi.encode` in `Registry.sol`, unchanged by the
+//! move from heads to leaves.
 #![allow(dead_code)]
 
 /// The account every vector was written by, as the decoder renders it: checksummed.
 pub const AUTHOR: &str = "0x0000000000000000000000000000000000C0FFEE";
 
-/// addRecord("ipfs://cid", "0xabc", "sha256", "{}", Unspecified, "") -> recordKey(keccak256("0xabc"))
-pub const RECORD_KEY: &str = "0x5de9cfc79de28bdb120140799229816d1be7b571e7dc8db35d3f24d2a35142a3";
+/// addRecord("ipfs://cid", "0xabc", "sha256", "{}", Unspecified, ""): the leaf's commitment is
+/// `keccak256(envelope)`, and the envelope is its metadata.
 pub const RECORD_COMMITMENT: &str =
     "0xa444eb2eef3f25d43826cd15dcef4445fb870b9de739da0e7ae38c0a8f6c647d";
 pub const RECORD_METADATA: &str = "0x\
@@ -35,8 +36,7 @@ pub const RECORD_METADATA: &str = "0x\
 7b7d000000000000000000000000000000000000000000000000000000000000\
 0000000000000000000000000000000000000000000000000000000000000000";
 
-/// updateRecordStatus("0xabc", 1, "approved") -> statusKey(keccak256("0xabc"), 1)
-pub const STATUS_KEY: &str = "0x40c526ce172b7720c74b54727866222688294b31844db86d18ec1075c5702c61";
+/// updateRecordStatus("0xabc", 1, "approved")
 pub const STATUS_COMMITMENT: &str =
     "0x12496fef0a79f105aac77ccad9e63e6989a94a066abe0c85361f4014513fe203";
 pub const STATUS_METADATA: &str = "0x\
@@ -49,6 +49,78 @@ pub const STATUS_METADATA: &str = "0x\
 0000000000000000000000000000000000000000000000000000000000000008\
 617070726f766564000000000000000000000000000000000000000000000000";
 
+/// The checksum hash both fixtures carry: `keccak256("0xabc")`.
+pub const FIXTURE_HASH: &str = "0x851bb152e67e6c958ab7da1431fcaed09ce0efc598885f69a750b3b4b81fc1dc";
+
 pub fn bytes(hexed: &str) -> Vec<u8> {
     hex::decode(hexed.strip_prefix("0x").unwrap_or(hexed)).expect("hex")
+}
+
+/// `abi.encode(bytes32 commitment, bytes32 root, bytes32[] peaks, bytes metadata)` — a
+/// `LeafAppended` row's `data` column, as tidx hands it back. Built the way the ABI says
+/// rather than pasted, so a test that fails names a decoder bug and not a typo.
+pub fn leaf_data(commitment: &str, root: &str, peaks: &[&str], metadata: &[u8]) -> String {
+    let mut out = String::from("0x");
+    out.push_str(&format!("{:0>64}", commitment.trim_start_matches("0x")));
+    out.push_str(&format!("{:0>64}", root.trim_start_matches("0x")));
+    let peaks_at = 4 * 32;
+    let metadata_at = peaks_at + 32 + peaks.len() * 32;
+    out.push_str(&format!("{peaks_at:064x}"));
+    out.push_str(&format!("{metadata_at:064x}"));
+    out.push_str(&format!("{:064x}", peaks.len()));
+    for peak in peaks {
+        out.push_str(&format!("{:0>64}", peak.trim_start_matches("0x")));
+    }
+    out.push_str(&format!("{:064x}", metadata.len()));
+    out.push_str(&format!(
+        "{:0<width$}",
+        hex::encode(metadata),
+        width = metadata.len().div_ceil(32) * 64
+    ));
+    out
+}
+
+/// `abi.encode(uint256 count, bytes32[] chunkRoots, uint8[] chunkHeights, bytes32 root,
+/// bytes32[] peaks, bytes metadata)` — a `LeavesAppended` row's `data`.
+pub fn leaves_data(
+    count: u64,
+    chunks: &[(&str, u8)],
+    root: &str,
+    peaks: &[&str],
+    metadata: &[u8],
+) -> String {
+    let words = |items: &[String]| {
+        let mut s = format!("{:064x}", items.len());
+        for item in items {
+            s.push_str(&format!("{:0>64}", item.trim_start_matches("0x")));
+        }
+        s
+    };
+    let roots: Vec<String> = chunks.iter().map(|(r, _)| r.to_string()).collect();
+    let heights: Vec<String> = chunks.iter().map(|(_, h)| format!("{h:x}")).collect();
+    let peaks: Vec<String> = peaks.iter().map(|p| p.to_string()).collect();
+    let (roots, heights, peaks) = (words(&roots), words(&heights), words(&peaks));
+    let head = 6 * 32;
+    let roots_at = head;
+    let heights_at = roots_at + roots.len() / 2;
+    let peaks_at = heights_at + heights.len() / 2;
+    let metadata_at = peaks_at + peaks.len() / 2;
+    let mut out = format!("0x{count:064x}{roots_at:064x}{heights_at:064x}");
+    out.push_str(&format!("{:0>64}", root.trim_start_matches("0x")));
+    out.push_str(&format!("{peaks_at:064x}{metadata_at:064x}"));
+    out.push_str(&roots);
+    out.push_str(&heights);
+    out.push_str(&peaks);
+    out.push_str(&format!("{:064x}", metadata.len()));
+    out.push_str(&format!(
+        "{:0<width$}",
+        hex::encode(metadata),
+        width = metadata.len().div_ceil(32) * 64
+    ));
+    out
+}
+
+/// A 32-byte topic holding `word`, left-padded.
+pub fn topic(word: &str) -> String {
+    format!("0x{:0>64}", word.trim_start_matches("0x"))
 }

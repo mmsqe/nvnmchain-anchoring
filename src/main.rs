@@ -153,11 +153,11 @@ async fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref().unwrap_or("audit") {
         "kinds" => {
             // What this chain actually carries — the quickest way to see
-            // whether a namespace is anchoring registry envelopes at all.
-            let heads = tidx.heads(tidx.coverage().await?.tip_num).await?;
+            // whether a namespace is appending registry envelopes at all.
+            let leaves = tidx.leaves(tidx.coverage().await?.tip_num).await?;
             let mut counts: std::collections::BTreeMap<String, usize> = Default::default();
-            for head in &heads {
-                let name = match envelope::read_payload(&head.key, &head.metadata) {
+            for leaf in &leaves {
+                let name = match envelope::read_payload(&leaf.metadata) {
                     envelope::Payload::Envelope(e) => e.kind.to_string(),
                     envelope::Payload::Json(_) => "json".into(),
                     envelope::Payload::Text(_) => "text".into(),
@@ -165,7 +165,7 @@ async fn main() -> Result<()> {
                 };
                 *counts.entry(name).or_default() += 1;
             }
-            println!("{} head(s):", heads.len());
+            println!("{} leaf(s):", leaves.len());
             for (kind, count) in counts {
                 println!("  {count:>5}  {kind}");
             }

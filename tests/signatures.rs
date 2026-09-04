@@ -8,7 +8,7 @@
 //! `make fixtures`. Nothing offline can spot a stale fixture, so rerun it on any event change.
 
 use nvnmchain_anchoring::eth::keccak_hex;
-use nvnmchain_anchoring::precompile::{ANCHORED_SIGNATURE, ANCHORED_TOPIC};
+use nvnmchain_anchoring::precompile::PRECOMPILE_TOPICS;
 use nvnmchain_anchoring::registry::{REGISTRY_TOPICS, ROLE_EVENTS};
 use std::collections::BTreeSet;
 
@@ -53,26 +53,22 @@ fn compiled_signatures() -> BTreeSet<String> {
 #[test]
 fn every_filtered_signature_is_one_the_contracts_emit() {
     let (compiled, at) = (compiled_signatures(), fixture_commit());
-    for (_, signature) in REGISTRY_TOPICS {
+    for (_, signature) in REGISTRY_TOPICS.iter().chain(PRECOMPILE_TOPICS) {
         assert!(
             compiled.contains(*signature),
             "{signature} is not emitted by the contracts at {at} — this filter matches nothing.\n\
              Emitted: {compiled:#?}"
         );
     }
-    assert!(
-        compiled.contains(ANCHORED_SIGNATURE),
-        "{ANCHORED_SIGNATURE} is not in the precompile ABI at {at}"
-    );
 }
 
 #[test]
 fn every_domain_event_is_filtered() {
     let (compiled, at) = (compiled_signatures(), fixture_commit());
-    // Inherited solady/UUPS events, plus the precompile's own. Named rather than silently
-    // skipped, so a new contract event fails until someone picks a side for it.
+    // What the crate deliberately does not filter, each for its own reason. Named rather
+    // than silently skipped, so a new contract event fails until someone picks a side for it.
     const NOT_INDEXED: &[&str] = &[
-        "Anchored(address,bytes32,bytes32,bytes)", // the precompile's own, filtered separately
+        // Inherited from solady's Ownable/UUPS, not domain events.
         "OwnershipHandoverCanceled(address)",
         "OwnershipHandoverRequested(address)",
         "OwnershipTransferred(address,address)",
@@ -88,7 +84,11 @@ fn every_domain_event_is_filtered() {
         );
     }
 
-    let filtered: BTreeSet<&str> = REGISTRY_TOPICS.iter().map(|(_, sig)| *sig).collect();
+    let filtered: BTreeSet<&str> = REGISTRY_TOPICS
+        .iter()
+        .chain(PRECOMPILE_TOPICS)
+        .map(|(_, sig)| *sig)
+        .collect();
     for signature in &compiled {
         if NOT_INDEXED.contains(&signature.as_str()) {
             continue;
@@ -165,8 +165,7 @@ fn the_roles_query_reads_events_whose_scope_is_topic1() {
 fn vendored_signatures_hash_to_the_topics_in_use() {
     // Closes the loop: the signatures come from the contract, and these hashes are what an
     // indexer filters the log on.
-    for (topic, signature) in REGISTRY_TOPICS {
+    for (topic, signature) in REGISTRY_TOPICS.iter().chain(PRECOMPILE_TOPICS) {
         assert_eq!(&keccak_hex(signature.as_bytes()), topic, "{signature}");
     }
-    assert_eq!(keccak_hex(ANCHORED_SIGNATURE.as_bytes()), ANCHORED_TOPIC);
 }

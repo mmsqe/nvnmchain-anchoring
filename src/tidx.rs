@@ -1,16 +1,16 @@
-//! The anchored log, read from tidx rather than scanned from the node.
+//! The precompile's log, read from tidx rather than scanned from the node.
 //!
 //! tidx ingests every log on this chain, so what used to be a scan, a store and
 //! a reorg cursor is one SQL result. The coverage it arrives with is not
 //! decoration: an index that has not backfilled to the precompile's first block
-//! cannot be audited for keys it never saw.
+//! cannot fold a namespace it only saw part of.
 //!
 //! Queries read the base `logs` table — `topic1`, `topic2`, `data`, all real
 //! indexed columns — rather than the decoded event table a `?signature=`
-//! parameter would generate. tidx cannot decode this event: dynamic `bytes`
-//! comes back as its ABI offset word (see [`crate::precompile::decode_anchored_data`]).
-//! Reading raw also means the only contract fact in the SQL is a topic0 that
-//! `tests/signatures.rs` already pins against the compiled ABI.
+//! parameter would generate. tidx cannot decode these events: a dynamic argument
+//! comes back as its ABI offset word (see [`crate::precompile::decode_leaf_appended`]).
+//! Reading raw also means the only contract facts in the SQL are two topic0s that
+//! `tests/signatures.rs` pins against the compiled ABI.
 
 use std::time::Duration;
 
@@ -18,8 +18,11 @@ use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::eth::{address_from_topic, normalize_hex, strip_hex};
-use crate::precompile::{decode_anchored_data, ADDRESS, ANCHORED_TOPIC};
+use crate::eth::{address_from_topic, normalize_hex, strip_hex, word_to_usize};
+use crate::precompile::{
+    decode_leaf_appended, decode_leaves_appended, ADDRESS, LEAF_APPENDED_TOPIC,
+    LEAVES_APPENDED_TOPIC,
+};
 
 /// Which engine the query runs on. It decides one thing that matters here: a
 /// byte string is `'\x…'` for PostgreSQL and `'0x…'` for ClickHouse, so a
@@ -73,13 +76,52 @@ impl Engine {
     }
 }
 
-/// One `(namespace, key)`'s current commitment, as the index has it.
+/// One leaf, as the index has it: what `LeafAppended` said, and where in the log.
 #[derive(Debug, Clone)]
-pub struct Head {
+pub struct Leaf {
     pub namespace: String,
-    pub key: String,
+    pub index: u64,
     pub commitment: String,
     pub metadata: Vec<u8>,
+    pub block_num: u64,
+    pub log_idx: u64,
+}
+
+/// One append, of either shape, as the audit replays it.
+#[derive(Debug, Clone)]
+pub enum Appended {
+    Leaf {
+        index: u64,
+        commitment: String,
+    },
+    Leaves {
+        first: u64,
+        count: u64,
+        chunk_roots: Vec<String>,
+        chunk_heights: Vec<u8>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct Append {
+    pub namespace: String,
+    pub what: Appended,
+    pub root: String,
+    pub peaks: Vec<String>,
+    pub metadata: Vec<u8>,
+    pub block_num: u64,
+    pub log_idx: u64,
+}
+
+impl Append {
+    /// The leaf count this append left behind — which, for the newest one a
+    /// namespace has, is what its MMR holds.
+    pub fn count(&self) -> u64 {
+        match self.what {
+            Appended::Leaf { index, .. } => index + 1,
+            Appended::Leaves { count, .. } => count,
+        }
+    }
 }
 
 /// How much of the chain the index holds.
@@ -99,7 +141,7 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Whether the index reaches back far enough to have seen every anchor.
+    /// Whether the index reaches back far enough to have seen every append.
     pub fn reaches(&self, first_block: u64) -> bool {
         matches!(self.backfill_num, Some(floor) if floor <= first_block)
     }
@@ -164,7 +206,7 @@ pub const HARD_LIMIT: usize = 10_000;
 ///
 /// [`Tidx::paged`] answers a full page by asking for the next one, so anything
 /// that reaches here full was not paged and is a truncated answer wearing a
-/// complete one's clothes — an audit over the first 10,000 heads of a larger
+/// complete one's clothes — an audit over the first 10,000 leaves of a larger
 /// chain reports clean. Erring on a *legitimately* full page costs one
 /// confusing message; not erring costs a silent one.
 pub fn reject_truncated(table: Table, limit: usize) -> Result<Table> {
@@ -308,19 +350,9 @@ impl Tidx {
     /// the columns the query orders by.
     ///
     /// For a windowed query those columns must also be the *partition*: a page
-    /// boundary that falls inside a partition would compute "newest per key"
-    /// from half a key's rows. Aligned to the partition, every page's window is
-    /// as correct as the unpaged one's.
-    /// A query walked to exhaustion, one page per round trip.
-    ///
-    /// `build` is handed an `AND …` predicate placing it after the last row
-    /// seen, and `key` names the columns that predicate is over — which must be
-    /// the columns the query orders by.
-    ///
-    /// For a windowed query those columns must also be the *partition*: a page
-    /// boundary that falls inside a partition would compute "newest per key"
-    /// from half a key's rows. Aligned to the partition, every page's window is
-    /// as correct as the unpaged one's.
+    /// boundary that falls inside a partition would compute "newest per
+    /// namespace" from half a namespace's rows. Aligned to the partition, every
+    /// page's window is as correct as the unpaged one's.
     pub async fn paged(
         &self,
         signatures: &[&str],
@@ -351,13 +383,35 @@ impl Tidx {
         Ok(all)
     }
 
-    /// Every `(namespace, key)`'s newest commitment as of `up_to` — what the
-    /// audit compares against the chain's storage at that same block.
-    pub async fn heads(&self, up_to: u64) -> Result<Vec<Head>> {
+    /// Every leaf on the chain as of `up_to`, in log order.
+    pub async fn leaves(&self, up_to: u64) -> Result<Vec<Leaf>> {
         let table = self
-            .paged(&[], HEADS_KEY, |after| heads_sql(self.engine, up_to, after))
+            .paged(&[], LEAVES_KEY, |after| {
+                leaves_sql(self.engine, &[], up_to, after)
+            })
             .await?;
-        parse_heads(&table)
+        parse_leaves(&table)
+    }
+
+    /// Every namespace that has appended anything as of `up_to`.
+    pub async fn namespaces(&self, up_to: u64) -> Result<Vec<String>> {
+        let table = self
+            .paged(&[], NAMESPACES_KEY, |after| {
+                namespaces_sql(self.engine, up_to, after)
+            })
+            .await?;
+        parse_namespaces(&table)
+    }
+
+    /// Every append under one namespace as of `up_to`, in log order — what the
+    /// audit folds back into the root the chain holds.
+    pub async fn history(&self, namespace: &str, up_to: u64) -> Result<Vec<Append>> {
+        let table = self
+            .paged(&[], LEAVES_KEY, |after| {
+                history_sql(self.engine, namespace, up_to, after)
+            })
+            .await?;
+        parse_appends(&table)
     }
 
     /// `GET /status`, which is the only way to this: `/query` allowlists
@@ -369,190 +423,250 @@ impl Tidx {
     }
 }
 
-/// The precompile's own rule as SQL: one word per `(namespace, key)`, newest
-/// anchor wins. A subselect rather than `DISTINCT ON` so it runs on either
-/// engine, and the address and topic are spelled for the one it will run on.
+/// `AND topic1 …` over `namespaces`, or nothing at all for every one of them —
+/// a caller that meant "none" must not ask.
 ///
-/// `topic1` and `topic2` are the indexed `caller` and `key`; `data` is decoded
-/// here rather than by tidx (see the module docs).
-///
-/// Bounded at `up_to` because tidx's realtime sync runs ahead of its contiguous
-/// interval: an unbounded query can return a head newer than the block the
-/// audit reads state at, which reports as a mismatch that is really skew.
-pub fn heads_sql(engine: Engine, up_to: u64, after: &str) -> String {
-    scoped_heads_sql(engine, &Scope::default(), up_to, after)
-}
-
-/// What [`heads_sql`] pages on: the indexed caller and key, which are also its
-/// window's partition, so a page boundary never splits one.
-pub const HEADS_KEY: Key<'static> = &[("namespace", "topic1"), ("key", "topic2")];
-
-/// Which heads to keep, on the two indexed topics — `topic1` is the caller,
-/// `topic2` the key — independently: one namespace's records, one key across
-/// every namespace, or both.
-///
-/// Narrowing on the key is what a lookup *by checksum* is: a record's key derives
-/// from its checksum and nothing else, so the same checksum anchored by two
-/// registries is one key under two namespaces.
-#[derive(Debug, Clone, Default)]
-pub struct Scope {
-    /// Empty for every namespace; one for a registry's own records; several for the
-    /// bulk projection, which reads many registries in one walk rather than one each.
-    pub namespaces: Vec<String>,
-    /// Empty for every key. More than one only to fetch a set of derived keys —
-    /// the statuses of a record's versions — in one round trip.
-    pub keys: Vec<String>,
-}
-
-impl Scope {
-    pub fn of(namespace: &str) -> Self {
-        Self::across(std::slice::from_ref(&namespace.to_string()))
-    }
-
-    /// Several namespaces at once. Empty is every namespace, as in [`heads_sql`] —
-    /// a caller that meant "none" must not ask.
-    pub fn across(namespaces: &[String]) -> Self {
-        Self {
-            namespaces: namespaces.to_vec(),
-            keys: Vec::new(),
-        }
-    }
-
-    pub fn keyed(keys: &[String]) -> Self {
-        Self {
-            namespaces: Vec::new(),
-            keys: keys.to_vec(),
-        }
-    }
-}
-
-/// `AND column = x`, or `AND column IN (…)`, or nothing — the one shape both topics
-/// narrow with.
-fn narrow(engine: Engine, column: &str, words: &[String]) -> String {
-    match words {
+/// `topic1` is a 32-byte word with the address right-aligned, not the 20-byte
+/// `address` column beside it, so each is padded: comparing the bare address
+/// matches no row, which reads as a registry that has appended nothing.
+fn under(engine: Engine, namespaces: &[String]) -> String {
+    let word = |ns: &String| engine.bytes_literal(&format!("{:0>64}", strip_hex(ns)));
+    match namespaces {
         [] => String::new(),
-        [one] => format!(" AND {column} = {}", engine.bytes_literal(one)),
+        [one] => format!(" AND topic1 = {}", word(one)),
         many => format!(
-            " AND {column} IN ({})",
-            many.iter()
-                .map(|word| engine.bytes_literal(word))
-                .collect::<Vec<_>>()
-                .join(", ")
+            " AND topic1 IN ({})",
+            many.iter().map(word).collect::<Vec<_>>().join(", ")
         ),
     }
 }
 
-/// The heads rule under a [`Scope`]; [`heads_sql`] is this over the whole chain.
-pub fn scoped_heads_sql(engine: Engine, scope: &Scope, up_to: u64, after: &str) -> String {
-    // `topic1` is a 32-byte word with the address right-aligned, not the 20-byte
-    // `address` column beside it. Comparing the bare address matches no row at all,
-    // which reads as a registry that has anchored nothing.
-    let namespaces: Vec<String> = scope
-        .namespaces
-        .iter()
-        .map(|ns| format!("{:0>64}", strip_hex(ns)))
-        .collect();
-    let narrowing = format!(
-        "{}{}",
-        narrow(engine, "topic1", &namespaces),
-        narrow(engine, "topic2", &scope.keys)
-    );
+/// `AND block_num IN (…)`, or nothing — for fetching the leaves beside a set of
+/// registry events without walking a namespace.
+fn in_blocks(blocks: &[u64]) -> String {
+    if blocks.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = blocks.iter().map(u64::to_string).collect();
+    format!(" AND block_num IN ({})", list.join(", "))
+}
+
+/// Both selectors, for the queries that read either shape of append.
+fn either_append(engine: Engine) -> String {
     format!(
-        "SELECT namespace, key, data FROM (\
-           SELECT topic1 AS namespace, topic2 AS key, data, \
-                  ROW_NUMBER() OVER (PARTITION BY topic1, topic2 \
-                                     ORDER BY block_num DESC, log_idx DESC) AS rn \
-           FROM logs WHERE address = {} AND selector = {}{narrowing} \
-                 AND block_num <= {up_to}{after}\
-         ) heads WHERE rn = 1 ORDER BY namespace, key",
-        engine.bytes_literal(ADDRESS),
-        engine.bytes_literal(ANCHORED_TOPIC),
+        "selector IN ({}, {})",
+        engine.bytes_literal(LEAF_APPENDED_TOPIC),
+        engine.bytes_literal(LEAVES_APPENDED_TOPIC)
     )
 }
 
-/// One anchor as it was written, rather than the head it may since have stopped
-/// being. Carries the block so a version history can say when each one landed.
-#[derive(Debug, Clone)]
-pub struct Anchor {
-    pub head: Head,
-    pub block_num: u64,
+/// What every walk in log order pages on: the row's place in the log, which is
+/// also its order. No window to align to — every row is returned.
+pub const LEAVES_KEY: Key<'static> = &[("block_num", "block_num"), ("log_idx", "log_idx")];
+
+/// Every `LeafAppended` row under `namespaces`, oldest first.
+///
+/// `topic1` is the indexed namespace and `topic2` the leaf index; `data` is
+/// decoded here rather than by tidx (see the module docs). Bounded at `up_to`
+/// because tidx's realtime sync runs ahead of its contiguous interval: an
+/// unbounded query can return a leaf newer than the block the audit reads state
+/// at, which reports as a mismatch that is really skew.
+pub fn leaves_sql(engine: Engine, namespaces: &[String], up_to: u64, after: &str) -> String {
+    leaves_in_sql(engine, namespaces, &[], up_to, after)
 }
 
-/// Every anchor under one `(namespace, key)`, oldest first.
-///
-/// The one query here that does not fold to heads: the chain keeps a single word
-/// per key, so a record's earlier versions exist only as the log rows the head
-/// replaced. Bounded and ordered like the rest.
-pub fn anchors_sql(engine: Engine, namespace: &str, key: &str, up_to: u64, after: &str) -> String {
-    let word = format!("{:0>64}", strip_hex(namespace));
+/// [`leaves_sql`] narrowed to a set of blocks as well — the leaves beside the
+/// registry events a lookup by checksum found, fetched without walking a namespace.
+pub fn leaves_in_sql(
+    engine: Engine,
+    namespaces: &[String],
+    blocks: &[u64],
+    up_to: u64,
+    after: &str,
+) -> String {
     format!(
-        "SELECT topic1 AS namespace, topic2 AS key, data, block_num, log_idx \
-         FROM logs WHERE address = {} AND selector = {} AND topic1 = {} AND topic2 = {} \
+        "SELECT topic1 AS namespace, topic2 AS index, data, block_num, log_idx \
+         FROM logs WHERE address = {} AND selector = {}{}{} \
                AND block_num <= {up_to}{after} ORDER BY block_num, log_idx",
         engine.bytes_literal(ADDRESS),
-        engine.bytes_literal(ANCHORED_TOPIC),
-        engine.bytes_literal(&word),
-        engine.bytes_literal(key),
+        engine.bytes_literal(LEAF_APPENDED_TOPIC),
+        under(engine, namespaces),
+        in_blocks(blocks),
     )
 }
 
-/// What [`anchors_sql`] pages on: its place in the log, which is also its order.
-/// No window to align to — every row is returned, not one per partition.
-pub const ANCHORS_KEY: Key<'static> = &[("block_num", "block_num"), ("log_idx", "log_idx")];
+/// What [`appends_sql`] pages on: the namespace, which is also its window's
+/// partition, so a page boundary never splits one.
+pub const APPENDS_KEY: Key<'static> = &[("namespace", "topic1")];
 
-/// [`anchors_sql`]'s rows. Same decode as a head, plus the block it landed in.
-pub fn parse_anchors(table: &Table) -> Result<Vec<Anchor>> {
-    let block = table.index_of("block_num")?;
-    parse_heads(table)?
-        .into_iter()
-        .zip(table.rows.iter())
-        .map(|(head, row)| {
-            Ok(Anchor {
-                block_num: number(row, block)
-                    .with_context(|| format!("key {}: no block_num", head.key))?,
-                head,
-            })
-        })
-        .collect()
+/// Each namespace's newest append, of either shape — the MMR as it stands, since
+/// every event carries the count and peaks it left. A subselect rather than
+/// `DISTINCT ON` so it runs on either engine.
+pub fn appends_sql(engine: Engine, namespaces: &[String], up_to: u64, after: &str) -> String {
+    format!(
+        "SELECT namespace, index, selector, data, block_num, log_idx FROM (\
+           SELECT topic1 AS namespace, topic2 AS index, selector, data, block_num, log_idx, \
+                  ROW_NUMBER() OVER (PARTITION BY topic1 \
+                                     ORDER BY block_num DESC, log_idx DESC) AS rn \
+           FROM logs WHERE address = {} AND {}{} \
+                 AND block_num <= {up_to}{after}\
+         ) heads WHERE rn = 1 ORDER BY namespace",
+        engine.bytes_literal(ADDRESS),
+        either_append(engine),
+        under(engine, namespaces),
+    )
 }
 
-/// Rows into heads. Every log this query returns was written by the precompile,
-/// so a row that does not read as one is not a strange anchor — it is the
-/// index's copy gone bad, or this query gone wrong. Either is an error, not a
-/// skip: the query keeps only each pair's newest row, so dropping a corrupt one
-/// would take its whole `(namespace, key)` out of the audit silently.
-pub fn parse_heads(table: &Table) -> Result<Vec<Head>> {
-    let (ns, key, data) = (
+/// Every append under one namespace, of either shape, oldest first.
+pub fn history_sql(engine: Engine, namespace: &str, up_to: u64, after: &str) -> String {
+    format!(
+        "SELECT topic1 AS namespace, topic2 AS index, selector, data, block_num, log_idx \
+         FROM logs WHERE address = {} AND {}{} \
+               AND block_num <= {up_to}{after} ORDER BY block_num, log_idx",
+        engine.bytes_literal(ADDRESS),
+        either_append(engine),
+        under(engine, std::slice::from_ref(&namespace.to_string())),
+    )
+}
+
+/// What [`namespaces_sql`] pages on.
+pub const NAMESPACES_KEY: Key<'static> = &[("namespace", "topic1")];
+
+/// Every namespace that has appended anything, in topic order.
+pub fn namespaces_sql(engine: Engine, up_to: u64, after: &str) -> String {
+    format!(
+        "SELECT namespace FROM (\
+           SELECT DISTINCT topic1 AS namespace FROM logs \
+           WHERE address = {} AND {} AND block_num <= {up_to}{after}\
+         ) ns ORDER BY namespace",
+        engine.bytes_literal(ADDRESS),
+        either_append(engine),
+    )
+}
+
+/// Rows into leaves. Every log this query returns was written by the precompile,
+/// so a row that does not read as one is not a strange leaf — it is the index's
+/// copy gone bad, or this query gone wrong. Either is an error, not a skip:
+/// dropping a leaf would take it out of every fold and listing silently.
+pub fn parse_leaves(table: &Table) -> Result<Vec<Leaf>> {
+    let (ns, index, data, block, idx) = (
         table.index_of("namespace")?,
-        table.index_of("key")?,
+        table.index_of("index")?,
         table.index_of("data")?,
+        table.index_of("block_num")?,
+        table.index_of("log_idx")?,
     );
     table
         .rows
         .iter()
         .map(|row| {
-            let (commitment, metadata) = hex::decode(strip_hex(text(row, data)))
+            let at = || format!("leaf {} / {}", text(row, ns), text(row, index));
+            let leaf = hex::decode(strip_hex(text(row, data)))
                 .ok()
-                .and_then(|payload| decode_anchored_data(&payload))
-                .with_context(|| format!("key {}: not an Anchored payload", text(row, key)))?;
-            Ok(Head {
-                // Checksummed on the way in, so a head reads the same here as
-                // it does in an explorer and in an envelope's `creator` field.
-                namespace: address_from_topic(text(row, ns)).with_context(|| {
-                    format!("key {}: malformed namespace topic", text(row, key))
-                })?,
-                key: normalize_hex(text(row, key)),
-                commitment,
-                metadata,
+                .and_then(|payload| decode_leaf_appended(&payload))
+                .with_context(|| format!("{}: not a LeafAppended payload", at()))?;
+            Ok(Leaf {
+                // Checksummed on the way in, so a namespace reads the same here as
+                // it does in an explorer and in an envelope's `author` field.
+                namespace: address_from_topic(text(row, ns))
+                    .with_context(|| format!("{}: malformed namespace topic", at()))?,
+                index: topic_number(text(row, index))
+                    .with_context(|| format!("{}: malformed index topic", at()))?,
+                commitment: leaf.commitment,
+                metadata: leaf.metadata,
+                block_num: number(row, block).with_context(|| format!("{}: no block_num", at()))?,
+                log_idx: number(row, idx).with_context(|| format!("{}: no log_idx", at()))?,
             })
+        })
+        .collect()
+}
+
+/// A number in an indexed topic: a 32-byte word.
+fn topic_number(topic: &str) -> Option<u64> {
+    let word = hex::decode(strip_hex(topic)).ok()?;
+    u64::try_from(word_to_usize(&word)?).ok()
+}
+
+/// The rows either append query returns — [`history_sql`]'s in log order, and
+/// [`appends_sql`]'s one per namespace, which is that namespace's MMR.
+pub fn parse_appends(table: &Table) -> Result<Vec<Append>> {
+    let (ns, index, selector, data, block, idx) = (
+        table.index_of("namespace")?,
+        table.index_of("index")?,
+        table.index_of("selector")?,
+        table.index_of("data")?,
+        table.index_of("block_num")?,
+        table.index_of("log_idx")?,
+    );
+    table
+        .rows
+        .iter()
+        .map(|row| {
+            let at = || format!("namespace {} at block {}", text(row, ns), text(row, block));
+            let payload = hex::decode(strip_hex(text(row, data))).unwrap_or_default();
+            let topic = normalize_hex(text(row, selector));
+            // `topic2` is the leaf index for one shape and the first leaf for the other.
+            let position = topic_number(text(row, index))
+                .with_context(|| format!("{}: malformed index topic", at()))?;
+            let (what, root, peaks, metadata) = if topic == LEAF_APPENDED_TOPIC {
+                let leaf = decode_leaf_appended(&payload)
+                    .with_context(|| format!("{}: not a LeafAppended payload", at()))?;
+                (
+                    Appended::Leaf {
+                        index: position,
+                        commitment: leaf.commitment,
+                    },
+                    leaf.root,
+                    leaf.peaks,
+                    leaf.metadata,
+                )
+            } else if topic == LEAVES_APPENDED_TOPIC {
+                let leaves = decode_leaves_appended(&payload)
+                    .with_context(|| format!("{}: not a LeavesAppended payload", at()))?;
+                (
+                    Appended::Leaves {
+                        first: position,
+                        count: leaves.count,
+                        chunk_roots: leaves.chunk_roots,
+                        chunk_heights: leaves.chunk_heights,
+                    },
+                    leaves.root,
+                    leaves.peaks,
+                    leaves.metadata,
+                )
+            } else {
+                bail!("{}: selector {topic} is neither append", at());
+            };
+            Ok(Append {
+                namespace: address_from_topic(text(row, ns))
+                    .with_context(|| format!("{}: malformed namespace topic", at()))?,
+                what,
+                root,
+                peaks,
+                metadata,
+                block_num: number(row, block).with_context(|| format!("{}: no block_num", at()))?,
+                log_idx: number(row, idx).with_context(|| format!("{}: no log_idx", at()))?,
+            })
+        })
+        .collect()
+}
+
+/// [`namespaces_sql`]'s rows, checksummed.
+pub fn parse_namespaces(table: &Table) -> Result<Vec<String>> {
+    let ns = table.index_of("namespace")?;
+    table
+        .rows
+        .iter()
+        .map(|row| {
+            address_from_topic(text(row, ns))
+                .with_context(|| format!("malformed namespace topic {}", text(row, ns)))
         })
         .collect()
 }
 
 /// The chain's entry in a `/status` body. `tip_num` and `head_num` are always
 /// serialized, so a missing one is schema drift and errors — defaulted to zero
-/// it would bound the heads query at block 0, and an audit over zero heads
-/// reports clean.
+/// it would bound the queries at block 0, and an audit over nothing reports clean.
 pub fn parse_coverage(response: &Value, chain_id: u64) -> Result<Coverage> {
     let chain = array(&response["chains"])
         .iter()
