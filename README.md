@@ -121,7 +121,10 @@ what a rooted registry gives up is not provability but being queryable from the
 chain: `/records/{checksum}` across registries, and the decoded fields the log
 would have carried. `--root=sha256` takes the digest the manifest already holds
 instead, so it plans without the export staged and verifies nothing; a row then
-proves by producing the whole file.
+proves by producing the whole file. `--root=mmr` loads the file as leaves of the
+registry's MMR in one `appendLeaves` — a bulk anchor, whose gas is mostly the
+slot the precompile creates per chunk — and a row proves against the root with
+`log n` siblings; the registry then appends later records as more leaves.
 
 Below the threshold a registry is replayed record by record and keeps all of
 that. It defaults to zero — everything rooted — because a replayed record is
@@ -151,8 +154,9 @@ every landed one's records in a single walk. What comes back is split in two.
 that is already knowable (the factory for a deploy, the registry for anything
 under one that has landed), so a sender resuming needs no log of its own. What
 exits non-zero is only what sending cannot fix — a record past the version the
-plan writes, one the plan does not write at all, a name two registries carry — so
-the resume loop needs no parsing:
+plan writes, one the plan does not write at all, a name two registries carry, a
+`leaves` step whose registry was first loaded with something else — so the resume
+loop needs no parsing:
 
     until reconcile --plan=plan.jsonl --remaining=left.jsonl && [ ! -s left.jsonl ]
     do send left.jsonl; done
@@ -245,6 +249,11 @@ has not reached back to `START_BLOCK`.
 The decoder, the audit, and `serve` over registries, records, roles, one
 checksum across every registry, one record's versions, and each registry's MMR
 are in.
+
+What a leaves-loaded registry's rows are is not: the chain holds the root and
+the log the chunks, so `/records` answers `[]` for one and a proof needs the
+export file the plan was built from. Serving those rows, and proofs over them,
+from the export is the piece still to build.
 
 Read-through, not materialized: every request queries tidx and nothing is kept
 here. A second store over the same log is what the explorer already is, and the

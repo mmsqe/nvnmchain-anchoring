@@ -34,7 +34,7 @@ use crate::registry::{
     ROLE_EVENTS,
 };
 use crate::tidx::{
-    appends_sql, leaves_in_sql, leaves_sql, parse_appends, parse_leaves, Append, Leaf, Tidx,
+    appends_sql, leaves_in_sql, leaves_sql, parse_appends, parse_leaves, Append, Edge, Leaf, Tidx,
     APPENDS_KEY, LEAVES_KEY,
 };
 
@@ -462,11 +462,11 @@ async fn records_by_registry(
     Ok(Json(records_held_by(&ctx, &addresses).await?))
 }
 
-/// The MMR each of `addresses` holds, as its newest append left it — root, count,
-/// peaks and the metadata it was appended with — or null for one that has never
-/// appended: what `reconcile` judges a `leaves` step by, and what a proof is
-/// checked against.
-pub async fn mmr_held_by(ctx: &Ctx, addresses: &[String]) -> Result<Value, ApiError> {
+/// The MMR each of `addresses` holds at `edge` of its history — root, count, peaks
+/// and the metadata that append carried — or null for one that has never appended.
+/// `reconcile` judges a `leaves` step by the oldest; a proof is checked against the
+/// newest.
+pub async fn mmr_held_by(ctx: &Ctx, addresses: &[String], edge: Edge) -> Result<Value, ApiError> {
     let registries: Vec<String> = addresses
         .iter()
         .map(|address| registry_of(address))
@@ -480,7 +480,7 @@ pub async fn mmr_held_by(ctx: &Ctx, addresses: &[String]) -> Result<Value, ApiEr
         let table = ctx
             .tidx
             .paged(&[], APPENDS_KEY, |after| {
-                appends_sql(ctx.cfg.engine, &registries, at, after)
+                appends_sql(ctx.cfg.engine, &registries, at, after, edge)
             })
             .await?;
         for newest in parse_appends(&table)? {
@@ -490,15 +490,14 @@ pub async fn mmr_held_by(ctx: &Ctx, addresses: &[String]) -> Result<Value, ApiEr
     Ok(json!({ "at_block": at, "registries": roots }))
 }
 
-/// A namespace's MMR as its newest append left it: every event carries the count
-/// and peaks it reached, so the newest one is the whole answer.
-fn mmr_json(newest: &Append) -> Value {
+/// A namespace's MMR as one append left it: every event carries the count and peaks.
+fn mmr_json(append: &Append) -> Value {
     json!({
-        "root": newest.root,
-        "count": newest.count(),
-        "peaks": newest.peaks,
-        "metadata": String::from_utf8_lossy(&newest.metadata),
-        "block_num": newest.block_num,
+        "root": append.root,
+        "count": append.count(),
+        "peaks": append.peaks,
+        "metadata": String::from_utf8_lossy(&append.metadata),
+        "block_num": append.block_num,
     })
 }
 
@@ -510,7 +509,7 @@ async fn mmr(
     let registry = registry_of(&address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
     require_deployed(&ctx, &registry, at).await?;
-    let served = mmr_held_by(&ctx, std::slice::from_ref(&registry)).await?;
+    let served = mmr_held_by(&ctx, std::slice::from_ref(&registry), Edge::Newest).await?;
     let held = &served["registries"][registry.to_lowercase()];
     Ok(Json(json!({
         "registry": registry,

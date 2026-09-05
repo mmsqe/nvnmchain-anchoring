@@ -499,15 +499,34 @@ pub fn leaves_in_sql(
 /// partition, so a page boundary never splits one.
 pub const APPENDS_KEY: Key<'static> = &[("namespace", "topic1")];
 
-/// Each namespace's newest append, of either shape — the MMR as it stands, since
-/// every event carries the count and peaks it left. A subselect rather than
-/// `DISTINCT ON` so it runs on either engine.
-pub fn appends_sql(engine: Engine, namespaces: &[String], up_to: u64, after: &str) -> String {
+/// Which end of a namespace's history [`appends_sql`] keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// The newest append: the MMR as it stands.
+    Newest,
+    /// The oldest: what the tree was first loaded with.
+    Oldest,
+}
+
+/// One append per namespace, of either shape, at `edge` of its history — every
+/// event carries the count and peaks it left. A subselect rather than `DISTINCT ON`
+/// so it runs on either engine.
+pub fn appends_sql(
+    engine: Engine,
+    namespaces: &[String],
+    up_to: u64,
+    after: &str,
+    edge: Edge,
+) -> String {
+    let order = match edge {
+        Edge::Newest => "DESC",
+        Edge::Oldest => "ASC",
+    };
     format!(
         "SELECT namespace, index, selector, data, block_num, log_idx FROM (\
            SELECT topic1 AS namespace, topic2 AS index, selector, data, block_num, log_idx, \
                   ROW_NUMBER() OVER (PARTITION BY topic1 \
-                                     ORDER BY block_num DESC, log_idx DESC) AS rn \
+                                     ORDER BY block_num {order}, log_idx {order}) AS rn \
            FROM logs WHERE address = {} AND {}{} \
                  AND block_num <= {up_to}{after}\
          ) heads WHERE rn = 1 ORDER BY namespace",

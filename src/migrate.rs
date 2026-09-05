@@ -3,10 +3,10 @@
 //! The module's own migration seeded 2,114 registries and 11.9M records by
 //! calling its keeper from an upgrade handler: no transactions, no gas, every
 //! node writing the same state from a disk-staged export. None of that is
-//! available here. A record now exists as an `Anchored` log entry, logs come
-//! from transactions, and genesis has none — so the same corpus 1:1 would be
-//! ~10.9M new head slots at TIP-1000's 250k each, about 3.1e12 gas and 3.6 GB
-//! of log, permanently.
+//! available here. A record now exists as a leaf in the precompile's log, logs
+//! come from transactions, and genesis has none — so the same corpus 1:1 would
+//! be a fresh version-count slot per record at TIP-1000's 250k each, about
+//! 1.5e12 gas and 3.6 GB of log, permanently.
 //!
 //! So the plan splits the corpus. A registry small enough to be worth it is
 //! replayed record by record and keeps every per-record lookup; a large one is
@@ -30,14 +30,21 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::eth::{hex0x, keccak256, normalize_hex, strip_hex};
+use crate::mmr::{bag, hash_leaf, hash_merge};
 use crate::registry::{Deployed, NameFilter, Record};
 use crate::service::{self, Ctx};
+use crate::tidx::Edge;
 
 /// What one call costs, for the summary an operator sizes the run with. Measured
-/// against a dev node: a checksum's first version creates its head slot and pays
-/// TIP-1000 for it, later versions only move the word.
+/// against a dev node: a checksum's first version creates its version-count slot
+/// and pays TIP-1000 for it, later versions only append.
 const GAS_FIRST_VERSION: u64 = 280_000;
 const GAS_LATER_VERSION: u64 = 40_000;
+/// A fresh slot, TIP-1000's state creation: what the precompile pays once per peak
+/// height a namespace reaches, and once for its count.
+const GAS_FRESH_SLOT: u64 = 250_000;
+/// The rest of one `appendLeaves`: the call, the hashing, the event.
+const GAS_LEAVES_CALL: u64 = 80_000;
 
 /// The registries the export names, in the shape the module's own loader read.
 /// `id`, `created_at` and `creator` are deliberately absent there and here: the
@@ -98,6 +105,9 @@ pub enum Mode {
     /// One record holding a merkle root over the export file. Rows are proven
     /// against it; the chain stores the root and nothing else.
     Root,
+    /// The file's rows as leaves of the registry's MMR: one word of state, and a
+    /// later record appends as one more leaf rather than a new key.
+    Leaves,
 }
 
 /// One call to send, in the order it must be sent. A `deploy` goes to the
@@ -149,6 +159,8 @@ pub enum Kind {
     Deploy,
     Record,
     Status,
+    /// The whole file as leaves of the registry's MMR, in one `appendLeaves`.
+    Leaves,
 }
 
 /// What one registry's plan came to, for the summary.
@@ -171,6 +183,10 @@ pub enum Root {
     /// without the export staged, and verifies nothing. A row is then proven by
     /// producing the whole file.
     Sha256,
+    /// The rows as leaves of the registry's MMR (`Registry.appendLeaves`): a row
+    /// proves against the root with `log n` siblings, and the registry goes on
+    /// appending records as leaves afterwards.
+    Mmr,
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +269,8 @@ pub fn plan(registries: &[RegistryImport], manifest: &Manifest, opts: &Options) 
 
         let mode = if file.records <= opts.threshold {
             Mode::Record
+        } else if opts.root == Root::Mmr {
+            Mode::Leaves
         } else {
             Mode::Root
         };
@@ -260,6 +278,7 @@ pub fn plan(registries: &[RegistryImport], manifest: &Manifest, opts: &Options) 
         let gas = match mode {
             Mode::Record => replay(&mut steps, registry, file, opts)?,
             Mode::Root => root(&mut steps, registry, file, opts)?,
+            Mode::Leaves => leaves(&mut steps, registry, file, opts)?,
         };
         planned.push(Planned {
             registry: registry.name.clone(),
@@ -364,6 +383,7 @@ fn root(
             "sha256",
             "a row proves by producing the whole file",
         ),
+        Root::Mmr => unreachable!("a registry above the threshold plans as leaves under --root=mmr"),
     };
     let metadata = serde_json::json!({
         "legacy": {
@@ -389,6 +409,110 @@ fn root(
     step.checksum = Some(root);
     step.version = Some(1);
     Ok(GAS_FIRST_VERSION)
+}
+
+/// The whole file as leaves of the registry's MMR, in one `appendLeaves`.
+///
+/// A leaf is `keccak256("leaf" ‖ keccak256(line))`; the file is cut, from an empty
+/// MMR, into perfect subtrees by the binary decomposition of its length, largest
+/// first, which is the aligned cut the precompile insists on. What the step leaves
+/// behind is the MMR root, so that is its `checksum`. Its gas is mostly state: the
+/// precompile creates one slot per chunk, each a peak, and one for the count.
+fn leaves(
+    steps: &mut Vec<Step>,
+    registry: &RegistryImport,
+    file: &FileEntry,
+    opts: &Options,
+) -> Result<u64> {
+    let chunks = mmr_chunks(&read_lines(&opts.export_dir, file)?);
+    let root = mmr_root(&chunks);
+    let metadata = serde_json::json!({
+        "legacy": {
+            "registry": file.registry,
+            "mode": "leaves",
+            "file": file.file,
+            "records": file.records,
+            "sha256_gz": file.sha256_gz,
+            "sha256": file.sha256_uncompressed,
+            "chunks": chunks.iter().map(|(height, _)| height).collect::<Vec<_>>(),
+            "proof": "a row is leaf keccak256(\"leaf\" || keccak256(line)) at its index; siblings up to its peak, peaks bagged highest first",
+        }
+    });
+    let data = leaves_call(&chunks, &metadata.to_string());
+    let step = push(steps, Kind::Leaves, &registry.name, data);
+    step.checksum = Some(root);
+    Ok(GAS_FRESH_SLOT * (chunks.len() as u64 + 1) + GAS_LEAVES_CALL)
+}
+
+// -- the registry's MMR, as the precompile hashes it ----------------------------
+
+fn mmr_leaf(line: &[u8]) -> [u8; 32] {
+    hash_leaf(&keccak256(line))
+}
+
+fn mmr_merge(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    hash_merge(left, right)
+}
+
+/// The file's lines as aligned perfect subtrees from an empty MMR: `(height, root)`
+/// in leaf order, sizes by the binary decomposition of the length, largest first.
+pub fn mmr_chunks(lines: &[Vec<u8>]) -> Vec<(u8, [u8; 32])> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < lines.len() {
+        let size = 1usize << (usize::BITS - 1 - (lines.len() - at).leading_zeros());
+        let mut level: Vec<[u8; 32]> = lines[at..at + size].iter().map(|l| mmr_leaf(l)).collect();
+        while level.len() > 1 {
+            level = level
+                .chunks(2)
+                .map(|pair| mmr_merge(&pair[0], &pair[1]))
+                .collect();
+        }
+        out.push((size.trailing_zeros() as u8, level[0]));
+        at += size;
+    }
+    out
+}
+
+/// The root the precompile computes: the chunks are the peaks of an MMR loaded
+/// from empty, bagged highest first; zero when empty.
+pub fn mmr_root(chunks: &[(u8, [u8; 32])]) -> String {
+    let peaks: Vec<[u8; 32]> = chunks.iter().map(|(_, root)| *root).collect();
+    hex0x(&bag(&peaks))
+}
+
+/// `appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes metadata)`.
+pub fn leaves_call(chunks: &[(u8, [u8; 32])], metadata: &str) -> String {
+    let word = |n: usize| {
+        let mut w = [0u8; 32];
+        w[24..].copy_from_slice(&(n as u64).to_be_bytes());
+        w
+    };
+    let array = |words: Vec<[u8; 32]>| {
+        let mut tail = word(words.len()).to_vec();
+        tail.extend(words.concat());
+        tail
+    };
+    let roots = array(chunks.iter().map(|(_, root)| *root).collect());
+    let heights = array(
+        chunks
+            .iter()
+            .map(|(height, _)| word(*height as usize))
+            .collect(),
+    );
+    let mut bytes = word(metadata.len()).to_vec();
+    bytes.extend_from_slice(metadata.as_bytes());
+    bytes.resize(bytes.len().next_multiple_of(32), 0);
+
+    let head_len = 3 * 32;
+    let mut data = selector("appendLeaves(bytes32[],uint8[],bytes)").to_vec();
+    data.extend(word(head_len));
+    data.extend(word(head_len + roots.len()));
+    data.extend(word(head_len + roots.len() + heights.len()));
+    data.extend(roots);
+    data.extend(heights);
+    data.extend(bytes);
+    hex0x(&data)
 }
 
 /// The merkle root of `leaves`' lines. An empty file has no root to commit to.
@@ -618,7 +742,20 @@ pub async fn against_chain(ctx: &Ctx, plan: &str) -> Result<Report> {
         held.insert(name.to_string(), Some(records));
     }
 
-    let mut report = reconcile(&steps, &held);
+    // What each landed registry's MMR was first loaded with, in one more walk: a
+    // leaves step is judged by its own landing, not by what came after.
+    let served = service::mmr_held_by(ctx, &addresses, Edge::Oldest)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let roots: BTreeMap<String, String> = landed
+        .iter()
+        .filter_map(|(name, address)| {
+            let root = served["registries"][address.to_lowercase()]["root"].as_str()?;
+            Some((name.to_string(), root.to_string()))
+        })
+        .collect();
+
+    let mut report = reconcile(&steps, &held, &roots);
     report.divergences.extend(ambiguous);
     report.remaining = addressed(report.remaining, &factory, &landed);
     Ok(report)
@@ -653,7 +790,16 @@ pub fn addressed(
 /// `divergences` is what sending cannot fix, so a human has to look: a record the
 /// chain holds *past* the version the plan writes, which is a step that went twice,
 /// and one the plan does not write at all.
-pub fn reconcile(steps: &[Step], held: &BTreeMap<String, Held>) -> Report {
+///
+/// A `leaves` step is judged by `roots`, the root each landed registry's first
+/// append left: none owes the step, the planned one closes it, and any other is a
+/// divergence, since the chunks were cut for an empty MMR. The first append rather
+/// than the newest, so a record added after the load leaves the verdict alone.
+pub fn reconcile(
+    steps: &[Step],
+    held: &BTreeMap<String, Held>,
+    roots: &BTreeMap<String, String>,
+) -> Report {
     let mut report = Report::default();
     let records_of = |registry: &str| held.get(registry).and_then(Option::as_deref);
 
@@ -662,6 +808,21 @@ pub fn reconcile(steps: &[Step], held: &BTreeMap<String, Held>) -> Report {
             report.remaining.push(step.clone()); // its deploy has not landed
             continue;
         };
+        if step.kind == Kind::Leaves {
+            let planned = step.checksum.as_deref().unwrap_or_default().to_lowercase();
+            match roots.get(&step.registry).map(|r| r.to_lowercase()) {
+                None => report.remaining.push(step.clone()),
+                Some(held) if held == planned => {}
+                Some(held) => report.divergences.push(Divergence {
+                    registry: step.registry.clone(),
+                    detail: format!(
+                        "the MMR's first append left root {held}; the plan loads {planned} \
+                         into an empty one"
+                    ),
+                }),
+            }
+            continue;
+        }
         let (Some(checksum), Some(version)) = (&step.checksum, step.version) else {
             continue; // a deploy that landed
         };
@@ -678,6 +839,7 @@ pub fn reconcile(steps: &[Step], held: &BTreeMap<String, Held>) -> Report {
             (Kind::Status, Some(held)) if held.version < version => true,
             (Kind::Status, Some(held)) if held.version > version => false,
             (Kind::Status, Some(held)) => held.status.as_deref() != step.status.as_deref(),
+            (Kind::Leaves, _) => unreachable!("a leaves step was judged by its root above"),
         };
         if owed {
             report.remaining.push(step.clone());

@@ -13,7 +13,7 @@ const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds|serve|\n\
      records <registry>|roles <registry>|\n\
      record <registry> <checksum>|checksum <checksum>|\n\
      migrate --registries=<file> --manifest=<file> [--export=<dir>]\n\
-             [--threshold=<n>] [--root=merkle|sha256] [--uri-base=<url>]|\n\
+             [--threshold=<n>] [--root=merkle|sha256|mmr] [--uri-base=<url>]|\n\
      reconcile --plan=<file> [--remaining=<file>]]";
 
 /// `--flag=value` off the command line, or the default.
@@ -48,8 +48,9 @@ fn print_plan() -> Result<()> {
         root: match flag("root", "merkle").as_str() {
             "merkle" => migrate::Root::Merkle,
             "sha256" => migrate::Root::Sha256,
+            "mmr" => migrate::Root::Mmr,
             other => {
-                eprintln!("--root={other}: expected merkle or sha256\n{USAGE}");
+                eprintln!("--root={other}: expected merkle, sha256 or mmr\n{USAGE}");
                 std::process::exit(2);
             }
         },
@@ -66,9 +67,10 @@ fn print_plan() -> Result<()> {
     let count = |mode| (by(mode).count(), by(mode).map(|r| r.records).sum::<usize>());
     let (by_record, record_rows) = count(migrate::Mode::Record);
     let (by_root, root_rows) = count(migrate::Mode::Root);
+    let (by_leaves, leaves_rows) = count(migrate::Mode::Leaves);
     eprintln!(
         "{} registries: {by_record} by record ({record_rows} records), \
-         {by_root} by root ({root_rows} records)\n\
+         {by_root} by root ({root_rows} records), {by_leaves} by leaves ({leaves_rows} records)\n\
          {} steps, ~{:.1}e9 gas",
         plan.registries.len(),
         plan.steps.len(),

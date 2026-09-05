@@ -24,8 +24,8 @@ use nvnmchain_anchoring::registry::{
 use nvnmchain_anchoring::rpc::decode_state;
 use nvnmchain_anchoring::tidx::{
     appends_sql, cursor_after, history_sql, leaves_in_sql, leaves_sql, namespaces_sql,
-    parse_appends, parse_coverage, parse_leaves, reject_truncated, Appended, Engine, Leaf, Table,
-    APPENDS_KEY, HARD_LIMIT, LEAVES_KEY,
+    parse_appends, parse_coverage, parse_leaves, reject_truncated, Appended, Edge, Engine, Leaf,
+    Table, APPENDS_KEY, HARD_LIMIT, LEAVES_KEY,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -228,7 +228,7 @@ fn every_walk_is_bounded_at_the_audited_block_and_in_log_order() {
     for sql in [
         leaves_sql(Engine::Postgres, &[REGISTRY.to_string()], 123, ""),
         history_sql(Engine::Postgres, REGISTRY, 123, ""),
-        appends_sql(Engine::Postgres, &[], 123, ""),
+        appends_sql(Engine::Postgres, &[], 123, "", Edge::Newest),
         namespaces_sql(Engine::Postgres, 123, ""),
     ] {
         assert!(sql.contains("block_num <= 123"), "{sql}");
@@ -273,7 +273,13 @@ fn a_scoped_leaves_query_narrows_on_the_namespace_topic() {
 fn the_mmr_head_query_keeps_the_newest_append_of_either_shape() {
     // Both events carry the count and peaks they left, so the newest one per
     // namespace *is* the MMR. Partitioned by the namespace it pages on.
-    let sql = appends_sql(Engine::Postgres, &[REGISTRY.to_string()], 99, "");
+    let sql = appends_sql(
+        Engine::Postgres,
+        &[REGISTRY.to_string()],
+        99,
+        "",
+        Edge::Newest,
+    );
     assert!(
         sql.contains("PARTITION BY topic1 ORDER BY block_num DESC, log_idx DESC"),
         "{sql}"
@@ -283,6 +289,20 @@ fn the_mmr_head_query_keeps_the_newest_append_of_either_shape() {
         assert!(sql.contains(topic0.trim_start_matches("0x")), "{sql}");
     }
     assert!(sql.contains("selector IN ("), "{sql}");
+
+    // The other end of the window: what a registry was first loaded with.
+    let first = appends_sql(
+        Engine::Postgres,
+        &[REGISTRY.to_string()],
+        99,
+        "",
+        Edge::Oldest,
+    );
+    assert!(
+        first.contains("PARTITION BY topic1 ORDER BY block_num ASC, log_idx ASC"),
+        "{first}"
+    );
+    assert!(first.contains("WHERE rn = 1"), "{first}");
 
     let distinct = namespaces_sql(Engine::Postgres, 99, "");
     assert!(
