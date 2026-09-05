@@ -221,8 +221,9 @@ records.
 Every namespace's appends, oldest first, folded through the same hashing the
 precompile uses — a leaf is `keccak256("leaf" ‖ c)`, a merge
 `keccak256("merge" ‖ l ‖ r)`, the root bags the peaks highest first — and the
-result compared with `state()` on the node at the same block, batched a few
-hundred namespaces per request. Every leaf the index ever saw for a namespace is
+result compared with `state()` on the node at the same block, the log in one walk
+and the state a few hundred namespaces per request. Every leaf the index ever saw
+for a namespace is
 under that root, which is what a slot per key could never say: the head model
 checked only keys the index already knew.
 

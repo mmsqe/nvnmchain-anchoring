@@ -393,25 +393,15 @@ impl Tidx {
         parse_leaves(&table)
     }
 
-    /// Every namespace that has appended anything as of `up_to`.
-    pub async fn namespaces(&self, up_to: u64) -> Result<Vec<String>> {
+    /// Every namespace's appends as of `up_to`, each in log order, in one walk of the
+    /// index.
+    pub async fn histories(&self, up_to: u64) -> Result<Vec<(String, Vec<Append>)>> {
         let table = self
-            .paged(&[], NAMESPACES_KEY, |after| {
-                namespaces_sql(self.engine, up_to, after)
+            .paged(&[], HISTORIES_KEY, |after| {
+                histories_sql(self.engine, up_to, after)
             })
             .await?;
-        parse_namespaces(&table)
-    }
-
-    /// Every append under one namespace as of `up_to`, in log order — what the
-    /// audit folds back into the root the chain holds.
-    pub async fn history(&self, namespace: &str, up_to: u64) -> Result<Vec<Append>> {
-        let table = self
-            .paged(&[], LEAVES_KEY, |after| {
-                history_sql(self.engine, namespace, up_to, after)
-            })
-            .await?;
-        parse_appends(&table)
+        Ok(group_by_namespace(parse_appends(&table)?))
     }
 
     /// `GET /status`, which is the only way to this: `/query` allowlists
@@ -536,28 +526,20 @@ pub fn appends_sql(
     )
 }
 
-/// Every append under one namespace, of either shape, oldest first.
-pub fn history_sql(engine: Engine, namespace: &str, up_to: u64, after: &str) -> String {
+/// What [`histories_sql`] pages on: the namespace, then the row's place in the log,
+/// so a page boundary inside a namespace falls between two of its rows.
+pub const HISTORIES_KEY: Key<'static> = &[
+    ("namespace", "topic1"),
+    ("block_num", "block_num"),
+    ("log_idx", "log_idx"),
+];
+
+/// Every append on the chain, of either shape, by namespace and then in log order.
+pub fn histories_sql(engine: Engine, up_to: u64, after: &str) -> String {
     format!(
         "SELECT topic1 AS namespace, topic2 AS index, selector, data, block_num, log_idx \
-         FROM logs WHERE address = {} AND {}{} \
-               AND block_num <= {up_to}{after} ORDER BY block_num, log_idx",
-        engine.bytes_literal(ADDRESS),
-        either_append(engine),
-        under(engine, std::slice::from_ref(&namespace.to_string())),
-    )
-}
-
-/// What [`namespaces_sql`] pages on.
-pub const NAMESPACES_KEY: Key<'static> = &[("namespace", "topic1")];
-
-/// Every namespace that has appended anything, in topic order.
-pub fn namespaces_sql(engine: Engine, up_to: u64, after: &str) -> String {
-    format!(
-        "SELECT namespace FROM (\
-           SELECT DISTINCT topic1 AS namespace FROM logs \
-           WHERE address = {} AND {} AND block_num <= {up_to}{after}\
-         ) ns ORDER BY namespace",
+         FROM logs WHERE address = {} AND {} \
+               AND block_num <= {up_to}{after} ORDER BY topic1, block_num, log_idx",
         engine.bytes_literal(ADDRESS),
         either_append(engine),
     )
@@ -606,7 +588,7 @@ fn topic_number(topic: &str) -> Option<u64> {
     u64::try_from(word_to_usize(&word)?).ok()
 }
 
-/// The rows either append query returns — [`history_sql`]'s in log order, and
+/// The rows either append query returns — [`histories_sql`]'s in log order, and
 /// [`appends_sql`]'s one per namespace, which is that namespace's MMR.
 pub fn parse_appends(table: &Table) -> Result<Vec<Append>> {
     let (ns, index, selector, data, block, idx) = (
@@ -670,17 +652,16 @@ pub fn parse_appends(table: &Table) -> Result<Vec<Append>> {
         .collect()
 }
 
-/// [`namespaces_sql`]'s rows, checksummed.
-pub fn parse_namespaces(table: &Table) -> Result<Vec<String>> {
-    let ns = table.index_of("namespace")?;
-    table
-        .rows
-        .iter()
-        .map(|row| {
-            address_from_topic(text(row, ns))
-                .with_context(|| format!("malformed namespace topic {}", text(row, ns)))
-        })
-        .collect()
+/// [`histories_sql`]'s rows grouped by namespace, which the query returns consecutively.
+pub fn group_by_namespace(appends: Vec<Append>) -> Vec<(String, Vec<Append>)> {
+    let mut out: Vec<(String, Vec<Append>)> = Vec::new();
+    for append in appends {
+        match out.last_mut() {
+            Some((namespace, history)) if *namespace == append.namespace => history.push(append),
+            _ => out.push((append.namespace.clone(), vec![append])),
+        }
+    }
+    out
 }
 
 /// The chain's entry in a `/status` body. `tip_num` and `head_num` are always

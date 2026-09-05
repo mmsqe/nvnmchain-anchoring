@@ -41,8 +41,9 @@ pub struct Report {
     pub leaves: u64,
     /// Namespaces where the chain disagrees with the fold of what the index holds.
     pub mismatched: Vec<Mismatch>,
-    /// Appends whose own root or position disagrees with the fold up to them —
-    /// the index's copy of the log contradicting itself, rather than the chain.
+    /// Appends whose own root or position disagrees with the fold up to them, or
+    /// that the precompile would have refused outright — the index's copy of the
+    /// log contradicting itself, rather than the chain.
     pub inconsistent: Vec<Inconsistent>,
     /// Leaves whose commitment is not `keccak256(metadata)`. Not an error — a
     /// plain `appendLeaf` may commit to anything — but every registry write is
@@ -153,78 +154,103 @@ pub struct Folded {
     pub inconsistent: Vec<Inconsistent>,
 }
 
+impl Folded {
+    fn note(&mut self, namespace: &str, append: &Append, detail: String) {
+        self.inconsistent.push(Inconsistent {
+            namespace: namespace.to_string(),
+            block_num: append.block_num,
+            log_idx: append.log_idx,
+            detail,
+        });
+    }
+}
+
 /// Replay `history`, oldest first, checking each event against the fold up to it:
 /// a leaf must land at the count, a batch must start there and end where it says,
 /// and the root each event carries must be the fold's.
-pub fn fold(namespace: &str, history: &[Append]) -> Result<Folded> {
+///
+/// An event that cannot be replayed at all — a chunk the precompile would have
+/// refused, a word that is not one — is noted like the rest and ends the fold: the
+/// chain never wrote it, and nothing after it can be judged against a tree that
+/// cannot be built.
+pub fn fold(namespace: &str, history: &[Append]) -> Folded {
     let mut folded = Folded {
         mmr: Mmr::default(),
         leaves: 0,
         unverifiable: 0,
         inconsistent: Vec::new(),
     };
-    let mut note = |append: &Append, detail: String| {
-        folded.inconsistent.push(Inconsistent {
-            namespace: namespace.to_string(),
-            block_num: append.block_num,
-            log_idx: append.log_idx,
-            detail,
-        });
-    };
     for append in history {
-        match &append.what {
+        let before = folded.mmr.count;
+        let (what, from, to) = match &append.what {
             Appended::Leaf { index, commitment } => {
-                if *index != folded.mmr.count {
-                    note(
-                        append,
-                        format!("leaf {index} where the count is {}", folded.mmr.count),
-                    );
-                }
                 if !is_self_verifying(commitment, &append.metadata) {
                     folded.unverifiable += 1;
                 }
-                folded.mmr.append(&word(commitment)?)?;
-                folded.leaves += 1;
+                ("leaf", *index, None)
             }
-            Appended::Leaves {
-                first,
-                count,
-                chunk_roots,
-                chunk_heights,
-            } => {
-                if *first != folded.mmr.count {
-                    note(
-                        append,
-                        format!(
-                            "a batch from {first} where the count is {}",
-                            folded.mmr.count
-                        ),
-                    );
-                }
-                for (root, height) in chunk_roots.iter().zip(chunk_heights) {
-                    folded.mmr.push(*height, word(root)?)?;
-                    folded.leaves += 1u64 << height;
-                }
-                if *count != folded.mmr.count {
-                    note(
-                        append,
-                        format!(
-                            "a batch to {count} where the fold reaches {}",
-                            folded.mmr.count
-                        ),
-                    );
-                }
+            Appended::Leaves { first, count, .. } => ("a batch from", *first, Some(*count)),
+        };
+        if from != before {
+            folded.note(
+                namespace,
+                append,
+                format!("{what} {from} where the count is {before}"),
+            );
+        }
+        match replay(&mut folded.mmr, &append.what) {
+            Ok(added) => folded.leaves += added,
+            Err(refused) => {
+                folded.note(
+                    namespace,
+                    append,
+                    format!("cannot be replayed: {refused:#}"),
+                );
+                break;
             }
+        }
+        if let Some(count) = to.filter(|count| *count != folded.mmr.count) {
+            folded.note(
+                namespace,
+                append,
+                format!(
+                    "a batch to {count} where the fold reaches {}",
+                    folded.mmr.count
+                ),
+            );
         }
         let root = hex0x(&folded.mmr.root());
         if normalize_hex(&append.root) != root {
-            note(
+            folded.note(
+                namespace,
                 append,
                 format!("the event says root {}, the fold {root}", append.root),
             );
         }
     }
-    Ok(folded)
+    folded
+}
+
+/// One append onto `mmr`, and the leaves it added.
+fn replay(mmr: &mut Mmr, what: &Appended) -> Result<u64> {
+    match what {
+        Appended::Leaf { commitment, .. } => {
+            mmr.append(&word(commitment)?)?;
+            Ok(1)
+        }
+        Appended::Leaves {
+            chunk_roots,
+            chunk_heights,
+            ..
+        } => {
+            let mut added = 0;
+            for (root, height) in chunk_roots.iter().zip(chunk_heights) {
+                mmr.push(*height, word(root)?)?;
+                added += 1u64 << height;
+            }
+            Ok(added)
+        }
+    }
 }
 
 fn word(hexed: &str) -> Result<[u8; 32]> {
@@ -241,7 +267,7 @@ pub async fn run(rpc: &Rpc, tidx: &Tidx, first_block: u64) -> Result<Report> {
     // the fold and the state it is compared against describe the same chain.
     let coverage = tidx.coverage().await?;
     let at = coverage.tip_num;
-    let namespaces = tidx.namespaces(at).await?;
+    let histories = tidx.histories(at).await?;
 
     let mut report = Report {
         checked: 0,
@@ -254,9 +280,9 @@ pub async fn run(rpc: &Rpc, tidx: &Tidx, first_block: u64) -> Result<Report> {
         slot_rule_holds: None,
     };
 
-    let mut folds = Vec::with_capacity(namespaces.len());
-    for namespace in &namespaces {
-        let folded = fold(namespace, &tidx.history(namespace, at).await?)?;
+    let mut folds = Vec::with_capacity(histories.len());
+    for (namespace, history) in &histories {
+        let folded = fold(namespace, history);
         report.leaves += folded.leaves;
         report.unverifiable += folded.unverifiable;
         report.inconsistent.extend(folded.inconsistent);

@@ -23,9 +23,9 @@ use nvnmchain_anchoring::registry::{
 };
 use nvnmchain_anchoring::rpc::decode_state;
 use nvnmchain_anchoring::tidx::{
-    appends_sql, cursor_after, history_sql, leaves_in_sql, leaves_sql, namespaces_sql,
+    appends_sql, cursor_after, group_by_namespace, histories_sql, leaves_in_sql, leaves_sql,
     parse_appends, parse_coverage, parse_leaves, reject_truncated, Appended, Edge, Engine, Leaf,
-    Table, APPENDS_KEY, HARD_LIMIT, LEAVES_KEY,
+    Table, APPENDS_KEY, HARD_LIMIT, HISTORIES_KEY, LEAVES_KEY,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -227,14 +227,13 @@ fn every_walk_is_bounded_at_the_audited_block_and_in_log_order() {
     // than the block state is read at would fold into a false mismatch.
     for sql in [
         leaves_sql(Engine::Postgres, &[REGISTRY.to_string()], 123, ""),
-        history_sql(Engine::Postgres, REGISTRY, 123, ""),
+        histories_sql(Engine::Postgres, 123, ""),
         appends_sql(Engine::Postgres, &[], 123, "", Edge::Newest),
-        namespaces_sql(Engine::Postgres, 123, ""),
     ] {
         assert!(sql.contains("block_num <= 123"), "{sql}");
     }
     assert!(leaves_sql(Engine::Postgres, &[], 1, "").ends_with("ORDER BY block_num, log_idx"));
-    assert!(history_sql(Engine::Postgres, REGISTRY, 1, "").ends_with("ORDER BY block_num, log_idx"));
+    assert!(histories_sql(Engine::Postgres, 1, "").ends_with("ORDER BY topic1, block_num, log_idx"));
 }
 
 #[test]
@@ -303,12 +302,52 @@ fn the_mmr_head_query_keeps_the_newest_append_of_either_shape() {
         "{first}"
     );
     assert!(first.contains("WHERE rn = 1"), "{first}");
+}
 
-    let distinct = namespaces_sql(Engine::Postgres, 99, "");
+#[test]
+fn the_audit_walk_is_one_query_namespace_by_namespace() {
+    // One walk ordered by namespace, then log position; consecutive rows share a
+    // namespace, so grouping needs no map.
+    let walk = histories_sql(Engine::Postgres, 99, "");
     assert!(
-        distinct.contains("SELECT DISTINCT topic1 AS namespace"),
-        "{distinct}"
+        walk.ends_with("ORDER BY topic1, block_num, log_idx"),
+        "{walk}"
     );
+    assert!(walk.contains("selector IN ("), "{walk}");
+    assert!(!walk.contains("PARTITION BY"), "{walk}");
+
+    let peaks = [hex0x(&[0x22u8; 32])];
+    let peak_refs: Vec<&str> = peaks.iter().map(String::as_str).collect();
+    let row = |ns: &str, index: &str, block: u64| {
+        json!([
+            topic(ns),
+            topic(index),
+            LEAF_APPENDED_TOPIC,
+            leaf_data(RECORD_COMMITMENT, &hex0x(&[0x11u8; 32]), &peak_refs, b""),
+            block,
+            0,
+        ])
+    };
+    let appends = parse_appends(&table(json!({
+        "ok": true,
+        "columns": ["namespace", "index", "selector", "data", "block_num", "log_idx"],
+        "rows": [row(NAMESPACE, "0", 3), row(REGISTRY, "0", 4), row(REGISTRY, "1", 9)],
+    })))
+    .expect("three appends");
+    let histories = group_by_namespace(appends);
+    assert_eq!(histories.len(), 2);
+    assert_eq!(
+        (histories[0].0.as_str(), histories[0].1.len()),
+        (NAMESPACE, 1)
+    );
+    assert_eq!(
+        (histories[1].0.as_str(), histories[1].1.len()),
+        (REGISTRY, 2)
+    );
+    assert!(matches!(
+        histories[1].1[1].what,
+        Appended::Leaf { index: 1, .. }
+    ));
 }
 
 #[test]
@@ -813,7 +852,7 @@ fn a_namespaces_history_folds_to_the_root_its_events_carry() {
     ));
     assert!(matches!(appends[1].what, Appended::Leaf { index: 3, .. }));
 
-    let folded = fold(REGISTRY, &appends).expect("folds");
+    let folded = fold(REGISTRY, &appends);
     assert_eq!(folded.mmr.count, 4);
     assert_eq!(folded.leaves, 4, "three in the batch, one after");
     assert!(folded.inconsistent.is_empty(), "{:?}", folded.inconsistent);
@@ -835,12 +874,63 @@ fn an_event_whose_root_disagrees_with_the_fold_is_inconsistent() {
     // The index's own copy of the log contradicting itself — which is not the
     // chain being wrong, and is reported apart from a mismatch against it.
     let appends = parse_appends(&history_rows(true)).expect("two appends");
-    let folded = fold(REGISTRY, &appends).expect("folds regardless");
+    let folded = fold(REGISTRY, &appends);
     assert_eq!(folded.inconsistent.len(), 1, "{:?}", folded.inconsistent);
     assert!(folded.inconsistent[0]
         .detail
         .contains("the event says root"));
     assert_eq!(folded.inconsistent[0].block_num, 6);
+}
+
+#[test]
+fn an_event_the_precompile_would_have_refused_ends_the_fold_as_inconsistent() {
+    // A pair at count 1 is misaligned: the chain never wrote it. Noted like any other
+    // inconsistency, and the fold stops there rather than failing the whole audit.
+    let mut mmr = Mmr::default();
+    mmr.append(&c(1)).unwrap();
+    let root = hex0x(&mmr.root());
+    let peaks: Vec<String> = mmr.peaks.iter().map(|p| hex0x(p)).collect();
+    let peaks: Vec<&str> = peaks.iter().map(String::as_str).collect();
+    let bogus = hex0x(&[0xee; 32]);
+    let appends = parse_appends(&table(json!({
+        "ok": true,
+        "columns": ["namespace", "index", "selector", "data", "block_num", "log_idx"],
+        "rows": [
+            [
+                topic(REGISTRY), topic("0"), LEAF_APPENDED_TOPIC,
+                leaf_data(&hex0x(&c(1)), &root, &peaks, b"one"),
+                5, 0,
+            ],
+            [
+                topic(REGISTRY), topic("1"), LEAVES_APPENDED_TOPIC,
+                leaves_data(3, &[(&hex0x(&[0x77; 32]), 1)], &bogus, &peaks, b"{}"),
+                6, 0,
+            ],
+            [
+                topic(REGISTRY), topic("3"), LEAF_APPENDED_TOPIC,
+                leaf_data(&hex0x(&c(4)), &bogus, &peaks, b"four"),
+                7, 0,
+            ],
+        ],
+    })))
+    .expect("three appends");
+
+    let folded = fold(REGISTRY, &appends);
+    assert_eq!(folded.inconsistent.len(), 1, "{:?}", folded.inconsistent);
+    assert_eq!(folded.inconsistent[0].block_num, 6);
+    assert!(
+        folded.inconsistent[0]
+            .detail
+            .contains("not a multiple of 2"),
+        "{}",
+        folded.inconsistent[0].detail
+    );
+    assert_eq!(
+        folded.mmr.count, 1,
+        "the fold stops where the log stops making sense"
+    );
+    assert_eq!(folded.leaves, 1);
+    assert_eq!(hex0x(&folded.mmr.root()), root);
 }
 
 /// `RecordAdded`'s data section: `abi.encode(uint256 index, string checksum, uint8 category,
@@ -1087,6 +1177,15 @@ fn a_cursor_is_lexicographic_over_its_key_and_spelled_for_its_engine() {
     let ns = Engine::Postgres.bytes_literal(&topic("aa"));
     let by_namespace = cursor_after(Engine::Postgres, &rows, APPENDS_KEY, &row).expect("a cursor");
     assert_eq!(by_namespace, format!(" AND (topic1 > {ns})"));
+    // The audit's walk pages on all three, namespace first.
+    let by_history = cursor_after(Engine::Postgres, &rows, HISTORIES_KEY, &row).expect("a cursor");
+    assert_eq!(
+        by_history,
+        format!(
+            " AND (topic1 > {ns} OR (topic1 = {ns} AND \
+             (block_num > 12 OR (block_num = 12 AND (log_idx > 7)))))"
+        )
+    );
     let ch = cursor_after(Engine::ClickHouse, &rows, APPENDS_KEY, &row).expect("a cursor");
     assert!(ch.contains("topic1 > '0x"), "{ch}");
 }
