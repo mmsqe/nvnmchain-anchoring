@@ -9,16 +9,15 @@ use crate::eth::{hex0x, keccak256, strip_hex, word_to_usize};
 /// Fixed at genesis (`IAnchoring.sol`).
 pub const ADDRESS: &str = "0x0000000000000000000000000000000000000A00";
 
-pub const LEAF_APPENDED_SIGNATURE: &str =
-    "LeafAppended(address,uint256,bytes32,bytes32,bytes32[],bytes)";
+pub const LEAF_APPENDED_SIGNATURE: &str = "LeafAppended(address,uint256,bytes32,bytes32[],bytes)";
 /// `keccak256(LEAF_APPENDED_SIGNATURE)`, asserted in the tests so it cannot drift.
 pub const LEAF_APPENDED_TOPIC: &str =
-    "0x299ee3fc8eecbb10ce273b5329c6e4f095c550dc1bc7e1756bd6303da53cf12a";
+    "0x43a24f34ff55c61c25ca8f226ce1e940c9bc4ca4ef98253d9780a3cf29aa2262";
 
 pub const LEAVES_APPENDED_SIGNATURE: &str =
-    "LeavesAppended(address,uint256,uint256,bytes32[],uint8[],bytes32,bytes32[],bytes)";
+    "LeavesAppended(address,uint256,uint256,(bytes32,uint8)[],bytes32[],bytes)";
 pub const LEAVES_APPENDED_TOPIC: &str =
-    "0x07d3a61ef7a792265f84d9a96ef8168c654dd0d610d83034971ce6c68c30a378";
+    "0xa643a7916be4114a8d4f887b0606856c1f49b02a0a4374c775283987c1e12c2c";
 
 /// `(topic0, signature)` for both events, the way [`crate::registry::REGISTRY_TOPICS`]
 /// lists the contracts', so `tests/signatures.rs` checks them against the compiled ABI.
@@ -48,7 +47,8 @@ pub fn count_slot(namespace: &str) -> Option<String> {
     Some(hex0x(&keccak256(&preimage)))
 }
 
-/// What a `LeafAppended` row's `data` decodes to.
+/// What a `LeafAppended` row's `data` decodes to. The event carries the peaks; `root` is
+/// what they bag to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafData {
     pub commitment: String,
@@ -57,7 +57,7 @@ pub struct LeafData {
     pub metadata: Vec<u8>,
 }
 
-/// What a `LeavesAppended` row's `data` decodes to.
+/// What a `LeavesAppended` row's `data` decodes to, `root` bagged from the peaks as above.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeavesData {
     pub count: u64,
@@ -68,37 +68,51 @@ pub struct LeavesData {
     pub metadata: Vec<u8>,
 }
 
-/// `abi.encode(bytes32 commitment, bytes32 root, bytes32[] peaks, bytes metadata)`.
+/// `abi.encode(bytes32 commitment, bytes32[] peaks, bytes metadata)`.
 ///
 /// Read here rather than by the index that stored the log, because tidx decodes a
 /// dynamic argument as the 32-byte head word — the ABI *offset* to the payload, not
 /// the payload. So the queries select the raw `data` column and this reads it.
 pub fn decode_leaf_appended(data: &[u8]) -> Option<LeafData> {
     let words = Words(data);
+    let peaks = words.words_at(words.offset(1)?, 1)?;
     Some(LeafData {
         commitment: hex0x(words.word(0)?),
-        root: hex0x(words.word(1)?),
-        peaks: words.words_at(words.offset(2)?)?,
+        root: root_of(&peaks)?,
+        peaks,
+        metadata: words.bytes_at(words.offset(2)?)?,
+    })
+}
+
+/// `abi.encode(uint256 count, (bytes32 root, uint8 height)[] chunks, bytes32[] peaks,
+/// bytes metadata)`. A chunk is a static pair, so the array is its length word and then two
+/// words per chunk.
+pub fn decode_leaves_appended(data: &[u8]) -> Option<LeavesData> {
+    let words = Words(data);
+    let (mut chunk_roots, mut chunk_heights) = (Vec::new(), Vec::new());
+    for pair in words.words_at(words.offset(1)?, 2)?.chunks(2) {
+        chunk_roots.push(pair[0].clone());
+        chunk_heights
+            .push(u8::try_from(word_to_usize(&hex::decode(strip_hex(&pair[1])).ok()?)?).ok()?);
+    }
+    let peaks = words.words_at(words.offset(2)?, 1)?;
+    Some(LeavesData {
+        count: u64::try_from(word_to_usize(words.word(0)?)?).ok()?,
+        chunk_roots,
+        chunk_heights,
+        root: root_of(&peaks)?,
+        peaks,
         metadata: words.bytes_at(words.offset(3)?)?,
     })
 }
 
-/// `abi.encode(uint256 count, bytes32[] chunkRoots, uint8[] chunkHeights, bytes32 root,
-/// bytes32[] peaks, bytes metadata)`.
-pub fn decode_leaves_appended(data: &[u8]) -> Option<LeavesData> {
-    let words = Words(data);
-    let heights = words.words_at(words.offset(2)?)?;
-    Some(LeavesData {
-        count: u64::try_from(word_to_usize(words.word(0)?)?).ok()?,
-        chunk_roots: words.words_at(words.offset(1)?)?,
-        chunk_heights: heights
-            .iter()
-            .map(|h| u8::try_from(word_to_usize(&hex::decode(strip_hex(h)).ok()?)?).ok())
-            .collect::<Option<_>>()?,
-        root: hex0x(words.word(3)?),
-        peaks: words.words_at(words.offset(4)?)?,
-        metadata: words.bytes_at(words.offset(5)?)?,
-    })
+/// What `peaks` bag to: the root an event no longer carries, being one fold away.
+fn root_of(peaks: &[String]) -> Option<String> {
+    let peaks: Option<Vec<[u8; 32]>> = peaks
+        .iter()
+        .map(|peak| hex::decode(strip_hex(peak)).ok()?.try_into().ok())
+        .collect();
+    Some(hex0x(&crate::mmr::bag(&peaks?)))
 }
 
 /// ABI words over a data section. Bounds are checked on every read, so a short
@@ -119,9 +133,9 @@ impl Words<'_> {
         word_to_usize(self.0.get(offset..offset.checked_add(32)?)?)
     }
 
-    /// A `bytes32[]` at `offset`, each word as hex.
-    fn words_at(&self, offset: usize) -> Option<Vec<String>> {
-        let len = self.length_at(offset)?;
+    /// An array at `offset` of elements `width` words wide, each word as hex.
+    fn words_at(&self, offset: usize, width: usize) -> Option<Vec<String>> {
+        let len = self.length_at(offset)?.checked_mul(width)?;
         let start = offset.checked_add(32)?;
         let end = start.checked_add(len.checked_mul(32)?)?;
         Some(self.0.get(start..end)?.chunks(32).map(hex0x).collect())

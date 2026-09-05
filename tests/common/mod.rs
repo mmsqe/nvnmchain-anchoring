@@ -56,14 +56,13 @@ pub fn bytes(hexed: &str) -> Vec<u8> {
     hex::decode(hexed.strip_prefix("0x").unwrap_or(hexed)).expect("hex")
 }
 
-/// `abi.encode(bytes32 commitment, bytes32 root, bytes32[] peaks, bytes metadata)` — a
-/// `LeafAppended` row's `data` column, as tidx hands it back. Built the way the ABI says
-/// rather than pasted, so a test that fails names a decoder bug and not a typo.
-pub fn leaf_data(commitment: &str, root: &str, peaks: &[&str], metadata: &[u8]) -> String {
+/// `abi.encode(bytes32 commitment, bytes32[] peaks, bytes metadata)` — a `LeafAppended` row's
+/// `data` column, as tidx hands it back. Built the way the ABI says rather than pasted, so a
+/// test that fails names a decoder bug and not a typo.
+pub fn leaf_data(commitment: &str, peaks: &[&str], metadata: &[u8]) -> String {
     let mut out = String::from("0x");
     out.push_str(&format!("{:0>64}", commitment.trim_start_matches("0x")));
-    out.push_str(&format!("{:0>64}", root.trim_start_matches("0x")));
-    let peaks_at = 4 * 32;
+    let peaks_at = 3 * 32;
     let metadata_at = peaks_at + 32 + peaks.len() * 32;
     out.push_str(&format!("{peaks_at:064x}"));
     out.push_str(&format!("{metadata_at:064x}"));
@@ -80,36 +79,30 @@ pub fn leaf_data(commitment: &str, root: &str, peaks: &[&str], metadata: &[u8]) 
     out
 }
 
-/// `abi.encode(uint256 count, bytes32[] chunkRoots, uint8[] chunkHeights, bytes32 root,
-/// bytes32[] peaks, bytes metadata)` — a `LeavesAppended` row's `data`.
-pub fn leaves_data(
-    count: u64,
-    chunks: &[(&str, u8)],
-    root: &str,
-    peaks: &[&str],
-    metadata: &[u8],
-) -> String {
+/// `abi.encode(uint256 count, (bytes32 root, uint8 height)[] chunks, bytes32[] peaks,
+/// bytes metadata)` — a `LeavesAppended` row's `data`. A chunk is a static pair, so the
+/// array is its length and then two words per chunk.
+pub fn leaves_data(count: u64, chunks: &[(&str, u8)], peaks: &[&str], metadata: &[u8]) -> String {
     let words = |items: &[String]| {
-        let mut s = format!("{:064x}", items.len());
+        let mut s = String::new();
         for item in items {
             s.push_str(&format!("{:0>64}", item.trim_start_matches("0x")));
         }
         s
     };
-    let roots: Vec<String> = chunks.iter().map(|(r, _)| r.to_string()).collect();
-    let heights: Vec<String> = chunks.iter().map(|(_, h)| format!("{h:x}")).collect();
+    let pairs: Vec<String> = chunks
+        .iter()
+        .flat_map(|(r, h)| [r.to_string(), format!("{h:x}")])
+        .collect();
     let peaks: Vec<String> = peaks.iter().map(|p| p.to_string()).collect();
-    let (roots, heights, peaks) = (words(&roots), words(&heights), words(&peaks));
-    let head = 6 * 32;
-    let roots_at = head;
-    let heights_at = roots_at + roots.len() / 2;
-    let peaks_at = heights_at + heights.len() / 2;
+    let chunks = format!("{:064x}{}", chunks.len(), words(&pairs));
+    let peaks = format!("{:064x}{}", peaks.len(), words(&peaks));
+    let head = 4 * 32;
+    let chunks_at = head;
+    let peaks_at = chunks_at + chunks.len() / 2;
     let metadata_at = peaks_at + peaks.len() / 2;
-    let mut out = format!("0x{count:064x}{roots_at:064x}{heights_at:064x}");
-    out.push_str(&format!("{:0>64}", root.trim_start_matches("0x")));
-    out.push_str(&format!("{peaks_at:064x}{metadata_at:064x}"));
-    out.push_str(&roots);
-    out.push_str(&heights);
+    let mut out = format!("0x{count:064x}{chunks_at:064x}{peaks_at:064x}{metadata_at:064x}");
+    out.push_str(&chunks);
     out.push_str(&peaks);
     out.push_str(&format!("{:064x}", metadata.len()));
     out.push_str(&format!(

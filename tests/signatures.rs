@@ -28,6 +28,24 @@ fn fixture_commit() -> String {
         .collect()
 }
 
+/// An input's canonical type: a tuple spelled out from its components, `(bytes32,uint8)[]`
+/// where the ABI says `tuple[]`.
+fn canonical(input: &serde_json::Value) -> String {
+    let kind = input["type"].as_str().expect("input has a type");
+    match kind.strip_prefix("tuple") {
+        Some(suffix) => {
+            let components: Vec<String> = input["components"]
+                .as_array()
+                .expect("a tuple lists its components")
+                .iter()
+                .map(canonical)
+                .collect();
+            format!("({}){suffix}", components.join(","))
+        }
+        None => kind.to_string(),
+    }
+}
+
 /// Canonical `Name(type,…)` for every event the contracts compile to.
 fn compiled_signatures() -> BTreeSet<String> {
     fixture()["events"]
@@ -35,11 +53,11 @@ fn compiled_signatures() -> BTreeSet<String> {
         .expect("fixture has an events array")
         .iter()
         .map(|e| {
-            let types: Vec<&str> = e["inputs"]
+            let types: Vec<String> = e["inputs"]
                 .as_array()
                 .expect("inputs is an array")
                 .iter()
-                .map(|i| i["type"].as_str().expect("input has a type"))
+                .map(canonical)
                 .collect();
             format!(
                 "{}({})",

@@ -57,12 +57,7 @@ fn leaf_row(
     json!([
         topic(&REGISTRY.to_lowercase()),
         topic(&format!("{index:x}")),
-        leaf_data(
-            commitment,
-            &hex0x(&[0x11u8; 32]),
-            &[&hex0x(&[0x22u8; 32])],
-            &bytes(metadata)
-        ),
+        leaf_data(commitment, &[&hex0x(&[0x22u8; 32])], &bytes(metadata)),
         block,
         log_idx,
     ])
@@ -323,7 +318,7 @@ fn the_audit_walk_is_one_query_namespace_by_namespace() {
             topic(ns),
             topic(index),
             LEAF_APPENDED_TOPIC,
-            leaf_data(RECORD_COMMITMENT, &hex0x(&[0x11u8; 32]), &peak_refs, b""),
+            leaf_data(RECORD_COMMITMENT, &peak_refs, b""),
             block,
             0,
         ])
@@ -769,7 +764,7 @@ fn the_newest_append_per_namespace_is_the_mmr() {
                 topic(REGISTRY),
                 topic("4"),
                 LEAF_APPENDED_TOPIC,
-                leaf_data(RECORD_COMMITMENT, &hex0x(&[0x11u8; 32]), &peak_refs, b"provenance"),
+                leaf_data(RECORD_COMMITMENT, &peak_refs, b"provenance"),
                 12,
                 1,
             ],
@@ -777,7 +772,7 @@ fn the_newest_append_per_namespace_is_the_mmr() {
                 topic(NAMESPACE),
                 topic("0"),
                 LEAVES_APPENDED_TOPIC,
-                leaves_data(13, &[(&hex0x(&[0x33u8; 32]), 3)], &hex0x(&[0x44u8; 32]), &peak_refs, b"{}"),
+                leaves_data(13, &[(&hex0x(&[0x33u8; 32]), 3)], &peak_refs, b"{}"),
                 13,
                 0,
             ],
@@ -790,49 +785,46 @@ fn the_newest_append_per_namespace_is_the_mmr() {
         (heads[0].namespace.as_str(), heads[0].count()),
         (REGISTRY, 5)
     );
-    assert_eq!(heads[0].root, hex0x(&[0x11u8; 32]));
+    assert_eq!(heads[0].root, peaks[0], "one peak bags to itself");
     assert_eq!(heads[0].peaks, peaks);
     assert_eq!(heads[0].metadata, b"provenance");
     assert_eq!(
         (heads[1].namespace.as_str(), heads[1].count()),
         (NAMESPACE, 13)
     );
-    assert_eq!(heads[1].root, hex0x(&[0x44u8; 32]));
+    assert_eq!(heads[1].root, peaks[0]);
 }
 
 /// A namespace's history: a batch of three from empty, then one leaf, each row
-/// carrying the root and peaks the precompile would have emitted.
+/// carrying the peaks the precompile would have emitted — or, tampered, peaks no
+/// fold reaches.
 fn history_rows(tamper: bool) -> Table {
     let mut mmr = Mmr::default();
     let pair = hash_merge(&hash_leaf(&c(1)), &hash_leaf(&c(2)));
     mmr.push(1, pair).unwrap();
     mmr.push(0, hash_leaf(&c(3))).unwrap();
-    let batch_root = hex0x(&mmr.root());
     let batch_peaks: Vec<String> = mmr.peaks.iter().map(|p| hex0x(p)).collect();
     let batch_peaks: Vec<&str> = batch_peaks.iter().map(String::as_str).collect();
 
     mmr.append(&c(4)).unwrap();
-    let leaf_root = hex0x(&mmr.root());
-    let leaf_peaks: Vec<String> = mmr.peaks.iter().map(|p| hex0x(p)).collect();
-    let leaf_peaks: Vec<&str> = leaf_peaks.iter().map(String::as_str).collect();
-
-    let claimed = if tamper {
-        hex0x(&[0xee; 32])
+    let leaf_peaks: Vec<String> = if tamper {
+        vec![hex0x(&[0xee; 32])]
     } else {
-        leaf_root
+        mmr.peaks.iter().map(|p| hex0x(p)).collect()
     };
+    let leaf_peaks: Vec<&str> = leaf_peaks.iter().map(String::as_str).collect();
     table(json!({
         "ok": true,
         "columns": ["namespace", "index", "selector", "data", "block_num", "log_idx"],
         "rows": [
             [
                 topic(REGISTRY), topic("0"), LEAVES_APPENDED_TOPIC,
-                leaves_data(3, &[(&hex0x(&pair), 1), (&hex0x(&hash_leaf(&c(3))), 0)], &batch_root, &batch_peaks, b"{}"),
+                leaves_data(3, &[(&hex0x(&pair), 1), (&hex0x(&hash_leaf(&c(3))), 0)], &batch_peaks, b"{}"),
                 5, 0,
             ],
             [
                 topic(REGISTRY), topic("3"), LEAF_APPENDED_TOPIC,
-                leaf_data(&hex0x(&c(4)), &claimed, &leaf_peaks, b"four"),
+                leaf_data(&hex0x(&c(4)), &leaf_peaks, b"four"),
                 6, 1,
             ],
         ],
@@ -870,15 +862,13 @@ fn a_namespaces_history_folds_to_the_root_its_events_carry() {
 }
 
 #[test]
-fn an_event_whose_root_disagrees_with_the_fold_is_inconsistent() {
+fn an_event_whose_peaks_disagree_with_the_fold_is_inconsistent() {
     // The index's own copy of the log contradicting itself — which is not the
     // chain being wrong, and is reported apart from a mismatch against it.
     let appends = parse_appends(&history_rows(true)).expect("two appends");
     let folded = fold(REGISTRY, &appends);
     assert_eq!(folded.inconsistent.len(), 1, "{:?}", folded.inconsistent);
-    assert!(folded.inconsistent[0]
-        .detail
-        .contains("the event says root"));
+    assert!(folded.inconsistent[0].detail.contains("bag to"));
     assert_eq!(folded.inconsistent[0].block_num, 6);
 }
 
@@ -891,24 +881,23 @@ fn an_event_the_precompile_would_have_refused_ends_the_fold_as_inconsistent() {
     let root = hex0x(&mmr.root());
     let peaks: Vec<String> = mmr.peaks.iter().map(|p| hex0x(p)).collect();
     let peaks: Vec<&str> = peaks.iter().map(String::as_str).collect();
-    let bogus = hex0x(&[0xee; 32]);
     let appends = parse_appends(&table(json!({
         "ok": true,
         "columns": ["namespace", "index", "selector", "data", "block_num", "log_idx"],
         "rows": [
             [
                 topic(REGISTRY), topic("0"), LEAF_APPENDED_TOPIC,
-                leaf_data(&hex0x(&c(1)), &root, &peaks, b"one"),
+                leaf_data(&hex0x(&c(1)), &peaks, b"one"),
                 5, 0,
             ],
             [
                 topic(REGISTRY), topic("1"), LEAVES_APPENDED_TOPIC,
-                leaves_data(3, &[(&hex0x(&[0x77; 32]), 1)], &bogus, &peaks, b"{}"),
+                leaves_data(3, &[(&hex0x(&[0x77; 32]), 1)], &peaks, b"{}"),
                 6, 0,
             ],
             [
                 topic(REGISTRY), topic("3"), LEAF_APPENDED_TOPIC,
-                leaf_data(&hex0x(&c(4)), &bogus, &peaks, b"four"),
+                leaf_data(&hex0x(&c(4)), &peaks, b"four"),
                 7, 0,
             ],
         ],

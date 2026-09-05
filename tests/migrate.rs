@@ -111,7 +111,7 @@ fn the_mmr_is_hashed_as_the_precompile_hashes_it() {
         "0xff324afacd068a01dda359c03c1589d703eb1a70b26a7aa3c6526e965e0e67c2"
     );
     assert!(
-        leaves_call(&chunks, "{}").starts_with("0x1afcfa4f"),
+        leaves_call(&chunks, "{}").starts_with("0x7150c2c6"),
         "appendLeaves' selector"
     );
     assert_eq!(
@@ -119,25 +119,22 @@ fn the_mmr_is_hashed_as_the_precompile_hashes_it() {
         format!("0x{}", "00".repeat(32)),
         "empty is zero, as the root is"
     );
-    // The whole call, against an independent encoder: two chunks, then the metadata.
+    // The whole call, against an independent encoder: two chunks as pairs, then the metadata.
     let (h1, r1) = chunks[0];
     let (h0, r0) = chunks[1];
     assert_eq!(
         leaves_call(&chunks, "{}"),
         format!(
-            "0x1afcfa4f\
-             {:064x}{:064x}{:064x}\
-             {:064x}{}{}\
-             {:064x}{:064x}{:064x}\
+            "0x7150c2c6\
+             {:064x}{:064x}\
+             {:064x}{}{:064x}{}{:064x}\
              {:064x}{:0<64}",
-            0x60,
-            0xc0,
-            0x120,
+            0x40,
+            0xe0,
             2,
             hex::encode(r1),
-            hex::encode(r0),
-            2,
             h1,
+            hex::encode(r0),
             h0,
             2,
             hex::encode("{}"),
@@ -179,7 +176,7 @@ fn a_registry_loads_as_leaves_under_root_mmr() {
         "what the step leaves behind"
     );
     assert!(
-        planned.steps[1].data.starts_with("0x1afcfa4f"),
+        planned.steps[1].data.starts_with("0x7150c2c6"),
         "an appendLeaves call"
     );
 }

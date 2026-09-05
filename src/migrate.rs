@@ -486,36 +486,28 @@ pub fn mmr_root(chunks: &[(u8, [u8; 32])]) -> String {
     hex0x(&bag(&peaks))
 }
 
-/// `appendLeaves(bytes32[] chunkRoots, uint8[] chunkHeights, bytes metadata)`.
+/// `appendLeaves((bytes32 root, uint8 height)[] chunks, bytes metadata)`: a chunk is a static
+/// pair, so the array is its length and then two words per chunk.
 pub fn leaves_call(chunks: &[(u8, [u8; 32])], metadata: &str) -> String {
     let word = |n: usize| {
         let mut w = [0u8; 32];
         w[24..].copy_from_slice(&(n as u64).to_be_bytes());
         w
     };
-    let array = |words: Vec<[u8; 32]>| {
-        let mut tail = word(words.len()).to_vec();
-        tail.extend(words.concat());
-        tail
-    };
-    let roots = array(chunks.iter().map(|(_, root)| *root).collect());
-    let heights = array(
-        chunks
-            .iter()
-            .map(|(height, _)| word(*height as usize))
-            .collect(),
-    );
+    let mut pairs = word(chunks.len()).to_vec();
+    for (height, root) in chunks {
+        pairs.extend_from_slice(root);
+        pairs.extend_from_slice(&word(*height as usize));
+    }
     let mut bytes = word(metadata.len()).to_vec();
     bytes.extend_from_slice(metadata.as_bytes());
     bytes.resize(bytes.len().next_multiple_of(32), 0);
 
-    let head_len = 3 * 32;
-    let mut data = selector("appendLeaves(bytes32[],uint8[],bytes)").to_vec();
+    let head_len = 2 * 32;
+    let mut data = selector("appendLeaves((bytes32,uint8)[],bytes)").to_vec();
     data.extend(word(head_len));
-    data.extend(word(head_len + roots.len()));
-    data.extend(word(head_len + roots.len() + heights.len()));
-    data.extend(roots);
-    data.extend(heights);
+    data.extend(word(head_len + pairs.len()));
+    data.extend(pairs);
     data.extend(bytes);
     hex0x(&data)
 }

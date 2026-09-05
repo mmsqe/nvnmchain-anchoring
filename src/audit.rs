@@ -224,7 +224,10 @@ pub fn fold(namespace: &str, history: &[Append]) -> Folded {
             folded.note(
                 namespace,
                 append,
-                format!("the event says root {}, the fold {root}", append.root),
+                format!(
+                    "the event's peaks bag to {}, the fold's to {root}",
+                    append.root
+                ),
             );
         }
     }
