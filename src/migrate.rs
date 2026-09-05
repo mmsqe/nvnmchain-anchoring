@@ -202,6 +202,10 @@ pub struct Options {
     /// Prefix a root record's `uri` is built from, so the file it commits to can
     /// be fetched: `{base}/{file}`.
     pub uri_base: String,
+    /// A status the replay leaves out: every row of the module's export carries
+    /// `Active`, a call and a leaf saying nothing. The record still lands. A plan
+    /// made without this lists those calls, so `reconcile` reports them as owed.
+    pub skip_status: Option<String>,
 }
 
 /// The plan, and what it adds up to.
@@ -346,8 +350,9 @@ fn replay(
 
         // Status was a field on the record and is a per-version anchor now, so a
         // record that carried one needs a second call against the version it
-        // belongs to.
-        if !record.status.is_empty() {
+        // belongs to — unless it carried the one value the caller left out.
+        let status = record.status.as_str();
+        if !status.is_empty() && opts.skip_status.as_deref() != Some(status) {
             gas += GAS_FIRST_VERSION;
             let data = update_status_call(&record.checksum, *version, &record.status);
             let step = push(steps, Kind::Status, &registry.name, data);

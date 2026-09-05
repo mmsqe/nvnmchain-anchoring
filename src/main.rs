@@ -13,7 +13,8 @@ const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds|serve|\n\
      records <registry>|roles <registry>|\n\
      record <registry> <checksum>|checksum <checksum>|\n\
      migrate --registries=<file> --manifest=<file> [--export=<dir>]\n\
-             [--threshold=<n>] [--root=merkle|sha256|mmr] [--uri-base=<url>]|\n\
+             [--threshold=<n>] [--root=merkle|sha256|mmr] [--uri-base=<url>]\n\
+             [--skip-status=<status>]|\n\
      reconcile --plan=<file> [--remaining=<file>]]";
 
 /// `--flag=value` off the command line, or the default.
@@ -21,6 +22,19 @@ fn flag(name: &str, default: &str) -> String {
     std::env::args()
         .find_map(|arg| arg.strip_prefix(&format!("--{name}=")).map(str::to_string))
         .unwrap_or_else(|| default.to_string())
+}
+
+/// Refuse a `--flag` the command does not take: [`flag`] reads by name, so one
+/// misspelt or not yet built would otherwise be dropped without a word.
+fn only_flags(command: &str, known: &[&str]) {
+    for arg in std::env::args().skip(2).filter(|a| a.starts_with("--")) {
+        let name = arg.trim_start_matches("--");
+        let name = name.split_once('=').map_or(name, |(n, _)| n);
+        if !known.contains(&name) {
+            eprintln!("{command} does not take --{name}\n{USAGE}");
+            std::process::exit(2);
+        }
+    }
 }
 
 fn required(command: &str, name: &str) -> String {
@@ -37,6 +51,18 @@ fn required(command: &str, name: &str) -> String {
 /// Reads no chain: it needs the export and nothing else, so it runs before the
 /// settings every other command is configured by.
 fn print_plan() -> Result<()> {
+    only_flags(
+        "migrate",
+        &[
+            "registries",
+            "manifest",
+            "export",
+            "threshold",
+            "root",
+            "uri-base",
+            "skip-status",
+        ],
+    );
     let read = |name: &str| -> Result<Vec<u8>> {
         let path = required("migrate", name);
         std::fs::read(&path).with_context(|| format!("read {path}"))
@@ -56,6 +82,7 @@ fn print_plan() -> Result<()> {
         },
         export_dir: flag("export", ".").into(),
         uri_base: flag("uri-base", "file://export"),
+        skip_status: Some(flag("skip-status", "")).filter(|status| !status.is_empty()),
     };
 
     let plan = migrate::plan(&registries, &manifest, &opts)?;
@@ -180,6 +207,7 @@ async fn main() -> Result<()> {
             }
         }
         "reconcile" => {
+            only_flags("reconcile", &["plan", "remaining"]);
             let ctx = service::Ctx { tidx, cfg };
             let path = required("reconcile", "plan");
             let plan = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;

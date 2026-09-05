@@ -53,6 +53,7 @@ impl Export {
             root: Root::Merkle,
             export_dir: self.dir.clone(),
             uri_base: "https://export.example/legacy".into(),
+            skip_status: None,
         }
     }
 }
@@ -180,6 +181,42 @@ fn a_registry_loads_as_leaves_under_root_mmr() {
     assert!(
         planned.steps[1].data.starts_with("0x1afcfa4f"),
         "an appendLeaves call"
+    );
+}
+
+#[test]
+fn a_status_the_caller_leaves_out_is_not_planned() {
+    // Left out, the record still lands and any other status is planned as before.
+    let export = Export::new("skip-status");
+    let file = export.tranche(
+        "r",
+        &[
+            record("r", "aaa", "ipfs://a", "Active"),
+            record("r", "bbb", "ipfs://b", "approved"),
+            record("r", "ccc", "ipfs://c", ""),
+        ],
+    );
+    let opts = Options {
+        skip_status: Some("Active".into()),
+        ..export.opts(10)
+    };
+    let steps = plan(&registries(&["r"]), &manifest(vec![file]), &opts)
+        .expect("a plan")
+        .steps;
+    let planned: Vec<(Kind, Option<&str>)> = steps
+        .iter()
+        .map(|s| (s.kind, s.status.as_deref()))
+        .collect();
+    assert_eq!(
+        planned,
+        [
+            (Kind::Deploy, None),
+            (Kind::Record, None),
+            (Kind::Record, None),
+            (Kind::Status, Some("approved")),
+            (Kind::Record, None),
+        ],
+        "the Active status is left out; the other is planned"
     );
 }
 
