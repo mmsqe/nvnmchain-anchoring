@@ -1,19 +1,53 @@
 {
   "source": "git@github.com:NVNM-Chain/nvnmchain-contracts.git",
-  "commit": "be289fc95a203bbfab19bd217098c34b7da66fa9",
+  "commit": "78d57431566705e85985c1fdf5d8b08d646b00ae",
   "note": "Regenerate with: make fixtures",
   "events": [
     {
-      "name": "Anchored",
+      "name": "LeafAppended",
       "inputs": [
         {
           "type": "address"
         },
         {
-          "type": "bytes32"
+          "type": "uint256"
         },
         {
           "type": "bytes32"
+        },
+        {
+          "type": "bytes32[]"
+        },
+        {
+          "type": "bytes"
+        }
+      ]
+    },
+    {
+      "name": "LeavesAppended",
+      "inputs": [
+        {
+          "type": "address"
+        },
+        {
+          "type": "uint256"
+        },
+        {
+          "type": "uint256"
+        },
+        {
+          "type": "tuple[]",
+          "components": [
+            {
+              "type": "bytes32"
+            },
+            {
+              "type": "uint8"
+            }
+          ]
+        },
+        {
+          "type": "bytes32[]"
         },
         {
           "type": "bytes"

@@ -1,22 +1,16 @@
-//! Reading a `Registry` payload out of anchored metadata.
+//! Reading a `Registry` payload out of a leaf's metadata.
 
-use crate::eth::{
-    hex0x, keccak_hex, normalize_hex, strip_hex, word_to_address, word_to_u128, word_to_usize,
-};
+use crate::eth::{hex0x, normalize_hex, word_to_address, word_to_u128, word_to_usize};
 
-// Every envelope leads with a `bytes32` kind, so one word identifies the shape.
-// The ids in the payload must then reproduce the key it was anchored under,
-// `keccak256(abi.encode(kind, ids…))` — which catches a schema that has drifted
-// from the contract, and binds the payload to the key rather than letting one
-// from elsewhere read as an envelope.
+// Every envelope leads with a `bytes32` kind, so one word identifies the shape, and
+// the layout is then read strictly: tails packed in field order with nothing left
+// over. That keeps out a payload that merely resembles an envelope; a crafted one is
+// kept out by `Registry.appendLeaf`, which refuses a bare leaf leading with `record`
+// or `status`.
 //
-// There was an untagged format once, identified by that key derivation alone.
-// It never shipped: one contract per registry is a fresh deployment, so no
-// build predating the kind tags can ever have emitted one.
-//
-// No registryId in any key. The registry is the address the envelope was
-// anchored under, so a payload only means something with its namespace beside
-// it — the same commitment under two registries is two different records.
+// No registry id in any envelope. The registry is the namespace the leaf was
+// appended under, so a payload only means something with its namespace beside it —
+// the same envelope under two registries is two different records.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Ty {
@@ -34,22 +28,19 @@ enum Ty {
 struct Schema {
     kind: &'static str,
     fields: &'static [(&'static str, Ty)],
-    /// Field positions of the ids that make up the anchored key, in the order
-    /// the contract hashes them.
-    key_ids: &'static [usize],
 }
 
-/// Each schema is one `abi.encode` call in `Registry.sol`, paired with the
-/// `*Key()` helper naming the slot it is anchored at.
+/// Each schema is one `abi.encode` call in `Registry.sol`.
 ///
-/// Two kinds, not four. `registry` went with the wrapper: name, description and
-/// metadata ride in the factory's deployment event now, descriptive and set
-/// once, so there is nothing to prove and no envelope to decode. `acl` went with
-/// the anchoring of role changes: membership is the registry's own state and its
-/// history is its own events, which carry every field.
+/// Two kinds. `registry` went with the wrapper: name, description and metadata
+/// ride in the factory's deployment event, descriptive and set once, so there is
+/// nothing to prove and no envelope to decode. `acl` went with the anchoring of
+/// role changes: membership is the registry's own state and its history is its
+/// own events, which carry every field. The MMR itself has no envelope either —
+/// the precompile's events carry its count and peaks.
 const SCHEMAS: &[Schema] = &[
     Schema {
-        // addRecord → recordKey(checksum_hash)
+        // addRecord
         kind: "record",
         fields: &[
             ("checksum_hash", Ty::Hash),
@@ -64,10 +55,9 @@ const SCHEMAS: &[Schema] = &[
             ("author", Ty::Address),
             ("timestamp", Ty::Uint),
         ],
-        key_ids: &[0],
     },
     Schema {
-        // updateRecordStatus → statusKey(checksum_hash, index)
+        // updateRecordStatus
         kind: "status",
         fields: &[
             ("checksum_hash", Ty::Hash),
@@ -76,7 +66,6 @@ const SCHEMAS: &[Schema] = &[
             ("author", Ty::Address),
             ("seq", Ty::Uint),
         ],
-        key_ids: &[0, 1],
     },
 ];
 
@@ -94,14 +83,19 @@ impl Envelope {
             .find(|(n, _)| *n == name)
             .map_or("", |(_, v)| v.as_str())
     }
+
+    /// The `checksum_hash` both kinds lead with, lowercased.
+    pub fn checksum_hash(&self) -> String {
+        normalize_hex(self.field("checksum_hash"))
+    }
 }
 
 /// How a payload reads, in descending order of confidence.
 #[derive(Debug, Clone)]
 pub enum Payload {
-    /// A `Registry` envelope, identified by the key it is under.
+    /// A `Registry` envelope.
     Envelope(Envelope),
-    /// Self-describing text — what plain EOA anchors carry in practice.
+    /// Self-describing text — what a plain EOA's leaves carry in practice.
     Json(serde_json::Value),
     /// Printable text that is not JSON.
     Text(String),
@@ -109,10 +103,10 @@ pub enum Payload {
     Opaque,
 }
 
-/// Read a payload, most meaningful reading first. Anything may be anchored, so
+/// Read a payload, most meaningful reading first. Anything may be a leaf, so
 /// `Opaque` is a normal answer.
-pub fn read_payload(key: &str, metadata: &[u8]) -> Payload {
-    if let Some(envelope) = decode_envelope(key, metadata) {
+pub fn read_payload(metadata: &[u8]) -> Payload {
+    if let Some(envelope) = decode_envelope(metadata) {
         return Payload::Envelope(envelope);
     }
     let Ok(text) = std::str::from_utf8(metadata) else {
@@ -141,28 +135,29 @@ pub fn decode_strings(names: &[&'static str], data: &[u8]) -> Option<Vec<(&'stat
     Some(names.iter().copied().zip(values).collect())
 }
 
-/// Decode the `Registry` envelope anchored at `key`, or `None` when
-/// `metadata` is not one.
-pub fn decode_envelope(key: &str, metadata: &[u8]) -> Option<Envelope> {
-    let key = normalize_hex(key);
-    SCHEMAS
-        .iter()
-        .find_map(|schema| decode_as(schema, metadata, &key))
+/// `abi.encode(uint256, string)` — what `RecordStatusUpdated` puts in its data
+/// section after its indexed hash.
+pub fn decode_uint_string(data: &[u8]) -> Option<(u64, String)> {
+    let (values, _) = decode_strict(&[("n", Ty::Uint), ("s", Ty::Str)], data)?;
+    Some((values[0].parse().ok()?, values[1].clone()))
 }
 
-/// One attempt, kept only if the ids reproduce the anchored key.
-fn decode_as(schema: &'static Schema, metadata: &[u8], key: &str) -> Option<Envelope> {
+/// Decode the `Registry` envelope in `metadata`, or `None` when it is not one.
+pub fn decode_envelope(metadata: &[u8]) -> Option<Envelope> {
+    SCHEMAS
+        .iter()
+        .find_map(|schema| decode_as(schema, metadata))
+}
+
+/// One attempt, kept only if the leading kind is this schema's and the layout is exact.
+fn decode_as(schema: &'static Schema, metadata: &[u8]) -> Option<Envelope> {
     let mut layout: Vec<(&'static str, Ty)> = Vec::with_capacity(schema.fields.len() + 1);
     layout.push(("kind", Ty::Bytes32));
     layout.extend_from_slice(schema.fields);
 
     let (values, words) = decode_strict(&layout, metadata)?;
-    // The leading kind rejects a wrong shape on one word, before the key is derived.
+    // The leading kind rejects a wrong shape on one word, before anything else is read.
     if bytes32_label(&words[0]) != schema.kind {
-        return None;
-    }
-    let ids: Vec<[u8; 32]> = schema.key_ids.iter().map(|i| words[*i + 1]).collect();
-    if derive_key(schema.kind, &ids) != key {
         return None;
     }
     Some(Envelope {
@@ -187,47 +182,6 @@ pub fn bytes32_label(word: &[u8; 32]) -> String {
         }
         _ => hex0x(word),
     }
-}
-
-/// The key a record stream is anchored under, from its checksum hash —
-/// `Registry.recordKey`, derived rather than read from the contract.
-///
-/// Deriving it is what makes a lookup *by checksum* possible at all: the key is
-/// the only thing the index is filtered on, and it comes from the checksum and
-/// nothing else. Which is also why the same checksum in two registries is the
-/// same key under two namespaces.
-pub fn record_key(checksum_hash: &str) -> Option<String> {
-    Some(derive_key("record", &[word(checksum_hash)?]))
-}
-
-/// The key one version's status is anchored under — `Registry.statusKey`.
-pub fn status_key(checksum_hash: &str, index: u64) -> Option<String> {
-    Some(derive_key(
-        "status",
-        &[word(checksum_hash)?, usize_word(index as usize)],
-    ))
-}
-
-/// A 32-byte hex string as the word the contract hashed.
-fn word(hexed: &str) -> Option<[u8; 32]> {
-    hex::decode(strip_hex(hexed)).ok()?.try_into().ok()
-}
-
-/// `keccak256(abi.encode(kind, ids…))`, over the ids as their raw words so no
-/// re-encoding can misrepresent them.
-fn derive_key(kind: &str, ids: &[[u8; 32]]) -> String {
-    let mut encoded = Vec::with_capacity(32 * (ids.len() + 3));
-    // Head: the offset of the dynamic `kind` string, then the static ids.
-    encoded.extend_from_slice(&usize_word(32 * (1 + ids.len())));
-    for id in ids {
-        encoded.extend_from_slice(id);
-    }
-    // Tail: the string's length and its right-padded bytes (all kinds are short).
-    encoded.extend_from_slice(&usize_word(kind.len()));
-    let mut padded = [0u8; 32];
-    padded[..kind.len()].copy_from_slice(kind.as_bytes());
-    encoded.extend_from_slice(&padded);
-    keccak_hex(&encoded)
 }
 
 /// Decode a fixed field list, accepting only the exact layout `abi.encode`
@@ -276,14 +230,8 @@ fn decode_strict(fields: &[(&str, Ty)], data: &[u8]) -> Option<(Vec<String>, Vec
     Some((values, words))
 }
 
-fn usize_word(value: usize) -> [u8; 32] {
-    let mut word = [0u8; 32];
-    word[24..].copy_from_slice(&(value as u64).to_be_bytes());
-    word
-}
-
-/// Whether the commitment is `keccak256(metadata)` — what `anchorAndHash`
-/// writes, making the logged payload self-verifying.
+/// Whether the commitment is `keccak256(metadata)` — what the registry commits
+/// to, making every record leaf self-verifying.
 pub fn is_self_verifying(commitment: &str, metadata: &[u8]) -> bool {
-    keccak_hex(metadata) == normalize_hex(commitment)
+    crate::eth::keccak_hex(metadata) == normalize_hex(commitment)
 }

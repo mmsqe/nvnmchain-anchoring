@@ -8,8 +8,9 @@ use std::path::PathBuf;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use nvnmchain_anchoring::migrate::{
-    add_record_call, addressed, deploy_registry_call, merkle_root, plan, reconcile,
-    update_status_call, Held, Kind, Manifest, Mode, Options, RegistryImport, Root,
+    add_record_call, addressed, deploy_registry_call, leaves_call, merkle_root, mmr_chunks,
+    mmr_root, plan, reconcile, update_status_call, Held, Kind, Manifest, Mode, Options,
+    RegistryImport, Root,
 };
 use sha2::{Digest, Sha256};
 
@@ -52,6 +53,7 @@ impl Export {
             root: Root::Merkle,
             export_dir: self.dir.clone(),
             uri_base: "https://export.example/legacy".into(),
+            skip_status: None,
         }
     }
 }
@@ -92,6 +94,181 @@ fn manifest(files: Vec<serde_json::Value>) -> Manifest {
         "files": files,
     }))
     .expect("manifest")
+}
+
+#[test]
+fn the_mmr_is_hashed_as_the_precompile_hashes_it() {
+    // Pinned in Python with keccak: three lines' root, and the selector the call carries.
+    let lines = [b"a".to_vec(), b"b".to_vec(), b"c".to_vec()];
+    let chunks = mmr_chunks(&lines);
+    assert_eq!(
+        chunks.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+        [1, 0],
+        "a pair, then one"
+    );
+    assert_eq!(
+        mmr_root(&chunks),
+        "0xff324afacd068a01dda359c03c1589d703eb1a70b26a7aa3c6526e965e0e67c2"
+    );
+    assert!(
+        leaves_call(&chunks, "{}").starts_with("0x7150c2c6"),
+        "appendLeaves' selector"
+    );
+    assert_eq!(
+        mmr_root(&[]),
+        format!("0x{}", "00".repeat(32)),
+        "empty is zero, as the root is"
+    );
+    // The whole call, against an independent encoder: two chunks as pairs, then the metadata.
+    let (h1, r1) = chunks[0];
+    let (h0, r0) = chunks[1];
+    assert_eq!(
+        leaves_call(&chunks, "{}"),
+        format!(
+            "0x7150c2c6\
+             {:064x}{:064x}\
+             {:064x}{}{:064x}{}{:064x}\
+             {:064x}{:0<64}",
+            0x40,
+            0xe0,
+            2,
+            hex::encode(r1),
+            h1,
+            hex::encode(r0),
+            h0,
+            2,
+            hex::encode("{}"),
+        )
+    );
+}
+
+#[test]
+fn a_registry_loads_as_leaves_under_root_mmr() {
+    let export = Export::new("leaves");
+    let lines: Vec<String> = ["aaa", "bbb", "ccc", "ddd", "eee"]
+        .iter()
+        .map(|c| record("r", c, "ipfs://x", "Active"))
+        .collect();
+    let file = export.tranche("r", &lines);
+    let opts = Options {
+        root: Root::Mmr,
+        ..export.opts(0)
+    };
+    let planned = plan(&registries(&["r"]), &manifest(vec![file]), &opts).expect("a plan");
+
+    assert_eq!(planned.registries[0].mode, Mode::Leaves);
+    let kinds: Vec<_> = planned.steps.iter().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        [Kind::Deploy, Kind::Leaves],
+        "one call for the whole file"
+    );
+    let bytes: Vec<Vec<u8>> = lines.iter().map(|l| l.as_bytes().to_vec()).collect();
+    let chunks = mmr_chunks(&bytes);
+    assert_eq!(
+        chunks.iter().map(|(h, _)| *h).collect::<Vec<_>>(),
+        [2, 0],
+        "five rows: four, then one"
+    );
+    assert_eq!(
+        planned.steps[1].checksum,
+        Some(mmr_root(&chunks)),
+        "what the step leaves behind"
+    );
+    assert!(
+        planned.steps[1].data.starts_with("0x7150c2c6"),
+        "an appendLeaves call"
+    );
+}
+
+#[test]
+fn a_status_the_caller_leaves_out_is_not_planned() {
+    // Left out, the record still lands and any other status is planned as before.
+    let export = Export::new("skip-status");
+    let file = export.tranche(
+        "r",
+        &[
+            record("r", "aaa", "ipfs://a", "Active"),
+            record("r", "bbb", "ipfs://b", "approved"),
+            record("r", "ccc", "ipfs://c", ""),
+        ],
+    );
+    let opts = Options {
+        skip_status: Some("Active".into()),
+        ..export.opts(10)
+    };
+    let steps = plan(&registries(&["r"]), &manifest(vec![file]), &opts)
+        .expect("a plan")
+        .steps;
+    let planned: Vec<(Kind, Option<&str>)> = steps
+        .iter()
+        .map(|s| (s.kind, s.status.as_deref()))
+        .collect();
+    assert_eq!(
+        planned,
+        [
+            (Kind::Deploy, None),
+            (Kind::Record, None),
+            (Kind::Record, None),
+            (Kind::Status, Some("approved")),
+            (Kind::Record, None),
+        ],
+        "the Active status is left out; the other is planned"
+    );
+}
+
+#[test]
+fn a_leaves_step_is_judged_by_what_the_registry_was_first_loaded_with() {
+    let export = Export::new("leaves-reconcile");
+    let file = export.tranche(
+        "r",
+        &[
+            record("r", "aaa", "ipfs://a", ""),
+            record("r", "bbb", "ipfs://b", ""),
+        ],
+    );
+    let opts = Options {
+        root: Root::Mmr,
+        ..export.opts(0)
+    };
+    let steps = plan(&registries(&["r"]), &manifest(vec![file]), &opts)
+        .expect("a plan")
+        .steps;
+    let planned_root = steps[1].checksum.clone().unwrap();
+    let held: BTreeMap<String, Held> = [("r".to_string(), Some(vec![]))].into(); // deployed, empty
+
+    // `roots` is what each registry's first append left.
+    let judge = |root: Option<&str>| {
+        let roots: BTreeMap<String, String> = root
+            .map(|r| ("r".to_string(), r.to_string()))
+            .into_iter()
+            .collect();
+        reconcile(&steps, &held, &roots)
+    };
+    let owed = judge(None);
+    assert_eq!(
+        owed.remaining.iter().map(|s| s.kind).collect::<Vec<_>>(),
+        [Kind::Leaves],
+        "no MMR yet: owed"
+    );
+    assert!(owed.divergences.is_empty());
+
+    let landed = judge(Some(&planned_root));
+    assert!(
+        landed.remaining.is_empty() && landed.divergences.is_empty(),
+        "the first append left the planned root"
+    );
+
+    let other = judge(Some("0xdead"));
+    assert!(
+        other.remaining.is_empty(),
+        "the chunks were cut for an empty tree; sending them now would only be refused"
+    );
+    assert!(
+        other.divergences[0].detail.contains("first append"),
+        "{}",
+        other.divergences[0].detail
+    );
 }
 
 #[test]
@@ -341,7 +518,11 @@ fn a_step_that_did_not_land_is_owed_and_one_sent_twice_is_a_divergence() {
         ],
     );
     let against = |records: Vec<nvnmchain_anchoring::registry::Record>| {
-        reconcile(&steps, &BTreeMap::from([("r".to_string(), Some(records))]))
+        reconcile(
+            &steps,
+            &BTreeMap::from([("r".to_string(), Some(records))]),
+            &BTreeMap::new(),
+        )
     };
     let landed = || vec![served("aaa", 2, Some("approved")), served("bbb", 1, None)];
 
@@ -403,11 +584,15 @@ fn what_is_left_to_send_is_decided_against_the_chain() {
         ],
     );
     let left = |held: Held| {
-        reconcile(&steps, &BTreeMap::from([("r".to_string(), held)]))
-            .remaining
-            .iter()
-            .map(|s| (s.kind, s.checksum.clone(), s.version))
-            .collect::<Vec<_>>()
+        reconcile(
+            &steps,
+            &BTreeMap::from([("r".to_string(), held)]),
+            &BTreeMap::new(),
+        )
+        .remaining
+        .iter()
+        .map(|s| (s.kind, s.checksum.clone(), s.version))
+        .collect::<Vec<_>>()
     };
 
     // Nothing deployed: the whole plan, deploy included.
