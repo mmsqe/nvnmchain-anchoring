@@ -118,7 +118,7 @@ impl Append {
     /// namespace has, is what its MMR holds.
     pub fn count(&self) -> u64 {
         match self.what {
-            Appended::Leaf { index, .. } => index + 1,
+            Appended::Leaf { index, .. } => index.saturating_add(1),
             Appended::Leaves { count, .. } => count,
         }
     }

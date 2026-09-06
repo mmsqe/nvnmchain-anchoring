@@ -246,10 +246,14 @@ fn replay(mmr: &mut Mmr, what: &Appended) -> Result<u64> {
             chunk_heights,
             ..
         } => {
-            let mut added = 0;
+            let mut added: u64 = 0;
             for (root, height) in chunk_roots.iter().zip(chunk_heights) {
                 mmr.push(*height, word(root)?)?;
-                added += 1u64 << height;
+                // `push` refused any height a count cannot hold, so the shift is sound; the
+                // sum is what the index could still overflow.
+                added = added
+                    .checked_add(1u64 << height)
+                    .context("more leaves than a count holds")?;
             }
             Ok(added)
         }

@@ -652,6 +652,10 @@ pub struct RecordAt {
 /// event's less one, taking `log_idx` for the receipt's `logIndex`, numbered across
 /// the block. An event with no leaf beside it — some other contract's `RecordAdded`,
 /// or an index missing a row — pairs with `None`.
+///
+/// That adjacency is a contract invariant, not a coincidence: `addRecord` appends, then
+/// emits, with nothing logged between. A registry that came to log something in between
+/// would surface here first, as every version reading as foreign.
 pub fn pair_leaves<'a>(
     events: &'a [RecordEvent],
     leaves: &'a [Leaf],

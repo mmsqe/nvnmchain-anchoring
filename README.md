@@ -223,9 +223,8 @@ precompile uses — a leaf is `keccak256("leaf" ‖ c)`, a merge
 `keccak256("merge" ‖ l ‖ r)`, the root bags the peaks highest first — and the
 result compared with `state()` on the node at the same block, the log in one walk
 and the state a few hundred namespaces per request. Every leaf the index ever saw
-for a namespace is
-under that root, which is what a slot per key could never say: the head model
-checked only keys the index already knew.
+for a namespace is under that root, which is what a slot per key could never say:
+the head model checked only keys the index already knew.
 
 Each event's own root is checked against the fold up to it, so the index's copy
 of the log contradicting itself is reported apart from the chain disagreeing

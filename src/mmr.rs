@@ -51,6 +51,11 @@ impl Mmr {
                 self.count
             );
         }
+        // Settled before any peak moves, so a refused push changes nothing.
+        let count = self
+            .count
+            .checked_add(size)
+            .with_context(|| format!("a chunk of height {height} overflows the count"))?;
         let mut node = node;
         let mut height = u32::from(height);
         while self.count.checked_shr(height).unwrap_or(0) & 1 == 1 {
@@ -62,7 +67,7 @@ impl Mmr {
             height += 1;
         }
         self.peaks.push(node);
-        self.count += size;
+        self.count = count;
         Ok(())
     }
 
