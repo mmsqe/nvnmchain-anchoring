@@ -1,31 +1,30 @@
-//! Reading a `Registry` payload out of anchored metadata.
+//! Reading a `Registry` payload out of a leaf's metadata.
 //!
-//! Every envelope leads with a `bytes32` kind, so one word identifies the shape; the ids
-//! inside must then reproduce the key it was anchored under, which catches a schema that has
-//! drifted from the contract and binds the payload to its key. Payloads are dumped from a
-//! forge run against the shipped contract — re-encoding them here would only check the
-//! decoder against its own guess.
+//! Every envelope leads with a `bytes32` kind, so one word identifies the shape, and the
+//! layout is then read strictly, which is what keeps a foreign payload from reading as a
+//! record. Payloads are dumped from a forge run against the shipped contract — re-encoding
+//! them here would only check the decoder against its own guess.
 
 mod common;
 
 use common::{
-    bytes, AUTHOR, RECORD_COMMITMENT, RECORD_KEY, RECORD_METADATA, STATUS_COMMITMENT, STATUS_KEY,
+    bytes, AUTHOR, FIXTURE_HASH, RECORD_COMMITMENT, RECORD_METADATA, STATUS_COMMITMENT,
     STATUS_METADATA,
 };
-use nvnmchain_anchoring::envelope::{decode_envelope, is_self_verifying, read_payload, Payload};
+use nvnmchain_anchoring::envelope::{
+    decode_envelope, decode_uint_string, is_self_verifying, read_payload, Payload,
+};
 
-fn decoded(key: &str, metadata: &str) -> nvnmchain_anchoring::envelope::Envelope {
-    decode_envelope(key, &bytes(metadata)).expect("decodes as an envelope")
+fn decoded(metadata: &str) -> nvnmchain_anchoring::envelope::Envelope {
+    decode_envelope(&bytes(metadata)).expect("decodes as an envelope")
 }
 
 #[test]
 fn record_envelope_decodes() {
-    let env = decoded(RECORD_KEY, RECORD_METADATA);
+    let env = decoded(RECORD_METADATA);
     assert_eq!(env.kind, "record");
-    assert_eq!(
-        env.field("checksum_hash"),
-        "0x851bb152e67e6c958ab7da1431fcaed09ce0efc598885f69a750b3b4b81fc1dc"
-    );
+    assert_eq!(env.field("checksum_hash"), FIXTURE_HASH);
+    assert_eq!(env.checksum_hash(), FIXTURE_HASH);
     assert_eq!(env.field("index"), "1");
     assert_eq!(env.field("uri"), "ipfs://cid");
     assert_eq!(env.field("checksum"), "0xabc");
@@ -45,12 +44,9 @@ fn record_envelope_decodes() {
 
 #[test]
 fn status_envelope_decodes() {
-    let env = decoded(STATUS_KEY, STATUS_METADATA);
+    let env = decoded(STATUS_METADATA);
     assert_eq!(env.kind, "status");
-    assert_eq!(
-        env.field("checksum_hash"),
-        "0x851bb152e67e6c958ab7da1431fcaed09ce0efc598885f69a750b3b4b81fc1dc"
-    );
+    assert_eq!(env.field("checksum_hash"), FIXTURE_HASH);
     assert_eq!(env.field("index"), "1");
     assert_eq!(env.field("status"), "approved");
     assert_eq!(env.field("author"), AUTHOR);
@@ -58,48 +54,48 @@ fn status_envelope_decodes() {
 }
 
 #[test]
-fn envelopes_are_identified_by_the_key_they_are_anchored_under() {
-    // The kind word says what shape to try; the key derivation says the ids inside are the
-    // ones it was actually anchored under. A record payload under a status key is neither.
-    assert!(decode_envelope(STATUS_KEY, &bytes(RECORD_METADATA)).is_none());
-    assert!(decode_envelope(RECORD_KEY, &bytes(STATUS_METADATA)).is_none());
+fn the_kind_word_decides_the_shape() {
+    // One word, read before anything else: a record payload never reads as a status and
+    // a status never as a record, so a leaf is classified from the log alone.
+    assert_eq!(decoded(RECORD_METADATA).kind, "record");
+    assert_eq!(decoded(STATUS_METADATA).kind, "status");
 }
 
 #[test]
-fn a_payload_under_the_wrong_key_is_refused() {
-    // Same shape, same kind, a key from another record: the ids no longer reproduce it.
-    let elsewhere = format!("0x{}", "5c".repeat(32));
-    assert!(decode_envelope(&elsewhere, &bytes(RECORD_METADATA)).is_none());
-}
-
-#[test]
-fn a_registry_id_is_no_longer_part_of_any_key() {
-    // recordKey(checksum_hash) — one id, not two. Were the old two-id derivation still in use,
-    // the shipped payload could not reproduce the key the contract anchored it under, and
-    // the test above would be the one failing.
-    let env = decoded(RECORD_KEY, RECORD_METADATA);
+fn a_registry_id_is_not_part_of_any_envelope() {
+    // The registry is the namespace the leaf was appended under, not a field.
+    let env = decoded(RECORD_METADATA);
     assert!(
         env.fields.iter().all(|(name, _)| *name != "registry_id"),
-        "the registry is the address it was anchored under, not a field: {:?}",
+        "{:?}",
         env.fields
     );
 }
 
 #[test]
 fn foreign_payloads_are_not_envelopes() {
-    // Anything may be anchored, so a payload that is not ours reads as something else
-    // rather than being forced into a schema.
-    for metadata in ["0x", "0x00", &format!("0x{}", "ab".repeat(64))] {
+    // Anything may be a leaf — a registry-scoped writer appends whatever it commits to —
+    // so a payload that is not ours reads as something else rather than being forced into
+    // a schema. A record with a word of slack after its tail is not ours either.
+    let mut padded = bytes(RECORD_METADATA);
+    padded.extend_from_slice(&[0u8; 32]);
+    for metadata in [
+        bytes("0x"),
+        bytes("0x00"),
+        bytes(&format!("0x{}", "ab".repeat(64))),
+        padded,
+    ] {
         assert!(
-            decode_envelope(RECORD_KEY, &bytes(metadata)).is_none(),
-            "{metadata}"
+            decode_envelope(&metadata).is_none(),
+            "{}",
+            hex::encode(metadata)
         );
     }
 }
 
 #[test]
-fn anchor_and_hash_payloads_are_self_verifying() {
-    // The precompile's own guarantee: anchorAndHash commits to the digest of its metadata,
+fn record_leaves_are_self_verifying() {
+    // The registry's own guarantee: a record leaf commits to the digest of its envelope,
     // which holds whatever the payload turns out to mean.
     assert!(is_self_verifying(
         RECORD_COMMITMENT,
@@ -117,21 +113,29 @@ fn anchor_and_hash_payloads_are_self_verifying() {
 
 #[test]
 fn payloads_that_are_not_envelopes_still_read() {
-    // A plain EOA anchors whatever it likes; the reading degrades rather than failing.
-    let key = format!("0x{}", "11".repeat(32));
+    // A plain EOA appends whatever it likes; the reading degrades rather than failing.
+    assert!(matches!(read_payload(br#"{"v":1}"#), Payload::Json(_)));
+    assert!(matches!(read_payload(b"hello"), Payload::Text(_)));
+    assert!(matches!(read_payload(&[0xff, 0xfe]), Payload::Opaque));
     assert!(matches!(
-        read_payload(&key, br#"{"v":1}"#),
-        Payload::Json(_)
+        read_payload(&bytes(RECORD_METADATA)),
+        Payload::Envelope(_)
     ));
-    assert!(matches!(read_payload(&key, b"hello"), Payload::Text(_)));
-    assert!(matches!(read_payload(&key, &[0xff, 0xfe]), Payload::Opaque));
 }
 
 #[test]
-fn a_registry_payload_reads_as_an_envelope() {
-    // ...and one that is ours takes the Envelope arm ahead of the fallbacks.
-    assert!(matches!(
-        read_payload(RECORD_KEY, &bytes(RECORD_METADATA)),
-        Payload::Envelope(_)
-    ));
+fn a_status_event_decodes_its_index_and_text() {
+    // `RecordStatusUpdated`'s data section: `abi.encode(uint256 index, string status)`.
+    let data = format!(
+        "0x{:064x}{:064x}{:064x}{:0<64}",
+        2,
+        0x40,
+        8,
+        hex::encode("approved")
+    );
+    assert_eq!(
+        decode_uint_string(&bytes(&data)),
+        Some((2, "approved".to_string()))
+    );
+    assert!(decode_uint_string(&bytes("0x00")).is_none());
 }

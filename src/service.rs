@@ -1,7 +1,7 @@
 //! An HTTP surface over the projections.
 //!
-//! The explorer renders a link to "the anchoring decoder" on every key page
-//! when `ANCHORING_URL` is set, and nothing was serving it. This is that.
+//! The explorer renders a link to "the anchoring decoder" on every namespace
+//! page when `ANCHORING_URL` is set, and nothing was serving it. This is that.
 //!
 //! Read-through: every request queries tidx, and nothing is kept here. A second
 //! store over the same log is what the explorer already is, and the measurements
@@ -9,9 +9,9 @@
 //! sizes this chain has — so materializing is a decision to make against numbers
 //! later, not a shape to start with.
 //!
-//! `/records` answers at each record's newest version, because that is what the
-//! chain keeps — one word per key. Earlier versions are in the log, and want
-//! their own endpoint rather than a field that could quietly be short.
+//! `/records` answers at each record's newest version; every version is a leaf,
+//! and history has its own endpoint rather than a field that could quietly be
+//! short.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -25,16 +25,17 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::config::Settings;
-use crate::envelope::{record_key, status_key};
 use crate::eth::{keccak_hex, parse_address};
 use crate::registry::{
-    deployment_sql, parse_record_ids, parse_records, parse_records_at, parse_registries,
-    parse_roles, parse_statuses, parse_versions, record_ids_sql, registries_sql, roles_sql,
-    Deployed, NameFilter, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY, ROLE_EVENTS,
+    deployment_sql, pair_leaves, parse_record_events, parse_record_ids, parse_records,
+    parse_registries, parse_roles, parse_status_events, record_added_sql, record_ids_sql,
+    records_at, registries_sql, roles_sql, status_updated_sql, statuses_of, versions_of, Deployed,
+    NameFilter, RecordEvent, StatusEvent, EVENTS_KEY, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY,
+    ROLE_EVENTS,
 };
 use crate::tidx::{
-    anchors_sql, parse_anchors, parse_heads, scoped_heads_sql, Head, Scope, Tidx, ANCHORS_KEY,
-    HEADS_KEY,
+    appends_sql, leaves_in_sql, leaves_sql, parse_appends, parse_leaves, Append, Edge, Leaf, Tidx,
+    APPENDS_KEY, LEAVES_KEY,
 };
 
 pub struct Ctx {
@@ -106,19 +107,16 @@ pub fn router(ctx: Arc<Ctx>) -> Router {
         .route("/registries/{address}/records/{checksum}", get(versions))
         .route("/records/{checksum}", get(records_for_checksum))
         .route("/registries/records", post(records_by_registry))
+        .route("/registries/{address}/mmr", get(mmr))
         .with_state(ctx)
 }
 
 /// One record's versions, oldest first — the history `/records` cannot carry.
 ///
-/// The only projection here that does not fold to heads: the chain keeps one word
-/// per key, so every version before the newest exists solely as the log row the
-/// head replaced.
-///
-/// A checksum with nothing anchored under it here is a 404, and the one "does not
-/// exist" this service can establish about a record — the query is over the
-/// registry's own namespace at a derived key, so an empty answer means nothing was
-/// ever anchored there rather than that something was missed.
+/// A checksum with nothing under it here is a 404, and the one "does not exist"
+/// this service can establish about a record: the lookup is on the indexed
+/// checksum hash under this registry's own address, so an empty answer means
+/// nothing was ever added there rather than that something was missed.
 async fn versions(
     State(ctx): State<Arc<Ctx>>,
     Path((address, checksum)): Path<(String, String)>,
@@ -130,28 +128,25 @@ async fn versions(
 pub async fn record_versions(ctx: &Ctx, address: &str, checksum: &str) -> Result<Value, ApiError> {
     let registry = registry_of(address)?;
     let hash = keccak_hex(checksum.as_bytes());
-    let key = record_key(&hash).expect("a keccak digest is a 32-byte word");
     let at = ctx.tidx.coverage().await?.tip_num;
     require_deployed(ctx, &registry, at).await?;
 
-    let anchors = parse_anchors(
-        &ctx.tidx
-            .paged(&[], ANCHORS_KEY, |after| {
-                anchors_sql(ctx.cfg.engine, &registry, &key, at, after)
-            })
-            .await?,
-    )?;
-    let mut versions = parse_versions(&anchors)?;
+    // The events say which transactions, and the leaf beside each carries the
+    // version's fields: a lookup on an indexed topic rather than a walk of the
+    // registry, which for one record would cost the whole of it.
+    let events = record_events(ctx, Some(&registry), &hash, at).await?;
+    let leaves = leaves_beside(ctx, std::slice::from_ref(&registry), &events, at).await?;
+    let (mut versions, other) = versions_of(&pair_leaves(&events, &leaves))?;
     if versions.is_empty() {
         return Err(not_found(format!(
             "no record with checksum `{checksum}` in registry {registry}"
         )));
     }
-
-    let keys = versions.iter().filter_map(|v| status_key(&hash, v.version));
-    let statuses = statuses_under(ctx, keys, at).await?;
+    let statuses = statuses_of(&status_events(ctx, Some(&registry), &hash, at).await?);
     for version in &mut versions {
-        version.status = status_of(&statuses, &registry, &hash, version.version);
+        version.status = statuses
+            .get(&(registry.to_lowercase(), version.version))
+            .cloned();
     }
 
     // The id the contract stopped assigning, so the detail view and the listing
@@ -162,10 +157,12 @@ pub async fn record_versions(ctx: &Ctx, address: &str, checksum: &str) -> Result
         "registry": registry,
         "checksum": checksum,
         "checksum_hash": hash,
-        "key": key,
         "number": numbers.get(&hash),
         "at_block": at,
         "versions": versions,
+        // `RecordAdded` rows with no record leaf beside them: another contract's,
+        // counted rather than renumbering this record's versions.
+        "other": other,
     }))
 }
 
@@ -192,15 +189,74 @@ async fn require_deployed(ctx: &Ctx, registry: &str, at: u64) -> Result<(), ApiE
     Ok(())
 }
 
-/// Every head under `scope`, walked to exhaustion.
-async fn heads_under(ctx: &Ctx, scope: &Scope, at: u64) -> Result<Vec<Head>> {
+/// Every `RecordAdded` for one checksum hash, oldest first — under one registry,
+/// or across every emitter.
+async fn record_events(
+    ctx: &Ctx,
+    registry: Option<&str>,
+    hash: &str,
+    at: u64,
+) -> Result<Vec<RecordEvent>> {
     let table = ctx
         .tidx
-        .paged(&[], HEADS_KEY, |after| {
-            scoped_heads_sql(ctx.cfg.engine, scope, at, after)
+        .paged(&[], EVENTS_KEY, |after| {
+            record_added_sql(ctx.cfg.engine, registry, hash, at, after)
         })
         .await?;
-    parse_heads(&table)
+    parse_record_events(&table)
+}
+
+/// The same for `RecordStatusUpdated`, whose status text is in the event itself.
+async fn status_events(
+    ctx: &Ctx,
+    registry: Option<&str>,
+    hash: &str,
+    at: u64,
+) -> Result<Vec<StatusEvent>> {
+    let table = ctx
+        .tidx
+        .paged(&[], EVENTS_KEY, |after| {
+            status_updated_sql(ctx.cfg.engine, registry, hash, at, after)
+        })
+        .await?;
+    parse_status_events(&table)
+}
+
+/// The leaves in the blocks `events` landed in, under `namespaces` — what
+/// [`pair_leaves`] matches each event against, fetched without walking a namespace.
+async fn leaves_beside(
+    ctx: &Ctx,
+    namespaces: &[String],
+    events: &[RecordEvent],
+    at: u64,
+) -> Result<Vec<Leaf>> {
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    let blocks: Vec<u64> = events
+        .iter()
+        .map(|e| e.block_num)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let table = ctx
+        .tidx
+        .paged(&[], LEAVES_KEY, |after| {
+            leaves_in_sql(ctx.cfg.engine, namespaces, &blocks, at, after)
+        })
+        .await?;
+    parse_leaves(&table)
+}
+
+/// Every leaf under `scope`, walked to exhaustion, in log order.
+async fn leaves_under(ctx: &Ctx, namespaces: &[String], at: u64) -> Result<Vec<Leaf>> {
+    let table = ctx
+        .tidx
+        .paged(&[], LEAVES_KEY, |after| {
+            leaves_sql(ctx.cfg.engine, namespaces, at, after)
+        })
+        .await?;
+    parse_leaves(&table)
 }
 
 /// The numbering the contract stopped assigning. A full walk of one registry's
@@ -216,44 +272,13 @@ async fn numbering(ctx: &Ctx, registry: &str, at: u64) -> Result<BTreeMap<String
     parse_record_ids(&table)
 }
 
-/// What a status lookup answers: the status held against one
-/// `(registry, checksum hash, version)`.
-type Statuses = BTreeMap<(String, String, u64), String>;
-
-/// The statuses currently held under `keys`, in one round trip — a status key is
-/// the same word in every registry holding that record at that version, so the
-/// namespace only tells the answers apart afterwards.
-async fn statuses_under(
-    ctx: &Ctx,
-    keys: impl IntoIterator<Item = String>,
-    at: u64,
-) -> Result<Statuses> {
-    // Deduplicated here rather than at each caller: two registries at the same
-    // version are one key, and asking twice returns the same rows.
-    let keys: Vec<String> = keys
-        .into_iter()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    if keys.is_empty() {
-        return Ok(Statuses::new());
-    }
-    parse_statuses(&heads_under(ctx, &Scope::keyed(&keys), at).await?)
-}
-
-fn status_of(statuses: &Statuses, registry: &str, hash: &str, version: u64) -> Option<String> {
-    statuses
-        .get(&(registry.to_string(), hash.to_string(), version))
-        .cloned()
-}
-
-/// Every registry that has anchored one checksum — the module's
+/// Every registry that has added one checksum — the module's
 /// `records(registry_id = 0, checksum, …)`, and the one lookup no per-registry
 /// path can serve.
 ///
-/// Takes the checksum rather than its hash: the key derives from
-/// `keccak256(checksum)` and nothing else, which is why one filter on an indexed
-/// column answers for every registry at once.
+/// Takes the checksum rather than its hash: `RecordAdded` indexes
+/// `keccak256(checksum)`, which is why one filter on an indexed topic answers for
+/// every registry at once without walking any of them.
 async fn records_for_checksum(
     State(ctx): State<Arc<Ctx>>,
     Path(checksum): Path<String>,
@@ -262,34 +287,34 @@ async fn records_for_checksum(
 }
 
 /// The projection behind `GET /records/{checksum}`.
+///
+/// The events say which registries and which transactions; the leaf beside each
+/// event carries the version's fields. Fetched by namespace and block rather than
+/// by walking a namespace, so the cost is the record's, not the registry's.
 pub async fn anchored_anywhere(ctx: &Ctx, checksum: &str) -> Result<Value, ApiError> {
     let hash = keccak_hex(checksum.as_bytes());
-    let key = record_key(&hash).expect("a keccak digest is a 32-byte word");
     let at = ctx.tidx.coverage().await?.tip_num;
 
-    let keys = [key.clone()];
-    let (mut records, other) =
-        parse_records_at(&heads_under(ctx, &Scope::keyed(&keys), at).await?)?;
-
-    let keys = records
+    let events = record_events(ctx, None, &hash, at).await?;
+    let namespaces: Vec<String> = events
         .iter()
-        .filter_map(|r| status_key(&hash, r.record.version));
-    let statuses = statuses_under(ctx, keys, at).await?;
-    for held in &mut records {
-        let version = held.record.version;
-        held.record.status = status_of(&statuses, &held.registry, &hash, version);
-    }
+        .map(|e| e.registry.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let leaves = leaves_beside(ctx, &namespaces, &events, at).await?;
+    let statuses = statuses_of(&status_events(ctx, None, &hash, at).await?);
+    let (records, other) = records_at(&pair_leaves(&events, &leaves), &statuses)?;
 
     Ok(json!({
         "checksum": checksum,
         "checksum_hash": hash,
-        "key": key,
         "at_block": at,
         "records": records,
-        // Namespaces holding something else under this key. Anyone may anchor
-        // anywhere, so this lookup leaves what is not a record out rather than
-        // failing on it — and says how much it left out, since silence there
-        // would be indistinguishable from a key nobody else has touched.
+        // Events with no record leaf beside them. Anyone may emit a `RecordAdded`,
+        // so this lookup leaves what is not a registry's out rather than failing
+        // on it — and says how much it left out, since silence there would be
+        // indistinguishable from a checksum nobody else has touched.
         "other": other,
     }))
 }
@@ -403,14 +428,18 @@ pub async fn records_held(ctx: &Ctx, address: &str) -> Result<Value, ApiError> {
     let registry = registry_of(address)?;
     let at = ctx.tidx.coverage().await?.tip_num;
     require_deployed(ctx, &registry, at).await?;
-    // Both bounded at the same block, so the numbering and the heads describe
+    // Both bounded at the same block, so the numbering and the leaves describe
     // one state of the chain rather than two.
     let ids = numbering(ctx, &registry, at).await?;
-    let heads = heads_under(ctx, &Scope::of(&registry), at).await?;
+    let leaves = leaves_under(ctx, std::slice::from_ref(&registry), at).await?;
+    let (records, other) = parse_records(&leaves, &ids)?;
     Ok(json!({
         "registry": registry,
         "at_block": at,
-        "records": parse_records(&heads, &ids)?,
+        "records": records,
+        // Leaves that are not envelopes: what a registry-scoped writer appended
+        // as a bare commitment, or what a corpus loaded as a batch never had.
+        "other": other,
     }))
 }
 
@@ -431,6 +460,65 @@ async fn records_by_registry(
     Json(addresses): Json<Vec<String>>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(records_held_by(&ctx, &addresses).await?))
+}
+
+/// The MMR each of `addresses` holds at `edge` of its history — root, count, peaks
+/// and the metadata that append carried — or null for one that has never appended.
+/// `reconcile` judges a `leaves` step by the oldest; a proof is checked against the
+/// newest.
+pub async fn mmr_held_by(ctx: &Ctx, addresses: &[String], edge: Edge) -> Result<Value, ApiError> {
+    let registries: Vec<String> = addresses
+        .iter()
+        .map(|address| registry_of(address))
+        .collect::<Result<_, _>>()?;
+    let at = ctx.tidx.coverage().await?.tip_num;
+    let mut roots: BTreeMap<String, Value> = registries
+        .iter()
+        .map(|registry| (registry.to_lowercase(), Value::Null))
+        .collect();
+    if !registries.is_empty() {
+        let table = ctx
+            .tidx
+            .paged(&[], APPENDS_KEY, |after| {
+                appends_sql(ctx.cfg.engine, &registries, at, after, edge)
+            })
+            .await?;
+        for newest in parse_appends(&table)? {
+            roots.insert(newest.namespace.to_lowercase(), mmr_json(&newest));
+        }
+    }
+    Ok(json!({ "at_block": at, "registries": roots }))
+}
+
+/// A namespace's MMR as one append left it: every event carries the count and peaks.
+fn mmr_json(append: &Append) -> Value {
+    json!({
+        "root": append.root,
+        "count": append.count(),
+        "peaks": append.peaks,
+        "metadata": String::from_utf8_lossy(&append.metadata),
+        "block_num": append.block_num,
+    })
+}
+
+/// One registry's MMR, 404 for an address the factory never deployed.
+async fn mmr(
+    State(ctx): State<Arc<Ctx>>,
+    Path(address): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let registry = registry_of(&address)?;
+    let at = ctx.tidx.coverage().await?.tip_num;
+    require_deployed(&ctx, &registry, at).await?;
+    let served = mmr_held_by(&ctx, std::slice::from_ref(&registry), Edge::Newest).await?;
+    let held = &served["registries"][registry.to_lowercase()];
+    Ok(Json(json!({
+        "registry": registry,
+        "root": held["root"],
+        "count": held["count"],
+        "peaks": held["peaks"],
+        "metadata": held["metadata"],
+        "at_block": served["at_block"],
+    })))
 }
 
 /// The projection behind `POST /registries/records`: several registries' records at
@@ -469,21 +557,22 @@ pub async fn records_held_by(ctx: &Ctx, addresses: &[String]) -> Result<Value, A
         }
     }
 
-    let mut by_registry: BTreeMap<String, Vec<Head>> = BTreeMap::new();
-    for head in heads_under(ctx, &Scope::across(&registries), at).await? {
+    let mut by_registry: BTreeMap<String, Vec<Leaf>> = BTreeMap::new();
+    for leaf in leaves_under(ctx, &registries, at).await? {
         by_registry
-            .entry(head.namespace.to_lowercase())
+            .entry(leaf.namespace.to_lowercase())
             .or_default()
-            .push(head);
+            .push(leaf);
     }
     let unnumbered = BTreeMap::new();
     let mut records = serde_json::Map::new();
     for registry in registries {
-        let heads = by_registry
+        let leaves = by_registry
             .get(&registry.to_lowercase())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        records.insert(registry, json!(parse_records(heads, &unnumbered)?));
+        let (held, _) = parse_records(leaves, &unnumbered)?;
+        records.insert(registry, json!(held));
     }
     Ok(json!({ "at_block": at, "registries": records }))
 }
