@@ -9,7 +9,7 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use nvnmchain_anchoring::migrate::{
     add_record_call, addressed, deploy_registry_call, leaves_call, merkle_root, mmr_chunks,
-    mmr_root, plan, reconcile, update_status_call, Held, Kind, Manifest, Mode, Options,
+    mmr_root, plan, prove, reconcile, update_status_call, Held, Kind, Manifest, Mode, Options,
     RegistryImport, Root,
 };
 use sha2::{Digest, Sha256};
@@ -139,6 +139,47 @@ fn the_mmr_is_hashed_as_the_precompile_hashes_it() {
             2,
             hex::encode("{}"),
         )
+    );
+}
+
+#[test]
+fn a_batch_rows_proof_folds_to_the_root_the_plan_committed() {
+    // Five rows: 0b101, so peaks of height 2 and 0, and the proof has to find the
+    // right one. Folding a row up its siblings must land on a peak, and the peaks
+    // must bag to exactly the root the `leaves` step put in the plan — the root
+    // the chain holds once that step lands.
+    let export = Export::new("prove");
+    let lines: Vec<String> = ["aaa", "bbb", "ccc", "ddd", "eee"]
+        .iter()
+        .map(|c| record("r", c, "ipfs://x", "Active"))
+        .collect();
+    let file = export.tranche("r", &lines);
+    let manifest = manifest(vec![file]);
+    let opts = Options {
+        root: Root::Mmr,
+        ..export.opts(0)
+    };
+    let planned = plan(&registries(&["r"]), &manifest, &opts).expect("a plan");
+    let committed = planned.steps[1]
+        .checksum
+        .clone()
+        .expect("the leaves step's root");
+
+    for index in 0..5u64 {
+        let proof = prove(&manifest, &export.dir, "r", index).expect("a proof");
+        assert_eq!(proof.root, committed, "row {index}: the plan's root");
+        assert_eq!(proof.count, 5);
+        assert_eq!(proof.line, lines[index as usize]);
+        assert_eq!(proof.peaks.len(), 2, "0b101");
+        assert_eq!(proof.siblings.len(), if index < 4 { 2 } else { 0 });
+    }
+    assert!(
+        prove(&manifest, &export.dir, "r", 5).is_err(),
+        "past the end"
+    );
+    assert!(
+        prove(&manifest, &export.dir, "nope", 0).is_err(),
+        "no such registry"
     );
 }
 

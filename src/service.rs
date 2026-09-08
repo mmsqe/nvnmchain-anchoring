@@ -136,7 +136,7 @@ pub async fn record_versions(ctx: &Ctx, address: &str, checksum: &str) -> Result
     // registry, which for one record would cost the whole of it.
     let events = record_events(ctx, Some(&registry), &hash, at).await?;
     let leaves = leaves_beside(ctx, std::slice::from_ref(&registry), &events, at).await?;
-    let (mut versions, other) = versions_of(&pair_leaves(&events, &leaves))?;
+    let (mut versions, other) = versions_of(&pair_leaves(&hash, &events, &leaves))?;
     if versions.is_empty() {
         return Err(not_found(format!(
             "no record with checksum `{checksum}` in registry {registry}"
@@ -304,7 +304,7 @@ pub async fn anchored_anywhere(ctx: &Ctx, checksum: &str) -> Result<Value, ApiEr
         .collect();
     let leaves = leaves_beside(ctx, &namespaces, &events, at).await?;
     let statuses = statuses_of(&status_events(ctx, None, &hash, at).await?);
-    let (records, other) = records_at(&pair_leaves(&events, &leaves), &statuses)?;
+    let (records, other) = records_at(&pair_leaves(&hash, &events, &leaves), &statuses)?;
 
     Ok(json!({
         "checksum": checksum,

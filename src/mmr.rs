@@ -81,6 +81,53 @@ impl Mmr {
     }
 }
 
+/// The perfect subtree covering leaf `index` in a tree of `count` leaves: where it
+/// starts, and its height. Peaks align to leaf positions, so this walks the set
+/// bits of the count from the high end.
+fn peak_of(count: u64, index: u64) -> (u64, u32) {
+    let mut start = 0;
+    for h in (0..u64::BITS).rev() {
+        if count >> h & 1 == 0 {
+            continue;
+        }
+        if index < start + (1 << h) {
+            return (start, h);
+        }
+        start += 1 << h;
+    }
+    (start, 0)
+}
+
+/// An inclusion proof for the leaf at `index`: the siblings up to its peak, lowest
+/// first — what `MMRVerifier.verify` takes beside the peaks and the count.
+///
+/// Over the commitments a batch was cut from, since its rows never reached the
+/// chain one at a time. The root the chain holds is the commitment to that file,
+/// so this proves a leaf at a position against a root the chain agrees with.
+pub fn proof(commitments: &[[u8; 32]], index: u64) -> Result<Vec<[u8; 32]>> {
+    let count = commitments.len() as u64;
+    if index >= count {
+        bail!("leaf {index} is past the {count} this was cut from");
+    }
+    let (start, height) = peak_of(count, index);
+    let (start, size) = (start as usize, 1usize << height);
+    let mut nodes: Vec<[u8; 32]> = commitments[start..start + size]
+        .iter()
+        .map(hash_leaf)
+        .collect();
+    let mut at = index as usize - start;
+    let mut siblings = Vec::with_capacity(height as usize);
+    while nodes.len() > 1 {
+        siblings.push(nodes[at ^ 1]);
+        nodes = nodes
+            .chunks(2)
+            .map(|pair| hash_merge(&pair[0], &pair[1]))
+            .collect();
+        at /= 2;
+    }
+    Ok(siblings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +136,74 @@ mod tests {
         let mut word = [0u8; 32];
         word[24..].copy_from_slice(&i.to_be_bytes());
         word
+    }
+
+    /// Folding a leaf with its proof reaches one of the peaks, for every leaf of a
+    /// tree whose count is not a power of two — the shape where peaks differ in
+    /// height and a proof has to find the right one.
+    #[test]
+    fn every_leaf_proves_up_to_a_peak() {
+        let commitments: Vec<[u8; 32]> = (1..=13).map(c).collect();
+        let mut mmr = Mmr::default();
+        for x in &commitments {
+            mmr.append(x).unwrap();
+        }
+        assert_eq!(mmr.peaks.len(), 3, "13 = 0b1101, so heights 3, 2 and 0");
+
+        for index in 0..commitments.len() as u64 {
+            let siblings = proof(&commitments, index).expect("a proof");
+            // Fold from the leaf: the sibling's side is the bit of the offset
+            // within the peak, lowest first, which is what the verifier walks.
+            let mut node = hash_leaf(&commitments[index as usize]);
+            let mut at = index - peak_start(&commitments, index);
+            for sibling in &siblings {
+                node = if at & 1 == 0 {
+                    hash_merge(&node, sibling)
+                } else {
+                    hash_merge(sibling, &node)
+                };
+                at >>= 1;
+            }
+            assert!(
+                mmr.peaks.contains(&node),
+                "leaf {index} folded to something that is not a peak"
+            );
+        }
+    }
+
+    /// Where the perfect subtree covering `index` starts — the same walk `proof`
+    /// makes, spelled out here so the test does not lean on the code it checks.
+    fn peak_start(commitments: &[[u8; 32]], index: u64) -> u64 {
+        let count = commitments.len() as u64;
+        let mut start = 0;
+        for h in (0..u64::BITS).rev() {
+            if count >> h & 1 == 0 {
+                continue;
+            }
+            if index < start + (1 << h) {
+                break;
+            }
+            start += 1 << h;
+        }
+        start
+    }
+
+    /// One proof against vectors computed independently in Python, so a change to
+    /// the hashing shows up as a changed proof and not only as a changed root.
+    #[test]
+    fn a_proof_matches_an_independent_fold() {
+        let commitments: Vec<[u8; 32]> = (1..=13).map(c).collect();
+        let siblings = proof(&commitments, 5).expect("a proof");
+        assert_eq!(
+            siblings.iter().map(hex::encode).collect::<Vec<_>>(),
+            [
+                "883c502c26a5eaf5064fa4f3436acef6a5c0d2bca572e3bed242d0bcb19063c3",
+                "ec3e3f93dc9844db6729364ada1bc56d3f2714191ef6df216a782a464595f8c0",
+                "9a444d98cfab773b89efcfe3749342cd1b072e8f2276f9f822fb1e19edabb77b",
+            ]
+        );
+        assert_eq!(proof(&commitments, 12).expect("the lone peak").len(), 0);
+        assert!(proof(&commitments, 13).is_err(), "past the end");
     }
 
     /// The first, fifth and thirteenth of the sixteen roots the precompile and the

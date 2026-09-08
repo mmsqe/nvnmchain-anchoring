@@ -646,40 +646,47 @@ pub struct RecordAt {
     pub record: Record,
 }
 
-/// The leaf a registry event refers to: the one the precompile logged just before
-/// it, in the same transaction. `addRecord` appends and then announces, and the
-/// precompile emits exactly one log per append, so the leaf's `log_idx` is the
-/// event's less one, taking `log_idx` for the receipt's `logIndex`, numbered across
-/// the block. An event with no leaf beside it — some other contract's `RecordAdded`,
-/// or an index missing a row — pairs with `None`.
+/// The leaf a `RecordAdded` refers to: the one whose envelope names that record
+/// and that version, under the same namespace — matched on what the leaf is, not
+/// where it sits. `addRecord` appends and then announces, so the leaf is in
+/// practice the log just before the event, and reading it that way made log
+/// adjacency load-bearing: anything a registry came to emit in between would pair
+/// every version with the wrong leaf, quietly. The envelope can say which leaf it
+/// is on its own.
 ///
-/// That adjacency is a contract invariant, not a coincidence: `addRecord` appends, then
-/// emits, with nothing logged between. A registry that came to log something in between
-/// would surface here first, as every version reading as foreign.
+/// `hash` is part of the key, not assumed: leaves come per block, so another
+/// record's version 1 in the same block is a candidate too. An event with no such
+/// leaf — some other contract's, or an index missing a row — pairs with `None`.
 pub fn pair_leaves<'a>(
+    hash: &str,
     events: &'a [RecordEvent],
     leaves: &'a [Leaf],
 ) -> Vec<(&'a RecordEvent, Option<&'a Leaf>)> {
-    let by_place: BTreeMap<(String, u64, u64), &Leaf> = leaves
-        .iter()
-        .map(|leaf| {
-            (
-                (leaf.namespace.to_lowercase(), leaf.block_num, leaf.log_idx),
-                leaf,
-            )
-        })
-        .collect();
+    let hash = normalize_hex(hash);
+    let mut by_identity: BTreeMap<(String, u64), &'a Leaf> = BTreeMap::new();
+    for leaf in leaves {
+        let Some(envelope) = decode_envelope(&leaf.metadata) else {
+            continue;
+        };
+        if envelope.kind != "record" || normalize_hex(envelope.field("checksum_hash")) != hash {
+            continue;
+        }
+        let Ok(version) = envelope.field("index").parse::<u64>() else {
+            continue;
+        };
+        // Earliest wins: a duplicate version under one namespace is a registry
+        // misbehaving, and the first leaf is the one its own log announced.
+        by_identity
+            .entry((leaf.namespace.to_lowercase(), version))
+            .or_insert(leaf);
+    }
     events
         .iter()
         .map(|event| {
-            let beside = event
-                .log_idx
-                .checked_sub(1)
-                .and_then(|idx| {
-                    by_place.get(&(event.registry.to_lowercase(), event.block_num, idx))
-                })
+            let found = by_identity
+                .get(&(event.registry.to_lowercase(), event.index))
                 .copied();
-            (event, beside)
+            (event, found)
         })
         .collect()
 }

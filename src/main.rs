@@ -15,7 +15,8 @@ const USAGE: &str = "usage: nvnmchain-anchoring [audit|kinds|serve|\n\
      migrate --registries=<file> --manifest=<file> [--export=<dir>]\n\
              [--threshold=<n>] [--root=merkle|sha256|mmr] [--uri-base=<url>]\n\
              [--skip-status=<status>]|\n\
-     reconcile --plan=<file> [--remaining=<file>]]";
+     reconcile --plan=<file> [--remaining=<file>]|\n\
+     prove --manifest=<file> --registry=<name> --index=<n> [--export=<dir>]]";
 
 /// `--flag=value` off the command line, or the default.
 fn flag(name: &str, default: &str) -> String {
@@ -151,6 +152,21 @@ fn print(projection: Result<serde_json::Value, service::ApiError>) -> Result<()>
     }
 }
 
+/// `prove`: one row's proof, from the export. A batch's rows were never logged
+/// one at a time, so like `migrate` this reads the file and no chain.
+fn print_proof() -> Result<()> {
+    only_flags("prove", &["manifest", "registry", "index", "export"]);
+    let path = required("prove", "manifest");
+    let manifest: migrate::Manifest =
+        serde_json::from_slice(&std::fs::read(&path).with_context(|| format!("read {path}"))?)?;
+    let registry = required("prove", "registry");
+    let index: u64 = required("prove", "index").parse().context("--index")?;
+    let export_dir: std::path::PathBuf = flag("export", ".").into();
+    let proof = migrate::prove(&manifest, &export_dir, &registry, index)?;
+    println!("{}", serde_json::to_string_pretty(&proof)?);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -162,9 +178,11 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Planning reads an export, not a chain, so it runs before the settings.
-    if std::env::args().nth(1).as_deref() == Some("migrate") {
-        return print_plan();
+    // Planning and proving read an export, not a chain, so they run before the settings.
+    match std::env::args().nth(1).as_deref() {
+        Some("migrate") => return print_plan(),
+        Some("prove") => return print_proof(),
+        _ => {}
     }
 
     let cfg = Settings::from_env()?;
