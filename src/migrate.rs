@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::eth::{hex0x, keccak256, normalize_hex, strip_hex};
-use crate::mmr::{bag, hash_leaf, hash_merge};
+use crate::mmr::{self, bag, hash_leaf, hash_merge};
 use crate::registry::{Deployed, NameFilter, Record};
 use crate::service::{self, Ctx};
 use crate::tidx::Edge;
@@ -529,6 +529,51 @@ pub fn merkle_root(lines: &[Vec<u8>]) -> String {
             .collect();
     }
     hex0x(&level[0])
+}
+
+/// One row's inclusion proof: everything `MMRVerifier.verify` takes, and the root
+/// it should fold to — the one the chain holds for the registry.
+#[derive(Debug, Clone, Serialize)]
+pub struct Proof {
+    pub registry: String,
+    pub file: String,
+    pub index: u64,
+    pub count: u64,
+    /// `keccak256(line)` — the commitment; the leaf is `keccak256("leaf" ‖ this)`.
+    pub commitment: String,
+    pub line: String,
+    pub siblings: Vec<String>,
+    pub peaks: Vec<String>,
+    pub root: String,
+}
+
+/// The proof of row `index` of `registry`, from the export the batch was cut from.
+///
+/// A batch committed to subtree roots, so no row was logged on its own and the
+/// chain cannot produce this; the file can. It is verified against the manifest
+/// and cut into the same chunks as the plan was, so the root is the one the
+/// plan's `leaves` step carried — and the one the chain holds if it landed.
+pub fn prove(manifest: &Manifest, export_dir: &Path, registry: &str, index: u64) -> Result<Proof> {
+    let file = manifest
+        .files
+        .iter()
+        .find(|f| f.registry == registry)
+        .with_context(|| format!("manifest.json lists no file for registry `{registry}`"))?;
+    let lines = read_lines(export_dir, file)?;
+    let commitments: Vec<[u8; 32]> = lines.iter().map(|line| keccak256(line)).collect();
+    let siblings = mmr::proof(&commitments, index)?;
+    let chunks = mmr_chunks(&lines);
+    Ok(Proof {
+        registry: registry.to_string(),
+        file: file.file.clone(),
+        index,
+        count: lines.len() as u64,
+        commitment: hex0x(&commitments[index as usize]),
+        line: String::from_utf8_lossy(&lines[index as usize]).into_owned(),
+        siblings: siblings.iter().map(|s| hex0x(s)).collect(),
+        peaks: chunks.iter().map(|(_, root)| hex0x(root)).collect(),
+        root: mmr_root(&chunks),
+    })
 }
 
 /// A tranche file's lines, verified against the manifest before anything reads
