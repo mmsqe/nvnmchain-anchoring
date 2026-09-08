@@ -676,7 +676,7 @@ fn record_at_version(index: u64) -> String {
     format!("0x{}", hex::encode(raw))
 }
 
-/// A `RecordAdded` for this record at `index`, and the leaf logged just before it.
+/// A `RecordAdded` for this record at `index`, and the leaf it announced.
 fn announced(index: u64, block: u64, metadata: &str) -> (RecordEvent, Leaf) {
     let mut beside = leaf(index - 1, metadata, block);
     beside.log_idx = 2;
@@ -699,7 +699,8 @@ fn a_records_versions_come_back_in_log_order_with_their_leaves() {
     let (first, first_leaf) = announced(1, 11, &record_at_version(1));
     let (second, second_leaf) = announced(2, 22, &record_at_version(2));
     let (events, leaves) = ([first, second], [first_leaf, second_leaf]);
-    let (versions, other) = versions_of(&pair_leaves(&events, &leaves)).expect("two versions");
+    let (versions, other) =
+        versions_of(&pair_leaves(FIXTURE_HASH, &events, &leaves)).expect("two versions");
 
     assert_eq!(other, 0);
     assert_eq!(
@@ -720,7 +721,49 @@ fn a_records_versions_come_back_in_log_order_with_their_leaves() {
 }
 
 #[test]
-fn an_event_with_no_record_leaf_beside_it_is_counted_not_renumbered() {
+fn a_log_between_the_append_and_its_announcement_still_finds_the_leaf() {
+    // What pairing by position could not survive: something logged between the
+    // append and its announcement. The envelope says which record and version
+    // it is, so the leaf is found regardless of where it sits.
+    let (mut event, mut beside) = announced(1, 11, &record_at_version(1));
+    beside.log_idx = 2;
+    event.log_idx = 7; // four unrelated logs between the append and the announcement
+    let (events, leaves) = ([event], [beside]);
+    let (versions, other) =
+        versions_of(&pair_leaves(FIXTURE_HASH, &events, &leaves)).expect("still found");
+
+    assert_eq!(
+        (versions.len(), other),
+        (1, 0),
+        "matched on what the leaf says"
+    );
+    assert_eq!(versions[0].version, 1);
+    assert_eq!(versions[0].leaf, 0, "and it is still the leaf at index 0");
+}
+
+#[test]
+fn another_records_same_version_in_the_block_is_not_taken() {
+    // The leaves come per block, so a different record's version 1 landing in the
+    // same block is a candidate. Keyed on the version alone, it would be paired
+    // with this record's event; the checksum hash is what keeps them apart.
+    let (event, mine) = announced(1, 11, &record_at_version(1));
+    let mut other = leaf(7, &record_at_version(1), 11);
+    other.log_idx = 2;
+    // Rewrite the other leaf's checksum hash to a different record's.
+    let mut raw = bytes(&format!("0x{}", hex::encode(&other.metadata)));
+    raw[32..64].copy_from_slice(&[0x77u8; 32]);
+    other.metadata = raw;
+    let (events, leaves) = ([event], [other, mine.clone()]);
+    let paired = pair_leaves(FIXTURE_HASH, &events, &leaves);
+    let found = paired[0].1.expect("this record's leaf");
+    assert_eq!(
+        found.index, mine.index,
+        "not the other record's, though it came first"
+    );
+}
+
+#[test]
+fn an_event_with_no_record_leaf_of_its_own_is_counted_not_renumbered() {
     // Anyone may emit a `RecordAdded` under this topic, so a stranger's must not
     // shift the versions of the record that owns it.
     let (mine, my_leaf) = announced(1, 11, &record_at_version(1));
@@ -731,7 +774,8 @@ fn an_event_with_no_record_leaf_beside_it_is_counted_not_renumbered() {
         index: 1,
     };
     let (events, leaves) = ([stranger, mine], [my_leaf]);
-    let (versions, other) = versions_of(&pair_leaves(&events, &leaves)).expect("mine");
+    let (versions, other) =
+        versions_of(&pair_leaves(FIXTURE_HASH, &events, &leaves)).expect("mine");
 
     assert_eq!((versions.len(), other), (1, 1));
     assert_eq!(versions[0].version, 1);
@@ -745,7 +789,7 @@ fn a_version_index_that_is_not_its_place_in_the_log_is_an_error() {
     let (first, first_leaf) = announced(1, 11, &record_at_version(1));
     let (third, third_leaf) = announced(3, 22, &record_at_version(3));
     let (events, leaves) = ([first, third], [first_leaf, third_leaf]);
-    let gap = versions_of(&pair_leaves(&events, &leaves));
+    let gap = versions_of(&pair_leaves(FIXTURE_HASH, &events, &leaves));
     assert!(gap.is_err(), "{gap:?}");
     assert!(gap.unwrap_err().to_string().contains("version 3"));
 }
@@ -1001,10 +1045,10 @@ fn a_status_event_decodes_and_the_newest_wins() {
 }
 
 #[test]
-fn an_event_pairs_with_the_leaf_logged_just_before_it() {
-    // `addRecord` appends and then announces, in one transaction, so the leaf's
-    // log_idx is the event's less one. An event with no leaf beside it is some
-    // other contract's, or an index missing a row — counted, not fatal.
+fn an_event_pairs_with_the_leaf_that_says_it_is_that_version() {
+    // The leaf is the one whose envelope names this record and this version. An
+    // event with no such leaf is some other contract's, or an index missing a row
+    // — counted, not fatal.
     let mine = RecordEvent {
         registry: REGISTRY.to_string(),
         block_num: 5,
@@ -1021,9 +1065,15 @@ fn an_event_pairs_with_the_leaf_logged_just_before_it() {
     beside.log_idx = 2;
     let events = [mine, stranger];
     let leaves = [beside];
-    let paired = pair_leaves(&events, &leaves);
-    assert!(paired[0].1.is_some(), "the leaf logged just before it");
-    assert!(paired[1].1.is_none(), "nothing before log 0");
+    let paired = pair_leaves(FIXTURE_HASH, &events, &leaves);
+    assert!(
+        paired[0].1.is_some(),
+        "the leaf that says it is version 1 of this record"
+    );
+    assert!(
+        paired[1].1.is_none(),
+        "no leaf under the stranger's namespace"
+    );
 
     let statuses = BTreeMap::from([((REGISTRY.to_lowercase(), 1), "approved".to_string())]);
     let (records, other) = records_at(&paired, &statuses).expect("one registry");
