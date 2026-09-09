@@ -23,9 +23,9 @@ use nvnmchain_anchoring::registry::{
 };
 use nvnmchain_anchoring::rpc::decode_state;
 use nvnmchain_anchoring::tidx::{
-    appends_sql, cursor_after, group_by_namespace, histories_sql, leaves_in_sql, leaves_sql,
-    parse_appends, parse_coverage, parse_leaves, reject_truncated, Appended, Edge, Engine, Leaf,
-    Table, APPENDS_KEY, HARD_LIMIT, HISTORIES_KEY, LEAVES_KEY,
+    appends_sql, cursor_after, fit, group_by_namespace, histories_sql, leaves_in_sql, leaves_sql,
+    parse_appends, parse_coverage, parse_leaves, reject_truncated, too_large, walk, Appended, Edge,
+    Engine, Leaf, Page, Table, APPENDS_KEY, BODY_CAP, HARD_LIMIT, HISTORIES_KEY, LEAVES_KEY,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -37,7 +37,7 @@ const REGISTRY: &str = "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0";
 const FACTORY: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 
 fn table(body: serde_json::Value) -> Table {
-    Table::from_response(&body).expect("a query tidx accepted")
+    Table::from_response(body).expect("a query tidx accepted")
 }
 
 fn c(i: u64) -> [u8; 32] {
@@ -111,7 +111,7 @@ fn a_row_whose_payload_does_not_decode_is_an_error() {
 fn a_refused_query_is_not_an_empty_result() {
     // tidx answers 200 with ok:false. Read as success, a rejected query is an
     // index with no leaves — which is what a clean audit looks like.
-    let refused = Table::from_response(&json!({"ok": false, "error": "invalid signature"}));
+    let refused = Table::from_response(json!({"ok": false, "error": "invalid signature"}));
     assert!(refused.is_err());
     let message = refused.unwrap_err().to_string();
     assert!(message.contains("invalid signature"), "{message}");
@@ -1175,6 +1175,153 @@ fn a_full_page_is_refused_because_it_may_be_short() {
 #[test]
 fn the_row_cap_is_the_one_tidx_enforces() {
     assert_eq!(HARD_LIMIT, 10_000);
+}
+
+/// Rows `[from, from + n)`, in the shape `LEAVES_KEY` pages over.
+fn rows_from(from: u64, n: u64) -> Table {
+    Table::from_response(json!({
+        "ok": true,
+        "columns": ["block_num", "log_idx"],
+        "rows": (from..from + n).map(|i| json!([i, 0])).collect::<Vec<_>>(),
+    }))
+    .expect("a table")
+}
+
+/// What tidx says at its body cap, and for one cell over its own.
+const BODY_CAP_REFUSAL: &str = "Query error: Query result exceeded 10485760 bytes";
+const CELL_CAP_REFUSAL: &str = "Query error: Query result cell exceeded 1048576 bytes";
+
+/// A refusal as the client raises it — `table` unwraps, so through
+/// `from_response` directly.
+fn refusal(said: &str) -> anyhow::Error {
+    Table::from_response(json!({"ok": false, "error": said})).expect_err("tidx refused this")
+}
+
+#[tokio::test]
+async fn a_page_narrowed_mid_walk_is_not_the_last_one() {
+    // Ten rows behind a source that is asked for eight and can only send four:
+    // the walk must come back with all ten. Reading the four-row page as "shorter
+    // than the eight we asked for, so the end" is the silent truncation the
+    // narrowed limit exists to prevent.
+    let state = std::cell::RefCell::new((0u64, Vec::new())); // rows served, sizes asked
+    let table = walk(
+        Engine::Postgres,
+        LEAVES_KEY,
+        8,
+        |after| after.to_string(),
+        |_sql: String, rows: usize| {
+            let narrowed = rows.min(4); // the body cap bites at eight, not at four
+            let (served, asked) = &mut *state.borrow_mut();
+            asked.push(rows);
+            let from = *served;
+            let n = (narrowed as u64).min(10 - from);
+            *served += n;
+            async move {
+                Ok(Page {
+                    table: rows_from(from, n),
+                    asked: narrowed,
+                    next: narrowed,
+                })
+            }
+        },
+    )
+    .await
+    .expect("the walk completes");
+
+    let (_, asked) = &*state.borrow();
+    assert_eq!(
+        table.rows.len(),
+        10,
+        "every row, not just the first narrowed page"
+    );
+    assert_eq!(
+        asked.first().copied(),
+        Some(8),
+        "the first ask is the configured page"
+    );
+    assert!(
+        asked[1..].iter().all(|&r| r == 4),
+        "the narrowed limit carries: {asked:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_page_refused_for_its_size_is_asked_for_at_half() {
+    // Eight is over the cap and four is half of it: one refusal, then a page
+    // of four that is full at four — and stays four, since eight would be over.
+    let asked = std::cell::RefCell::new(Vec::new());
+    let page = fit(8, 8, |rows| {
+        asked.borrow_mut().push(rows);
+        let answer = if rows > 4 {
+            Err(refusal(BODY_CAP_REFUSAL))
+        } else {
+            Ok((rows_from(0, rows as u64), BODY_CAP / 2))
+        };
+        async move { answer }
+    })
+    .await
+    .expect("a page that fits");
+    assert_eq!(*asked.borrow(), [8, 4]);
+    assert_eq!((page.table.rows.len(), page.asked, page.next), (4, 4, 4));
+}
+
+#[tokio::test]
+async fn the_limit_widens_once_the_rows_come_back_thin() {
+    // Four rows at a quarter of the cap: eight would fit, so eight is next.
+    let thin = |rows: usize| async move { Ok((rows_from(0, rows as u64), BODY_CAP / 4)) };
+    assert_eq!(fit(8, 4, thin).await.expect("fits").next, 8);
+    // Never past the configured page, however thin.
+    let thinner = |rows: usize| async move { Ok((rows_from(0, rows as u64), 10)) };
+    assert_eq!(fit(8, 8, thinner).await.expect("fits").next, 8);
+}
+
+#[tokio::test]
+async fn only_the_body_cap_is_halved_for() {
+    let asked = std::cell::RefCell::new(Vec::new());
+    let always = |said: &'static str| {
+        let asked = &asked;
+        move |rows: usize| {
+            asked.borrow_mut().push(rows);
+            async move { Err(refusal(said)) }
+        }
+    };
+
+    // The cell cap: asked once, since no page is small enough for one cell.
+    let err = fit(8, 8, always(CELL_CAP_REFUSAL))
+        .await
+        .expect_err("fatal");
+    assert!(err.to_string().contains("cell exceeded"), "{err}");
+    assert_eq!(*asked.borrow(), [8]);
+
+    // The body cap at any size: halved down to one row, then given up on, and
+    // the error says so — lowering `PAGE_SIZE` by hand would not help.
+    asked.borrow_mut().clear();
+    let err = fit(8, 8, always(BODY_CAP_REFUSAL))
+        .await
+        .expect_err("fatal");
+    assert!(format!("{err:#}").contains("even one row"), "{err:#}");
+    assert_eq!(*asked.borrow(), [8, 4, 2, 1]);
+}
+
+#[test]
+fn only_an_answer_too_big_to_send_is_worth_a_smaller_page() {
+    // The body cap, as each engine reports it: the rows fit the row cap and
+    // the answer does not fit the body, which a page of fewer rows will.
+    for said in [
+        BODY_CAP_REFUSAL,
+        "ClickHouse response exceeded 10485760 bytes",
+    ] {
+        assert!(too_large(&refusal(said)), "{said}");
+    }
+
+    // Everything else stays fatal, the cell cap included.
+    for said in [
+        CELL_CAP_REFUSAL,
+        "Query error: relation \"sync_state\" is not queryable",
+        "Query error: syntax error at or near \"slect\"",
+    ] {
+        assert!(!too_large(&refusal(said)), "{said}");
+    }
 }
 
 #[test]

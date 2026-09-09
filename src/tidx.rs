@@ -164,18 +164,25 @@ impl Table {
     /// A `/query` body as a table. tidx answers 200 with `ok: false` for a
     /// rejected query, so the status code alone would read a refusal as an
     /// empty result — which is also what a wrong-but-accepted query looks like.
-    pub fn from_response(response: &Value) -> Result<Self> {
+    ///
+    /// Takes the body: a page is up to [`BODY_CAP`] of rows, moved out of it
+    /// rather than copied.
+    pub fn from_response(mut response: Value) -> Result<Self> {
         if response.get("ok").and_then(Value::as_bool) != Some(true) {
             bail!("tidx refused the query: {response}");
         }
+        let items = |value: Value| match value {
+            Value::Array(items) => items,
+            _ => Vec::new(),
+        };
         Ok(Self {
-            columns: array(&response["columns"])
+            columns: items(response["columns"].take())
                 .iter()
                 .map(|c| c.as_str().unwrap_or_default().to_string())
                 .collect(),
-            rows: array(&response["rows"])
-                .iter()
-                .map(|row| array(row).to_vec())
+            rows: items(response["rows"].take())
+                .into_iter()
+                .map(items)
                 .collect(),
         })
     }
@@ -201,6 +208,20 @@ pub fn text(row: &[Value], at: usize) -> &str {
 /// here because the only defence is knowing the number — see
 /// [`reject_truncated`].
 pub const HARD_LIMIT: usize = 10_000;
+
+/// tidx's cap on a `/query` body (`MAX_QUERY_RESULT_BYTES`), pinned for the same
+/// reason. A row's width is the caller's data, so how many fit is not known
+/// until tidx refuses: [`fit`] halves until it does not, and widens again while
+/// a page comes back under a quarter of this.
+pub const BODY_CAP: usize = 10 * 1024 * 1024;
+
+/// Whether tidx refused because the answer was over [`BODY_CAP`], as either
+/// engine says it. Not its cell cap, which reads almost the same: no page is
+/// small enough for one cell.
+pub fn too_large(e: &anyhow::Error) -> bool {
+    let said = e.to_string();
+    said.contains("result exceeded") || said.contains("response exceeded")
+}
 
 /// A full page is refused rather than returned.
 ///
@@ -255,6 +276,92 @@ pub fn cursor_after(engine: Engine, table: &Table, key: Key, row: &[Value]) -> R
     Ok(format!(" AND ({predicate})"))
 }
 
+/// One page: its rows, the limit they were asked at — which is what "full"
+/// means for them — and the limit to ask next.
+#[derive(Debug)]
+pub struct Page {
+    pub table: Table,
+    pub asked: usize,
+    pub next: usize,
+}
+
+/// One page at `rows`, halved until `fetch` sends it, with the limit to ask
+/// next: what worked, or double that up to `page` while the body stays under a
+/// quarter of [`BODY_CAP`] — narrowed for one wide registry, a walk would
+/// otherwise crawl through every thin one after it. Only the body cap is
+/// halved for, see [`too_large`].
+///
+/// `fetch` answers a limit with the page and the body's size. Passed in so a
+/// fake can drive this; [`Tidx::page_at`] is it over HTTP.
+pub async fn fit<F, Fut>(page: usize, rows: usize, fetch: F) -> Result<Page>
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(Table, usize)>>,
+{
+    let mut asked = rows;
+    loop {
+        match fetch(asked).await {
+            Ok((table, bytes)) => {
+                let next = if bytes * 4 <= BODY_CAP {
+                    (asked * 2).min(page)
+                } else {
+                    asked
+                };
+                return Ok(Page { table, asked, next });
+            }
+            Err(e) if asked > 1 && too_large(&e) => asked /= 2,
+            Err(e) if too_large(&e) => {
+                return Err(e.context("even one row is over tidx's body cap"))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// A query walked to exhaustion, one [`Page`] per `fetch`. Full is judged
+/// against the limit the page was asked at, not `page`: narrowed mid-walk, a
+/// full page would otherwise read as the last one and the rest be dropped in
+/// silence. Passed the fetch for the same reason as [`fit`]; [`Tidx::paged`] is
+/// it over HTTP.
+pub async fn walk<F, Fut>(
+    engine: Engine,
+    key: Key<'_>,
+    page: usize,
+    build: impl Fn(&str) -> String,
+    fetch: F,
+) -> Result<Table>
+where
+    F: Fn(String, usize) -> Fut,
+    Fut: std::future::Future<Output = Result<Page>>,
+{
+    let Page {
+        table: mut all,
+        mut asked,
+        mut next,
+    } = fetch(build(""), page).await?;
+    let (mut fetched, mut after) = (all.rows.len(), String::new());
+    while fetched >= asked {
+        let last = all
+            .rows
+            .last()
+            .cloned()
+            .expect("a full page has a last row");
+        let cursor = cursor_after(engine, &all, key, &last)?;
+        // A cursor that does not move fetches the same page forever, which
+        // means `key` is not unique per row — the caller's bug, not a chain
+        // worth asking again.
+        if cursor == after {
+            let columns: Vec<_> = key.iter().map(|(c, _)| *c).collect();
+            bail!("paging stalled: {} does not advance", columns.join(", "));
+        }
+        after = cursor;
+        let mut more = fetch(build(&after), next).await?;
+        (asked, next, fetched) = (more.asked, more.next, more.table.rows.len());
+        all.rows.append(&mut more.table.rows);
+    }
+    Ok(all)
+}
+
 /// A numeric cell. tidx serializes integers as JSON numbers on one engine and
 /// as strings on the other, so reading only one of the two drops the column to
 /// zero without saying so.
@@ -300,16 +407,21 @@ impl Tidx {
         })
     }
 
-    async fn get_json(&self, path: &str, params: &[(&str, &str)]) -> Result<Value> {
-        self.client
+    /// A JSON body and its size, which is what [`BODY_CAP`] is a cap on.
+    async fn get_json(&self, path: &str, params: &[(&str, &str)]) -> Result<(Value, usize)> {
+        let body = self
+            .client
             .get(format!("{}{path}", self.url))
             .query(params)
             .send()
             .await
             .with_context(|| format!("tidx {path} request"))?
-            .json()
+            .bytes()
             .await
-            .with_context(|| format!("tidx {path} response"))
+            .with_context(|| format!("tidx {path} response"))?;
+        let value =
+            serde_json::from_slice(&body).with_context(|| format!("tidx {path} response"))?;
+        Ok((value, body.len()))
     }
 
     /// `GET /query`, over the base tables.
@@ -322,14 +434,22 @@ impl Tidx {
     /// the base tables exist. A signature tidx cannot match builds its table off
     /// some other topic0 and returns no rows rather than an error.
     pub async fn query_with(&self, sql: &str, signatures: &[&str]) -> Result<Table> {
-        reject_truncated(self.one_page(sql, signatures).await?, self.page)
+        let page = self.page_at(sql, signatures, self.page).await?;
+        reject_truncated(page.table, page.asked)
     }
 
-    /// One page. Left un-checked for truncation because [`Self::paged`] answers a
-    /// full page by asking for the next one, which is the whole point.
-    async fn one_page(&self, sql: &str, signatures: &[&str]) -> Result<Table> {
+    /// [`fit`] over `/query`. Un-checked for truncation: [`Self::paged`]
+    /// answers a full page by asking for the next.
+    async fn page_at(&self, sql: &str, signatures: &[&str], rows: usize) -> Result<Page> {
+        fit(self.page, rows, |asked| {
+            self.page_of(sql, signatures, asked)
+        })
+        .await
+    }
+
+    async fn page_of(&self, sql: &str, signatures: &[&str], rows: usize) -> Result<(Table, usize)> {
         let chain_id = self.chain_id.to_string();
-        let limit = self.page.to_string();
+        let limit = rows.to_string();
         let mut params = vec![
             ("chainId", chain_id.as_str()),
             ("engine", self.engine.as_param()),
@@ -340,7 +460,8 @@ impl Tidx {
             ("sql", sql),
         ];
         params.extend(signatures.iter().map(|s| ("signature", *s)));
-        Table::from_response(&self.get_json("/query", &params).await?)
+        let (response, bytes) = self.get_json("/query", &params).await?;
+        Ok((Table::from_response(response)?, bytes))
     }
 
     /// A query walked to exhaustion, one page per round trip.
@@ -359,28 +480,10 @@ impl Tidx {
         key: Key<'_>,
         build: impl Fn(&str) -> String,
     ) -> Result<Table> {
-        let mut all = self.one_page(&build(""), signatures).await?;
-        let (mut fetched, mut after) = (all.rows.len(), String::new());
-        while fetched >= self.page {
-            let last = all
-                .rows
-                .last()
-                .cloned()
-                .expect("a full page has a last row");
-            let next = cursor_after(self.engine, &all, key, &last)?;
-            // A cursor that does not move fetches the same page forever, which
-            // means `key` is not unique per row — the caller's bug, not a chain
-            // worth asking again.
-            if next == after {
-                let columns: Vec<_> = key.iter().map(|(c, _)| *c).collect();
-                bail!("paging stalled: {} does not advance", columns.join(", "));
-            }
-            after = next;
-            let mut page = self.one_page(&build(&after), signatures).await?;
-            fetched = page.rows.len();
-            all.rows.append(&mut page.rows);
-        }
-        Ok(all)
+        walk(self.engine, key, self.page, build, |sql, rows| async move {
+            self.page_at(&sql, signatures, rows).await
+        })
+        .await
     }
 
     /// Every leaf on the chain as of `up_to`, in log order.
@@ -409,7 +512,8 @@ impl Tidx {
     /// with a 422 — a rejection at the HTTP layer, before the `ok: false` body
     /// the rest of this module guards against.
     pub async fn coverage(&self) -> Result<Coverage> {
-        parse_coverage(&self.get_json("/status", &[]).await?, self.chain_id)
+        let (status, _) = self.get_json("/status", &[]).await?;
+        parse_coverage(&status, self.chain_id)
     }
 }
 

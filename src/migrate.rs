@@ -20,7 +20,7 @@
 //! calldata in a fixed order, so whatever holds the key sends them — the same
 //! reason there is no `tx` half to the command line.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -776,11 +776,13 @@ pub async fn against_chain(ctx: &Ctx, plan: &str) -> Result<Report> {
         }
     }
     let addresses: Vec<String> = landed.values().map(|at| at.to_string()).collect();
-    let served = service::records_held_by(ctx, &addresses)
+    let (_, mut served) = service::held_records(ctx, &addresses)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     for (name, address) in &landed {
-        let records: Vec<Record> = serde_json::from_value(served["registries"][*address].clone())?;
+        let records = served
+            .remove(*address)
+            .with_context(|| format!("{address} is not among the records served"))?;
         held.insert(name.to_string(), Some(records));
     }
 
@@ -843,13 +845,25 @@ pub fn reconcile(
     roots: &BTreeMap<String, String>,
 ) -> Report {
     let mut report = Report::default();
-    let records_of = |registry: &str| held.get(registry).and_then(Option::as_deref);
+    let landed = |registry: &str| matches!(held.get(registry), Some(Some(_)));
+
+    // What the chain holds, by registry and checksum, built once: the corpus's
+    // largest registry holds 1.2M records against as many steps, and a scan per
+    // step measured 55 minutes for that one registry. First wins, as `find` did.
+    let mut on_chain: HashMap<(&str, &str), &Record> = HashMap::new();
+    for (registry, records) in held {
+        for record in records.iter().flatten() {
+            on_chain
+                .entry((registry, &record.checksum))
+                .or_insert(record);
+        }
+    }
 
     for step in steps {
-        let Some(records) = records_of(&step.registry) else {
+        if !landed(&step.registry) {
             report.remaining.push(step.clone()); // its deploy has not landed
             continue;
-        };
+        }
         if step.kind == Kind::Leaves {
             let planned = step.checksum.as_deref().unwrap_or_default().to_lowercase();
             match roots.get(&step.registry).map(|r| r.to_lowercase()) {
@@ -868,7 +882,9 @@ pub fn reconcile(
         let (Some(checksum), Some(version)) = (&step.checksum, step.version) else {
             continue; // a deploy that landed
         };
-        let record = records.iter().find(|r| r.checksum == *checksum);
+        let record = on_chain
+            .get(&(step.registry.as_str(), checksum.as_str()))
+            .copied();
 
         let owed = match (step.kind, record) {
             (Kind::Deploy, _) => false,
@@ -889,7 +905,7 @@ pub fn reconcile(
     }
 
     // The other direction: what the chain holds and the plan does not write.
-    let mut planned: BTreeMap<(&str, &str), u64> = BTreeMap::new();
+    let mut planned: HashMap<(&str, &str), u64> = HashMap::new();
     for step in steps.iter().filter(|s| s.kind == Kind::Record) {
         if let (Some(checksum), Some(version)) = (&step.checksum, step.version) {
             let newest = planned.entry((&step.registry, checksum)).or_default();

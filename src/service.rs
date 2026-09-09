@@ -30,8 +30,8 @@ use crate::registry::{
     deployment_sql, pair_leaves, parse_record_events, parse_record_ids, parse_records,
     parse_registries, parse_roles, parse_status_events, record_added_sql, record_ids_sql,
     records_at, registries_sql, roles_sql, status_updated_sql, statuses_of, versions_of, Deployed,
-    NameFilter, RecordEvent, StatusEvent, EVENTS_KEY, RECORD_IDS_KEY, REGISTRIES_KEY, ROLES_KEY,
-    ROLE_EVENTS,
+    NameFilter, Record, RecordEvent, StatusEvent, EVENTS_KEY, RECORD_IDS_KEY, REGISTRIES_KEY,
+    ROLES_KEY, ROLE_EVENTS,
 };
 use crate::tidx::{
     appends_sql, leaves_in_sql, leaves_sql, parse_appends, parse_leaves, Append, Edge, Leaf, Tidx,
@@ -533,13 +533,24 @@ async fn mmr(
 /// Returns early on no addresses: an empty scope is every namespace, and the answer
 /// to "which of nothing" must not be a walk of the whole chain.
 pub async fn records_held_by(ctx: &Ctx, addresses: &[String]) -> Result<Value, ApiError> {
+    let (at, held) = held_records(ctx, addresses).await?;
+    Ok(json!({ "at_block": at, "registries": held }))
+}
+
+/// [`records_held_by`] before it is JSON: `(at_block, records by registry)`, for
+/// `reconcile`, which reads a million of them in this process and has no use for
+/// them as text.
+pub async fn held_records(
+    ctx: &Ctx,
+    addresses: &[String],
+) -> Result<(u64, BTreeMap<String, Vec<Record>>), ApiError> {
     let registries: Vec<String> = addresses
         .iter()
         .map(|address| registry_of(address))
         .collect::<Result<_, _>>()?;
     let at = ctx.tidx.coverage().await?.tip_num;
     if registries.is_empty() {
-        return Ok(json!({ "at_block": at, "registries": {} }));
+        return Ok((at, BTreeMap::new()));
     }
     if let Some(factory) = ctx.cfg.factory.as_deref() {
         let announced: BTreeSet<String> = deployed_at(ctx, factory, at)
@@ -565,16 +576,16 @@ pub async fn records_held_by(ctx: &Ctx, addresses: &[String]) -> Result<Value, A
             .push(leaf);
     }
     let unnumbered = BTreeMap::new();
-    let mut records = serde_json::Map::new();
+    let mut records = BTreeMap::new();
     for registry in registries {
         let leaves = by_registry
             .get(&registry.to_lowercase())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let (held, _) = parse_records(leaves, &unnumbered)?;
-        records.insert(registry, json!(held));
+        records.insert(registry, held);
     }
-    Ok(json!({ "at_block": at, "registries": records }))
+    Ok((at, records))
 }
 
 pub async fn serve(ctx: Arc<Ctx>, bind: &str) -> Result<()> {

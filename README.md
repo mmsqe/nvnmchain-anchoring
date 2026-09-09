@@ -77,8 +77,10 @@ until a page comes back short. The cursor is the query's own ordering, which for
 a windowed query is also its partition — a page boundary that fell inside a
 partition would fold "newest per namespace" from half a namespace's rows.
 Anything that somehow arrives full anyway is an error: a short list is
-indistinguishable from a complete one. `PAGE_SIZE` lowers the rows per round
-trip, which is only worth doing to watch the loop work.
+indistinguishable from a complete one. tidx caps the body too, and a row's width
+is the caller's data, so a page refused for its size is asked for again at half
+the rows, and widens back once they come thin. `PAGE_SIZE` lowers the rows per
+round trip, which is only worth doing to watch the loop work.
 
 ```bash
 CHAIN_ID=… TIDX_URL=http://127.0.0.1:8080 NVNM_RPC=http://127.0.0.1:8545 cargo run
