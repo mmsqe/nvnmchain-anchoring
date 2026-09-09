@@ -35,7 +35,7 @@ use crate::registry::{
 };
 use crate::tidx::{
     appends_sql, leaves_in_sql, leaves_sql, parse_appends, parse_leaves, Append, Edge, Leaf, Tidx,
-    APPENDS_KEY, LEAVES_KEY,
+    APPENDS_KEY, LEAVES_KEY, MAX_BLOCKS,
 };
 
 pub struct Ctx {
@@ -239,21 +239,28 @@ async fn leaves_beside(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let table = ctx
-        .tidx
-        .paged(&[], LEAVES_KEY, |after| {
-            leaves_in_sql(ctx.cfg.engine, namespaces, &blocks, at, after)
-        })
-        .await?;
-    parse_leaves(&table)
+    // The blocks ride in the same URL as the namespaces, so they are batched too.
+    // Sorted, so of a duplicate the earlier block is still the first `pair_leaves`
+    // sees.
+    let mut leaves = Vec::new();
+    for blocks in blocks.chunks(MAX_BLOCKS) {
+        let table = ctx
+            .tidx
+            .paged_in(&[], LEAVES_KEY, namespaces, |batch, after| {
+                leaves_in_sql(ctx.cfg.engine, batch, blocks, at, after)
+            })
+            .await?;
+        leaves.extend(parse_leaves(&table)?);
+    }
+    Ok(leaves)
 }
 
 /// Every leaf under `scope`, walked to exhaustion, in log order.
 async fn leaves_under(ctx: &Ctx, namespaces: &[String], at: u64) -> Result<Vec<Leaf>> {
     let table = ctx
         .tidx
-        .paged(&[], LEAVES_KEY, |after| {
-            leaves_sql(ctx.cfg.engine, namespaces, at, after)
+        .paged_in(&[], LEAVES_KEY, namespaces, |batch, after| {
+            leaves_sql(ctx.cfg.engine, batch, at, after)
         })
         .await?;
     parse_leaves(&table)
@@ -479,8 +486,8 @@ pub async fn mmr_held_by(ctx: &Ctx, addresses: &[String], edge: Edge) -> Result<
     if !registries.is_empty() {
         let table = ctx
             .tidx
-            .paged(&[], APPENDS_KEY, |after| {
-                appends_sql(ctx.cfg.engine, &registries, at, after, edge)
+            .paged_in(&[], APPENDS_KEY, &registries, |batch, after| {
+                appends_sql(ctx.cfg.engine, batch, at, after, edge)
             })
             .await?;
         for newest in parse_appends(&table)? {

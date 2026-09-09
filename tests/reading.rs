@@ -23,9 +23,10 @@ use nvnmchain_anchoring::registry::{
 };
 use nvnmchain_anchoring::rpc::decode_state;
 use nvnmchain_anchoring::tidx::{
-    appends_sql, cursor_after, fit, group_by_namespace, histories_sql, leaves_in_sql, leaves_sql,
-    parse_appends, parse_coverage, parse_leaves, reject_truncated, too_large, walk, Appended, Edge,
-    Engine, Leaf, Page, Table, APPENDS_KEY, BODY_CAP, HARD_LIMIT, HISTORIES_KEY, LEAVES_KEY,
+    appends_sql, batches, cursor_after, fit, group_by_namespace, histories_sql, leaves_in_sql,
+    leaves_sql, parse_appends, parse_coverage, parse_leaves, reject_truncated, too_large, walk,
+    Appended, Edge, Engine, Leaf, Page, Table, APPENDS_KEY, BODY_CAP, HARD_LIMIT, HISTORIES_KEY,
+    LEAVES_KEY, MAX_NAMESPACES,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1175,6 +1176,22 @@ fn a_full_page_is_refused_because_it_may_be_short() {
 #[test]
 fn the_row_cap_is_the_one_tidx_enforces() {
     assert_eq!(HARD_LIMIT, 10_000);
+}
+
+/// The URL budget, and the case a refactor would drop: no namespaces is *every*
+/// namespace and one query — not zero queries, which would read as no rows.
+#[test]
+fn namespaces_are_batched_for_the_url_and_none_is_one_batch() {
+    let none: Vec<String> = Vec::new();
+    assert_eq!(batches(&none), vec![&none[..]]);
+
+    let names: Vec<String> = (0..2 * MAX_NAMESPACES + 1).map(|i| i.to_string()).collect();
+    let split = batches(&names);
+    assert_eq!(
+        split.iter().map(|b| b.len()).collect::<Vec<_>>(),
+        [MAX_NAMESPACES, MAX_NAMESPACES, 1]
+    );
+    assert_eq!(split.concat(), names, "every name once, in order");
 }
 
 /// Rows `[from, from + n)`, in the shape `LEAVES_KEY` pages over.

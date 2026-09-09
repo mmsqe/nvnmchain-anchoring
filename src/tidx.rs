@@ -154,7 +154,7 @@ impl Coverage {
 }
 
 /// A `/query` result: named columns and the rows under them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Table {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
@@ -208,6 +208,32 @@ pub fn text(row: &[Value], at: usize) -> &str {
 /// here because the only defence is knowing the number — see
 /// [`reject_truncated`].
 pub const HARD_LIMIT: usize = 10_000;
+
+/// The most namespaces one query may name.
+///
+/// tidx takes the SQL as a query parameter and offers no POST to move it into
+/// (405), so the predicate rides in the URL — which `http::Uri` caps at 65,535.
+/// The corpus's 2,114 registries came to 165,287 characters and reqwest refused
+/// to build the request at all. Each name costs about 78 once encoded, so this
+/// spends a third of the budget and leaves the rest to the query around it and
+/// to [`MAX_BLOCKS`].
+pub const MAX_NAMESPACES: usize = 256;
+
+/// The most blocks one query may name, on the same budget: `leaves_in_sql` names
+/// every block a record's events landed in beside the namespaces, at about 15
+/// characters each once encoded.
+pub const MAX_BLOCKS: usize = 1024;
+
+/// `namespaces` in batches a URL can hold, none of which splits one. An empty
+/// list means *every* namespace and is one batch rather than none: `chunks` of
+/// nothing would be no query at all, which reads as no rows.
+pub fn batches(namespaces: &[String]) -> Vec<&[String]> {
+    if namespaces.is_empty() {
+        vec![&[]]
+    } else {
+        namespaces.chunks(MAX_NAMESPACES).collect()
+    }
+}
 
 /// tidx's cap on a `/query` body (`MAX_QUERY_RESULT_BYTES`), pinned for the same
 /// reason. A row's width is the caller's data, so how many fit is not known
@@ -484,6 +510,30 @@ impl Tidx {
             self.page_at(&sql, signatures, rows).await
         })
         .await
+    }
+
+    /// [`Self::paged`] repeated over [`batches`] of namespaces, since they ride
+    /// in the URL. A batch never splits a namespace, so a window partitioned by
+    /// one is as correct as it is unbatched, and every caller keys the rows by
+    /// namespace rather than reading them in one order.
+    pub async fn paged_in(
+        &self,
+        signatures: &[&str],
+        key: Key<'_>,
+        namespaces: &[String],
+        build: impl Fn(&[String], &str) -> String,
+    ) -> Result<Table> {
+        let mut all = Table::default();
+        for batch in batches(namespaces) {
+            let mut page = self
+                .paged(signatures, key, |after| build(batch, after))
+                .await?;
+            if all.columns.is_empty() {
+                all.columns = std::mem::take(&mut page.columns);
+            }
+            all.rows.append(&mut page.rows);
+        }
+        Ok(all)
     }
 
     /// Every leaf on the chain as of `up_to`, in log order.
