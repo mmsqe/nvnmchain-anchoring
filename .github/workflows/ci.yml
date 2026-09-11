@@ -25,5 +25,5 @@ jobs:
 
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      # Every test here is offline; the log fixtures are node-shaped JSON.
+      # Every test here is offline; the node is a stub.
       - run: cargo test

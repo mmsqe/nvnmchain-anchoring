@@ -1,76 +1,49 @@
 //! Runtime configuration, from the environment.
 
 use std::env;
+use std::time::Duration;
 
+use alloy_primitives::Address;
 use anyhow::{Context, Result};
 
-use crate::eth::parse_address;
-use crate::tidx::{Engine, HARD_LIMIT};
-
 pub const DEFAULT_RPC_URL: &str = "https://rpc.nvnm.canary.mantrachain.dev";
-pub const DEFAULT_TIDX_URL: &str = "http://127.0.0.1:8080";
+
+/// The anchoring contract.
+pub const DEFAULT_CONTRACT: &str = "0x0000000000000000000000000000000000000a00";
 
 #[derive(Debug, Clone)]
 pub struct Settings {
-    /// A node, for the precompile's own storage. Nothing else needs one.
     pub rpc_url: String,
-    /// A tidx instance indexing the same chain.
-    pub tidx_url: String,
-    /// tidx serves several chains from one endpoint, so every query names one.
-    pub chain_id: u64,
-    pub engine: Engine,
-    /// The precompile arrives at T10, so an index reaching this far back has
-    /// seen every anchor there is.
-    pub first_block: u64,
-    /// The `RegistryFactory` whose deployments `/registries` lists. Optional
-    /// because the audit needs no factory; the endpoint says so rather than
-    /// listing every contract that emits the same event.
-    pub factory: Option<String>,
+    pub contract: Address,
+    /// Derived data: delete it and the next start copies every registry again.
+    pub db_path: String,
     /// Where `serve` listens.
     pub bind: String,
-    /// Rows per tidx round trip. Only worth setting below the default to make
-    /// the paging loop observable in a test.
-    pub page_size: usize,
+    /// How often to ask the contract for registries past the last one indexed, one second at least.
+    pub poll: Duration,
 }
 
 impl Settings {
     pub fn from_env() -> Result<Self> {
-        let engine = match env::var("TIDX_ENGINE") {
-            Ok(v) => Engine::parse(&v)
-                .with_context(|| format!("TIDX_ENGINE={v}: expected postgres or clickhouse"))?,
-            Err(_) => Engine::Postgres,
+        let contract = env::var("CONTRACT_ADDRESS").unwrap_or_else(|_| DEFAULT_CONTRACT.into());
+        let poll_seconds: u64 = match env::var("POLL_SECONDS") {
+            Ok(v) => v
+                .trim()
+                .parse()
+                .with_context(|| format!("POLL_SECONDS={v}: not a whole number of seconds"))?,
+            Err(_) => 2,
         };
         Ok(Self {
             rpc_url: env::var("NVNM_RPC")
                 .or_else(|_| env::var("TEMPO_RPC"))
                 .unwrap_or_else(|_| DEFAULT_RPC_URL.to_string()),
-            tidx_url: env::var("TIDX_URL").unwrap_or_else(|_| DEFAULT_TIDX_URL.to_string()),
-            // No default: tidx requires a chain id on every query, and guessing
-            // one would silently audit a chain the node is not serving.
-            chain_id: env::var("CHAIN_ID")
-                .context("CHAIN_ID is required — tidx serves several chains from one endpoint")?
+            contract: contract
                 .trim()
                 .parse()
-                .context("CHAIN_ID must be a number")?,
-            engine,
-            first_block: env::var("START_BLOCK")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0),
-            // Validated at startup, not per request: a typo here would query a
-            // real-looking other address and list nothing.
-            factory: match env::var("FACTORY_ADDRESS") {
-                Ok(v) => Some(
-                    parse_address(&v)
-                        .with_context(|| format!("FACTORY_ADDRESS={v}: not a 20-byte address"))?,
-                ),
-                Err(_) => None,
-            },
+                .with_context(|| format!("CONTRACT_ADDRESS={contract}: not a 20-byte address"))?,
+            db_path: env::var("DB_PATH").unwrap_or_else(|_| "anchoring_name_index.db".into()),
             bind: env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8081".to_string()),
-            page_size: env::var("PAGE_SIZE")
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(HARD_LIMIT),
+            poll: Duration::from_secs(poll_seconds.max(1)),
         })
     }
 }
