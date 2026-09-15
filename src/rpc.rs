@@ -23,29 +23,38 @@ impl Rpc {
         })
     }
 
-    /// What `to` returns for `data` at the latest block.
-    pub async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>> {
+    async fn call(&self, method: &str, params: Value) -> Result<Value> {
         // One response per request, so the id is never matched against anything.
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "eth_call",
-            "params": [{"to": to.to_string(), "data": hex::encode_prefixed(data)}, "latest"],
-        });
-        let response: Value = self
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let mut response: Value = self
             .client
             .post(&self.url)
             .json(&body)
             .send()
             .await
-            .context("eth_call request")?
+            .with_context(|| format!("{method} request"))?
             .json()
             .await
-            .context("eth_call response")?;
+            .with_context(|| format!("{method} response"))?;
         if let Some(error) = response.get("error") {
-            bail!("eth_call: {error}");
+            bail!("{method}: {error}");
         }
-        let returned = response["result"]
+        Ok(response["result"].take())
+    }
+
+    /// The chain the node serves.
+    pub async fn chain_id(&self) -> Result<u64> {
+        let id = self.call("eth_chainId", json!([])).await?;
+        let id = id.as_str().context("eth_chainId: result is not a string")?;
+        u64::from_str_radix(id.trim_start_matches("0x"), 16)
+            .context("eth_chainId: result is not hex")
+    }
+
+    /// What `to` returns for `data` at the latest block.
+    pub async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>> {
+        let params = json!([{"to": to.to_string(), "data": hex::encode_prefixed(data)}, "latest"]);
+        let returned = self.call("eth_call", params).await?;
+        let returned = returned
             .as_str()
             .context("eth_call: result is not a string")?;
         hex::decode(returned).context("eth_call: result is not hex")

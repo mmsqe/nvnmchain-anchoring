@@ -22,31 +22,36 @@ fn registry(id: u64) -> Registry {
     }
 }
 
-/// A node whose contract holds `chain`, paging `registries` the way the contract
-/// does: from the cursor, at most `limit`, with a next key while more follow.
+/// A node on chain 0x2b45 whose contract holds `chain`, paging `registries` the way the
+/// contract does: from the cursor, at most `limit`, with a next key while more follow.
 async fn node(chain: Chain) -> String {
     async fn rpc(State(chain): State<Chain>, Json(request): Json<Value>) -> Json<Value> {
-        let data = hex::decode(request["params"][0]["data"].as_str().unwrap()).unwrap();
-        let call = registriesCall::abi_decode(&data).unwrap();
-        let start = u64::from_be_bytes(call.pagination.key[..].try_into().unwrap());
-        let chain = chain.lock().unwrap();
-        let rest: Vec<Registry> = chain.iter().filter(|r| r.id >= start).cloned().collect();
-        let n = rest.len().min(call.pagination.limit as usize);
-        let next_key = if rest.len() > n {
-            (start + n as u64).to_be_bytes().to_vec()
-        } else {
-            Vec::new()
+        let result = match request["method"].as_str().unwrap() {
+            "eth_chainId" => json!("0x2b45"),
+            "eth_call" => {
+                let data = hex::decode(request["params"][0]["data"].as_str().unwrap()).unwrap();
+                let call = registriesCall::abi_decode(&data).unwrap();
+                let start = u64::from_be_bytes(call.pagination.key[..].try_into().unwrap());
+                let chain = chain.lock().unwrap();
+                let rest: Vec<Registry> = chain.iter().filter(|r| r.id >= start).cloned().collect();
+                let n = rest.len().min(call.pagination.limit as usize);
+                let next_key = if rest.len() > n {
+                    (start + n as u64).to_be_bytes().to_vec()
+                } else {
+                    Vec::new()
+                };
+                let returned = registriesCall::abi_encode_returns(&registriesReturn {
+                    registriesOut: rest[..n].to_vec(),
+                    paginationOut: PageResponse {
+                        nextKey: next_key.into(),
+                        total: 0,
+                    },
+                });
+                json!(hex::encode_prefixed(returned))
+            }
+            other => panic!("the index asked for {other}"),
         };
-        let returned = registriesCall::abi_encode_returns(&registriesReturn {
-            registriesOut: rest[..n].to_vec(),
-            paginationOut: PageResponse {
-                nextKey: next_key.into(),
-                total: 0,
-            },
-        });
-        Json(
-            json!({"jsonrpc": "2.0", "id": request["id"], "result": hex::encode_prefixed(returned)}),
-        )
+        Json(json!({"jsonrpc": "2.0", "id": request["id"], "result": result}))
     }
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -71,6 +76,12 @@ async fn catches_up_across_pages_then_takes_only_what_is_new() {
     assert_eq!(catch_up(&rpc, Address::ZERO, &index).await.unwrap(), 2);
     assert_eq!(catch_up(&rpc, Address::ZERO, &index).await.unwrap(), 0);
     assert_eq!(index.last_id().unwrap(), 452);
+}
+
+#[tokio::test]
+async fn the_node_names_its_chain() {
+    let rpc = Rpc::new(node(Arc::default()).await).unwrap();
+    assert_eq!(rpc.chain_id().await.unwrap(), 0x2b45);
 }
 
 #[tokio::test]

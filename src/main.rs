@@ -29,8 +29,10 @@ async fn main() -> Result<()> {
     let cfg = Settings::from_env()?;
     let rpc = Rpc::new(&cfg.rpc_url)?;
     let index = Arc::new(Index::open(&cfg.db_path)?);
+    let chain_id = rpc.chain_id().await?;
+    index.bind(chain_id, cfg.contract)?;
     info!(
-        "rpc={} contract={} db={}",
+        "rpc={} chain={chain_id} contract={} db={}",
         cfg.rpc_url, cfg.contract, cfg.db_path
     );
 

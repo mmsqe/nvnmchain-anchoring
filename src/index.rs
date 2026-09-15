@@ -3,8 +3,9 @@
 
 use std::sync::{Mutex, PoisonError};
 
-use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use alloy_primitives::Address;
+use anyhow::{bail, Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::contract::Registry;
 
@@ -47,7 +48,13 @@ CREATE TABLE IF NOT EXISTS registries (
 );
 CREATE INDEX IF NOT EXISTS idx_registries_name_lower ON registries(name_lower);
 CREATE INDEX IF NOT EXISTS idx_registries_name_rev_lower ON registries(name_rev_lower);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ";
+
+fn max_id(conn: &Connection) -> Result<u64> {
+    let id: Option<i64> = conn.query_row("SELECT MAX(id) FROM registries", [], |r| r.get(0))?;
+    Ok(id.unwrap_or(0) as u64)
+}
 
 pub struct Index {
     conn: Mutex<Connection>,
@@ -71,9 +78,33 @@ impl Index {
     /// The highest id indexed, or 0 for none. Ids have no holes, so the index lacks only what
     /// follows it.
     pub fn last_id(&self) -> Result<u64> {
+        max_id(&self.conn.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Records that the index is `contract`'s on `chain_id`, or refuses one that is not: ids run
+    /// from 1 on every chain, so another chain's index looks level and answers with its names.
+    pub fn bind(&self, chain_id: u64, contract: Address) -> Result<()> {
+        let source = format!("chain {chain_id} contract {contract}");
         let conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
-        let id: Option<i64> = conn.query_row("SELECT MAX(id) FROM registries", [], |r| r.get(0))?;
-        Ok(id.unwrap_or(0) as u64)
+        let recorded: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key = 'source'", [], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        match recorded {
+            Some(from) if from == source => Ok(()),
+            Some(from) => bail!("the index is from {from}, not {source}: delete it to rebuild"),
+            None if max_id(&conn)? != 0 => {
+                bail!("the index predates recording its chain: delete it to rebuild")
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('source', ?1)",
+                    [source],
+                )?;
+                Ok(())
+            }
+        }
     }
 
     /// Indexes `registries` in one transaction; a page read twice lands the same rows.

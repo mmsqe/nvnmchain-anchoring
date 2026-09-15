@@ -1,3 +1,5 @@
+use alloy_primitives::Address;
+
 use nvnmchain_anchoring::contract::Registry;
 use nvnmchain_anchoring::index::{Index, Mode};
 
@@ -87,6 +89,32 @@ fn pages_by_id() {
         .search(Mode::Prefix, "registry", u64::MAX, u64::MAX)
         .unwrap()
         .is_empty());
+}
+
+/// Ids run from 1 on every chain, so only what the index recorded tells one chain's from another's.
+#[test]
+fn an_index_serves_the_one_chain_and_contract_it_was_built_from() {
+    let index = Index::open(":memory:").unwrap();
+    let (contract, other) = (Address::repeat_byte(0x0a), Address::repeat_byte(0x0b));
+    index.bind(1, contract).unwrap();
+    index.bind(1, contract).unwrap();
+    index.insert(&[registry(1, "One")]).unwrap();
+
+    let err = index.bind(2, contract).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        format!("the index is from chain 1 contract {contract}, not chain 2 contract {contract}: delete it to rebuild")
+    );
+    assert!(index.bind(1, other).is_err());
+
+    // Built before the index recorded its chain: refused rather than claimed.
+    let legacy = Index::open(":memory:").unwrap();
+    legacy.insert(&[registry(1, "One")]).unwrap();
+    let err = legacy.bind(1, contract).unwrap_err().to_string();
+    assert_eq!(
+        err,
+        "the index predates recording its chain: delete it to rebuild"
+    );
 }
 
 #[test]
