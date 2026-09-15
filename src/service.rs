@@ -14,8 +14,16 @@ use serde_json::{json, Value};
 
 use crate::contract::Registry;
 use crate::index::{Index, Mode};
+use crate::sync::Status;
 
 pub const SEARCH_PATH: &str = "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search";
+
+/// What the routes read: the index, and how its sync is going.
+#[derive(Clone)]
+pub struct App {
+    pub index: Arc<Index>,
+    pub status: Arc<Status>,
+}
 
 /// `defaultPageLimit` and `maxPageLimit` in the module's `keeper/query.go`.
 const DEFAULT_LIMIT: u64 = 50;
@@ -67,29 +75,41 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
-pub fn router(index: Arc<Index>) -> Router {
+pub fn router(app: App) -> Router {
     Router::new()
         .route("/health", get(health))
         .route(SEARCH_PATH, get(search))
-        .with_state(index)
+        .with_state(app)
 }
 
-pub async fn serve(index: Arc<Index>, bind: &str) -> Result<()> {
+pub async fn serve(app: App, bind: &str) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
     tracing::info!("serving on {bind}");
-    axum::serve(listener, router(index)).await?;
+    axum::serve(listener, router(app)).await?;
     Ok(())
 }
 
-/// How far the index reaches: the highest registry id it holds.
-async fn health(State(index): State<Arc<Index>>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(json!({"last_id": index.last_id()?})))
+/// How far the index reaches, and how the last round of sync went. A 503 while the node cannot
+/// be read: the index can only fall behind from there.
+async fn health(State(app): State<App>) -> Result<Response, ApiError> {
+    let round = app.status.round();
+    let body = json!({
+        "last_id": app.index.last_id()?,
+        "synced_at": round.synced_at,
+        "error": round.error,
+    });
+    let status = if round.error.is_some() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(body)).into_response())
 }
 
 async fn search(
-    State(index): State<Arc<Index>>,
+    State(app): State<App>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some(key) = params.keys().find(|k| !PARAMETERS.contains(&k.as_str())) {
@@ -119,7 +139,8 @@ async fn search(
         n => n.min(MAX_LIMIT),
     };
 
-    let registries: Vec<Value> = index
+    let registries: Vec<Value> = app
+        .index
         .search(mode, name, limit, offset)?
         .iter()
         .map(registry_json)

@@ -10,7 +10,7 @@ suffix and contains on the chain's `SearchRegistriesByName` route.
 NVNM_RPC=http://127.0.0.1:8545 nvnmchain-anchoring serve
 
 GET /NVNM-Chain/nvnmchain/anchoring/v1/registries/search?name=…[&mode=…][&pagination.offset=…][&pagination.limit=…]
-GET /health        the highest registry id indexed
+GET /health        the highest id indexed and when sync last succeeded; 503 with the error while it fails
 ```
 
 `serve` catches up from the contract before it listens, then every `POLL_SECONDS`.

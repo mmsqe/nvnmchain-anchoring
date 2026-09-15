@@ -6,7 +6,8 @@ use tracing::info;
 use nvnmchain_anchoring::config::Settings;
 use nvnmchain_anchoring::index::Index;
 use nvnmchain_anchoring::rpc::Rpc;
-use nvnmchain_anchoring::{service, sync};
+use nvnmchain_anchoring::service::{self, App};
+use nvnmchain_anchoring::sync::{self, Status};
 
 const USAGE: &str = "usage: nvnmchain-anchoring [serve|sync]";
 
@@ -46,7 +47,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let following = index.clone();
-    tokio::spawn(async move { sync::follow(rpc, cfg.contract, &following, cfg.poll).await });
-    service::serve(index, &cfg.bind).await
+    let status = Arc::new(Status::default());
+    status.ok();
+    let app = App {
+        index: index.clone(),
+        status: status.clone(),
+    };
+    let (contract, poll) = (cfg.contract, cfg.poll);
+    tokio::spawn(async move { sync::follow(rpc, contract, &index, poll, &status).await });
+    service::serve(app, &cfg.bind).await
 }

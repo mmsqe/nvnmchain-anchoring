@@ -4,7 +4,8 @@ use serde_json::{json, Value};
 
 use nvnmchain_anchoring::contract::Registry;
 use nvnmchain_anchoring::index::Index;
-use nvnmchain_anchoring::service::{router, SEARCH_PATH};
+use nvnmchain_anchoring::service::{router, App, SEARCH_PATH};
+use nvnmchain_anchoring::sync::Status;
 
 fn registry(id: u64, name: &str) -> Registry {
     Registry {
@@ -17,13 +18,16 @@ fn registry(id: u64, name: &str) -> Registry {
     }
 }
 
-/// The service over `registries`, and its base URL.
-async fn serve(registries: &[Registry]) -> String {
+/// The service over `registries`, reporting `status`, and its base URL.
+async fn serve(registries: &[Registry], status: Arc<Status>) -> String {
     let index = Index::open(":memory:").unwrap();
     index.insert(registries).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = router(Arc::new(index));
+    let app = router(App {
+        index: Arc::new(index),
+        status,
+    });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     url
 }
@@ -47,7 +51,11 @@ fn ids(body: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn answers_in_the_modules_json() {
-    let url = serve(&[registry(1, "Alpha Fund"), registry(2, "alpha fund")]).await;
+    let url = serve(
+        &[registry(1, "Alpha Fund"), registry(2, "alpha fund")],
+        Arc::default(),
+    )
+    .await;
     let (status, body) = get(&url, "name=ALPHA%20FUND").await;
     assert_eq!(status, 200);
     assert_eq!(
@@ -64,7 +72,11 @@ async fn answers_in_the_modules_json() {
 
 #[tokio::test]
 async fn a_mode_is_taken_by_name_or_by_number() {
-    let url = serve(&[registry(1, "Alpha Fund"), registry(2, "Fund Alpha")]).await;
+    let url = serve(
+        &[registry(1, "Alpha Fund"), registry(2, "Fund Alpha")],
+        Arc::default(),
+    )
+    .await;
     for mode in ["3", "REGISTRY_NAME_MATCH_MODE_SUFFIX"] {
         assert_eq!(
             ids(&get(&url, &format!("name=alpha&mode={mode}")).await.1),
@@ -87,7 +99,7 @@ async fn a_page_is_fifty_unless_asked_and_two_hundred_at_most() {
     let all: Vec<Registry> = (1..=250)
         .map(|id| registry(id, &format!("Registry {id}")))
         .collect();
-    let url = serve(&all).await;
+    let url = serve(&all, Arc::default()).await;
     let page = |query: &'static str| {
         let url = url.clone();
         async move { get(&url, &format!("name=registry&mode=2&{query}")).await.1 }
@@ -101,9 +113,40 @@ async fn a_page_is_fifty_unless_asked_and_two_hundred_at_most() {
     assert_eq!(tail["pagination"], json!({"next_key": null, "total": "0"}));
 }
 
+/// `/health` carries the last round of sync, and is a 503 while the node cannot be read.
+#[tokio::test]
+async fn health_reports_the_last_round_of_sync() {
+    let status = Arc::new(Status::default());
+    let url = serve(&[registry(1, "Alpha")], status.clone()).await;
+    let health = || async {
+        let response = reqwest::get(format!("{url}/health")).await.unwrap();
+        (
+            response.status().as_u16(),
+            response.json::<Value>().await.unwrap(),
+        )
+    };
+
+    assert_eq!(
+        health().await,
+        (200, json!({"last_id": 1, "synced_at": null, "error": null}))
+    );
+
+    status.failed(&anyhow::anyhow!("eth_call request: connection refused"));
+    let (code, body) = health().await;
+    assert_eq!(code, 503);
+    assert_eq!(body["error"], json!("eth_call request: connection refused"));
+    assert_eq!(body["last_id"], json!(1), "what it holds is still reported");
+
+    status.ok();
+    let (code, body) = health().await;
+    assert_eq!(code, 200);
+    assert!(body["synced_at"].as_u64().unwrap() > 0);
+    assert_eq!(body["error"], Value::Null);
+}
+
 #[tokio::test]
 async fn a_bad_request_says_what_is_wrong() {
-    let url = serve(&[registry(1, "Alpha")]).await;
+    let url = serve(&[registry(1, "Alpha")], Arc::default()).await;
     for (query, message) in [
         ("", "name must be provided"),
         ("name=", "name must be provided"),
