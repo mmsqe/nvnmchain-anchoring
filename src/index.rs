@@ -107,13 +107,14 @@ impl Index {
         }
     }
 
-    /// Indexes `registries` in one transaction; a page read twice lands the same rows.
+    /// Indexes `registries` in one transaction. A registry never changes on chain, so one read
+    /// twice is left as it is rather than written again.
     pub fn insert(&self, registries: &[Registry]) -> Result<()> {
         let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let tx = conn.transaction()?;
         {
             let mut insert = tx.prepare_cached(
-                "INSERT OR REPLACE INTO registries
+                "INSERT OR IGNORE INTO registries
                      (id, name, description, creator, created_at, metadata, name_lower, name_rev_lower)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
