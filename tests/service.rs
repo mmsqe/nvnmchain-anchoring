@@ -1,35 +1,90 @@
-use std::sync::Arc;
+//! The REST surface over a stub node: what a request turns into, and what an answer turns back.
+//! The matching itself is the node's, and `tempo-e2e` covers it there.
 
+use std::sync::{Arc, Mutex};
+
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use nvnmchain_anchoring::contract::Registry;
-use nvnmchain_anchoring::index::Index;
+use nvnmchain_anchoring::rpc::Rpc;
 use nvnmchain_anchoring::service::{router, App, SEARCH_PATH};
-use nvnmchain_anchoring::sync::Status;
 
-fn registry(id: u64, name: &str) -> Registry {
-    Registry {
-        id,
-        name: name.into(),
-        description: "d".into(),
-        creator: "nvnm1c".into(),
-        createdAt: "t".into(),
-        metadata: "m".into(),
+/// A node's `anchoring_` methods, canned. Search answers `registries` whatever it is asked, and
+/// records the params it was asked with.
+struct Node {
+    asked: Option<Value>,
+    registries: Value,
+    status: Value,
+    /// Answered instead of either, as a node that is down or not running the index would.
+    error: Option<String>,
+}
+
+impl Default for Node {
+    /// Answers every method, emptily. A derived default leaves both results `null`, which neither
+    /// decodes from, and every case below becomes a 500 that still recorded what it was asked.
+    fn default() -> Self {
+        Self {
+            asked: None,
+            registries: json!([]),
+            status: json!({"lastId": 0, "registryCount": 0}),
+            error: None,
+        }
     }
 }
 
-/// The service over `registries`, reporting `status`, and its base URL.
-async fn serve(registries: &[Registry], status: Arc<Status>) -> String {
-    let index = Index::open(":memory:").unwrap();
-    index.insert(registries).unwrap();
+type Stub = Arc<Mutex<Node>>;
+
+async fn answer(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value> {
+    let mut node = stub.lock().unwrap();
+    if let Some(message) = node.error.clone() {
+        return Json(
+            json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": message}}),
+        );
+    }
+    let result = match body["method"].as_str().unwrap_or_default() {
+        "anchoring_searchRegistriesByName" => {
+            node.asked = Some(body["params"][0].clone());
+            json!({"registries": node.registries.clone()})
+        }
+        "anchoring_nameIndexStatus" => node.status.clone(),
+        other => {
+            let error = json!({"code": -32601, "message": format!("no method {other}")});
+            return Json(json!({"jsonrpc": "2.0", "id": 1, "error": error}));
+        }
+    };
+    Json(json!({"jsonrpc": "2.0", "id": 1, "result": result}))
+}
+
+/// The stub, and the service pointed at it.
+async fn serve(node: Node) -> (Stub, String) {
+    let stub: Stub = Arc::new(Mutex::new(node));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node_url = format!("http://{}", listener.local_addr().unwrap());
+    let routes = Router::new()
+        .route("/", post(answer))
+        .with_state(stub.clone());
+    tokio::spawn(async move { axum::serve(listener, routes).await.unwrap() });
+
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = router(App {
-        index: Arc::new(index),
-        status,
+        rpc: Arc::new(Rpc::new(node_url).unwrap()),
     });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    url
+    (stub, url)
+}
+
+fn registry(id: u64, name: &str) -> Value {
+    json!({
+        "id": id,
+        "name": name,
+        "description": "d",
+        "creator": "nvnm1c",
+        "createdAt": "t",
+        "metadata": "m",
+    })
 }
 
 async fn get(url: &str, query: &str) -> (u16, Value) {
@@ -40,21 +95,12 @@ async fn get(url: &str, query: &str) -> (u16, Value) {
     (status, response.json().await.unwrap())
 }
 
-fn ids(body: &Value) -> Vec<String> {
-    body["registries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|r| r["id"].as_str().unwrap().to_string())
-        .collect()
-}
-
 #[tokio::test]
 async fn answers_in_the_modules_json() {
-    let url = serve(
-        &[registry(1, "Alpha Fund"), registry(2, "alpha fund")],
-        Arc::default(),
-    )
+    let (_stub, url) = serve(Node {
+        registries: json!([registry(1, "Alpha Fund"), registry(2, "alpha fund")]),
+        ..Node::default()
+    })
     .await;
     let (status, body) = get(&url, "name=ALPHA%20FUND").await;
     assert_eq!(status, 200);
@@ -72,52 +118,62 @@ async fn answers_in_the_modules_json() {
 
 #[tokio::test]
 async fn a_mode_is_taken_by_name_or_by_number() {
-    let url = serve(
-        &[registry(1, "Alpha Fund"), registry(2, "Fund Alpha")],
-        Arc::default(),
-    )
-    .await;
-    for mode in ["3", "REGISTRY_NAME_MATCH_MODE_SUFFIX"] {
-        assert_eq!(
-            ids(&get(&url, &format!("name=alpha&mode={mode}")).await.1),
-            ["2"]
-        );
+    let (stub, url) = serve(Node::default()).await;
+    let asked = |query: &'static str| {
+        let url = url.clone();
+        let stub = stub.clone();
+        async move {
+            get(&url, query).await;
+            stub.lock().unwrap().asked.clone().unwrap()["mode"].clone()
+        }
+    };
+
+    assert_eq!(asked("name=a").await, json!("exact"));
+    for query in ["name=a&mode=0", "name=a&mode=1"] {
+        assert_eq!(asked(query).await, json!("exact"), "{query}");
     }
-    for mode in ["2", "REGISTRY_NAME_MATCH_MODE_PREFIX"] {
-        assert_eq!(
-            ids(&get(&url, &format!("name=alpha&mode={mode}")).await.1),
-            ["1"]
-        );
-    }
-    assert_eq!(ids(&get(&url, "name=fund&mode=4").await.1), ["1", "2"]);
-    // Unspecified is exact.
-    assert!(ids(&get(&url, "name=alpha&mode=0").await.1).is_empty());
+    assert_eq!(asked("name=a&mode=2").await, json!("prefix"));
+    assert_eq!(
+        asked("name=a&mode=REGISTRY_NAME_MATCH_MODE_SUFFIX").await,
+        json!("suffix")
+    );
+    assert_eq!(asked("name=a&mode=4").await, json!("contains"));
 }
 
 #[tokio::test]
 async fn a_page_is_fifty_unless_asked_and_two_hundred_at_most() {
-    let all: Vec<Registry> = (1..=250)
-        .map(|id| registry(id, &format!("Registry {id}")))
-        .collect();
-    let url = serve(&all, Arc::default()).await;
-    let page = |query: &'static str| {
+    let (stub, url) = serve(Node::default()).await;
+    let asked = |query: &'static str| {
         let url = url.clone();
-        async move { get(&url, &format!("name=registry&mode=2&{query}")).await.1 }
+        let stub = stub.clone();
+        async move {
+            let (status, body) = get(&url, query).await;
+            assert_eq!(status, 200, "{query}: {body}");
+            let asked = stub.lock().unwrap().asked.clone().unwrap();
+            (asked["offset"].clone(), asked["limit"].clone(), body)
+        }
     };
 
-    assert_eq!(ids(&page("").await).len(), 50);
-    assert_eq!(ids(&page("pagination.limit=1000").await).len(), 200);
-    let tail = page("pagination.offset=240&pagination.limit=50").await;
-    assert_eq!(ids(&tail).first().unwrap(), "241");
-    assert_eq!(ids(&tail).len(), 10);
-    assert_eq!(tail["pagination"], json!({"next_key": null, "total": "0"}));
+    let (offset, limit, body) = asked("name=a").await;
+    assert_eq!((offset, limit), (json!(0), json!(50)));
+    assert_eq!(body["pagination"], Value::Null, "none was asked for");
+
+    let (_, limit, _) = asked("name=a&pagination.limit=1000").await;
+    assert_eq!(limit, json!(200));
+
+    let (offset, limit, body) = asked("name=a&pagination.offset=240&pagination.limit=50").await;
+    assert_eq!((offset, limit), (json!(240), json!(50)));
+    assert_eq!(body["pagination"], json!({"next_key": null, "total": "0"}));
 }
 
-/// `/health` carries the last round of sync, and is a 503 while the node cannot be read.
+/// `/health` carries how far the node's index reaches, and is a 503 while it cannot be read.
 #[tokio::test]
-async fn health_reports_the_last_round_of_sync() {
-    let status = Arc::new(Status::default());
-    let url = serve(&[registry(1, "Alpha")], status.clone()).await;
+async fn health_reports_what_the_node_has_indexed() {
+    let (stub, url) = serve(Node {
+        status: json!({"lastId": 7, "registryCount": 9, "blockNumber": 3}),
+        ..Node::default()
+    })
+    .await;
     let health = || async {
         let response = reqwest::get(format!("{url}/health")).await.unwrap();
         (
@@ -128,25 +184,28 @@ async fn health_reports_the_last_round_of_sync() {
 
     assert_eq!(
         health().await,
-        (200, json!({"last_id": 1, "synced_at": null, "error": null}))
+        (
+            200,
+            json!({"last_id": 7, "registry_count": 9, "error": null})
+        )
     );
 
-    status.failed(&anyhow::anyhow!("eth_call request: connection refused"));
+    stub.lock().unwrap().error = Some("connection refused".into());
     let (code, body) = health().await;
     assert_eq!(code, 503);
-    assert_eq!(body["error"], json!("eth_call request: connection refused"));
-    assert_eq!(body["last_id"], json!(1), "what it holds is still reported");
-
-    status.ok();
-    let (code, body) = health().await;
-    assert_eq!(code, 200);
-    assert!(body["synced_at"].as_u64().unwrap() > 0);
-    assert_eq!(body["error"], Value::Null);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused"),
+        "{body}"
+    );
 }
 
 #[tokio::test]
 async fn a_bad_request_says_what_is_wrong() {
-    let url = serve(&[registry(1, "Alpha")], Arc::default()).await;
+    // Every one is refused before the node is asked, so the stub answers nothing.
+    let (stub, url) = serve(Node::default()).await;
     for (query, message) in [
         ("", "name must be provided"),
         ("name=", "name must be provided"),
@@ -165,4 +224,18 @@ async fn a_bad_request_says_what_is_wrong() {
             "{query}"
         );
     }
+    assert!(stub.lock().unwrap().asked.is_none());
+}
+
+/// A node that cannot answer is the gateway's `codes.Internal`, not a bad request.
+#[tokio::test]
+async fn a_node_that_fails_is_a_500() {
+    let (_stub, url) = serve(Node {
+        error: Some("no method anchoring_searchRegistriesByName".into()),
+        ..Node::default()
+    })
+    .await;
+    let (status, body) = get(&url, "name=alpha").await;
+    assert_eq!(status, 500);
+    assert_eq!(body["code"], json!(13));
 }

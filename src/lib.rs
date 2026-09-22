@@ -1,9 +1,6 @@
-//! Prefix, suffix and contains search over the registry names held by the anchoring contract at
-//! `0x…0a00`, which answers for an exact name only.
+//! The module's registry name search, served on its REST route from a node that holds the index.
+//! The node searches; this translates.
 
 pub mod config;
-pub mod contract;
-pub mod index;
 pub mod rpc;
 pub mod service;
-pub mod sync;

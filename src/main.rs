@@ -1,15 +1,13 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::info;
 
 use nvnmchain_anchoring::config::Settings;
-use nvnmchain_anchoring::index::Index;
 use nvnmchain_anchoring::rpc::Rpc;
 use nvnmchain_anchoring::service::{self, App};
-use nvnmchain_anchoring::sync::{self, Status};
 
-const USAGE: &str = "usage: nvnmchain-anchoring [serve|sync]";
+const USAGE: &str = "usage: nvnmchain-anchoring [serve]";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -22,38 +20,24 @@ async fn main() -> Result<()> {
         .init();
 
     let command = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
-    if !matches!(command.as_str(), "serve" | "sync") {
+    if command != "serve" {
         eprintln!("unknown command `{command}`\n{USAGE}");
         std::process::exit(2);
     }
 
-    let cfg = Settings::from_env()?;
-    let rpc = Rpc::new(&cfg.rpc_url)?;
-    let index = Arc::new(Index::open(&cfg.db_path)?);
-    let chain_id = rpc.chain_id().await?;
-    index.bind(chain_id, cfg.contract)?;
+    let cfg = Settings::from_env();
+    let rpc = Arc::new(Rpc::new(&cfg.rpc_url)?);
+    // Asked before listening, so a node without the index says so here and not per request.
+    let status = rpc.status().await.with_context(|| {
+        format!(
+            "{} does not answer anchoring_nameIndexStatus; start it with --anchoring.name-index",
+            cfg.rpc_url
+        )
+    })?;
     info!(
-        "rpc={} chain={chain_id} contract={} db={}",
-        cfg.rpc_url, cfg.contract, cfg.db_path
+        "rpc={} indexed through id {} of {}",
+        cfg.rpc_url, status.last_id, status.registry_count
     );
 
-    // Caught up before serving, so a search never answers from half an index.
-    let added = sync::catch_up(&rpc, cfg.contract, &index).await?;
-    info!(
-        "registries indexed: {added}, through id {}",
-        index.last_id()?
-    );
-    if command == "sync" {
-        return Ok(());
-    }
-
-    let status = Arc::new(Status::default());
-    status.ok();
-    let app = App {
-        index: index.clone(),
-        status: status.clone(),
-    };
-    let (contract, poll) = (cfg.contract, cfg.poll);
-    tokio::spawn(async move { sync::follow(rpc, contract, &index, poll, &status).await });
-    service::serve(app, &cfg.bind).await
+    service::serve(App { rpc }, &cfg.bind).await
 }

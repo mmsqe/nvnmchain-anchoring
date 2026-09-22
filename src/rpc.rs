@@ -1,11 +1,32 @@
-//! A JSON-RPC client for the one read the index makes: `eth_call`.
+//! A JSON-RPC client for the two `anchoring_` methods a node running the index serves.
 
 use std::time::Duration;
 
-use alloy_primitives::{hex, Address};
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::{json, Value};
+
+/// `IAnchoring.Registry` as the node answers one: a number for the id, and camelCase.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Registry {
+    pub id: u64,
+    pub name: String,
+    pub description: String,
+    pub creator: String,
+    pub created_at: String,
+    pub metadata: String,
+}
+
+/// How far the node's index reaches. It also reports the block it is level with, which is not
+/// something a caller of this service can act on.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexStatus {
+    pub last_id: u64,
+    pub registry_count: u64,
+}
 
 pub struct Rpc {
     client: Client,
@@ -42,21 +63,23 @@ impl Rpc {
         Ok(response["result"].take())
     }
 
-    /// The chain the node serves.
-    pub async fn chain_id(&self) -> Result<u64> {
-        let id = self.call("eth_chainId", json!([])).await?;
-        let id = id.as_str().context("eth_chainId: result is not a string")?;
-        u64::from_str_radix(id.trim_start_matches("0x"), 16)
-            .context("eth_chainId: result is not hex")
+    /// Registries whose name matches. `mode` is the bare word the node's `Mode` deserializes.
+    pub async fn search(
+        &self,
+        name: &str,
+        mode: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Registry>> {
+        let params = json!([{"name": name, "mode": mode, "offset": offset, "limit": limit}]);
+        let mut answer = self
+            .call("anchoring_searchRegistriesByName", params)
+            .await?;
+        serde_json::from_value(answer["registries"].take()).context("decode registries")
     }
 
-    /// What `to` returns for `data` at the latest block.
-    pub async fn eth_call(&self, to: Address, data: &[u8]) -> Result<Vec<u8>> {
-        let params = json!([{"to": to.to_string(), "data": hex::encode_prefixed(data)}, "latest"]);
-        let returned = self.call("eth_call", params).await?;
-        let returned = returned
-            .as_str()
-            .context("eth_call: result is not a string")?;
-        hex::decode(returned).context("eth_call: result is not hex")
+    pub async fn status(&self) -> Result<IndexStatus> {
+        let answer = self.call("anchoring_nameIndexStatus", json!([])).await?;
+        serde_json::from_value(answer).context("decode nameIndexStatus")
     }
 }

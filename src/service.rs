@@ -1,5 +1,5 @@
 //! `SearchRegistriesByName` on the module's REST route and in its JSON, so a client moves over by
-//! changing the host it calls.
+//! changing the host it calls. The search itself is the node's, reached over JSON-RPC.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,20 +12,54 @@ use axum::routing::get;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use crate::contract::Registry;
-use crate::index::{Index, Mode};
-use crate::sync::Status;
+use crate::rpc::{Registry, Rpc};
 
 pub const SEARCH_PATH: &str = "/NVNM-Chain/nvnmchain/anchoring/v1/registries/search";
 
-/// What the routes read: the index, and how its sync is going.
-#[derive(Clone)]
-pub struct App {
-    pub index: Arc<Index>,
-    pub status: Arc<Status>,
+/// `RegistryNameMatchMode`. Matching is case-insensitive in every mode.
+#[derive(Clone, Copy)]
+enum Mode {
+    Exact,
+    Prefix,
+    Suffix,
+    Contains,
 }
 
-/// `defaultPageLimit` and `maxPageLimit` in the module's `keeper/query.go`.
+impl Mode {
+    /// The enum's number or its name, as the gateway took either; unspecified is exact. The node
+    /// takes these spellings too, but refusing one here keeps a bad mode a 400 and not a 500.
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "0"
+            | "1"
+            | "REGISTRY_NAME_MATCH_MODE_UNSPECIFIED"
+            | "REGISTRY_NAME_MATCH_MODE_EXACT" => Some(Self::Exact),
+            "2" | "REGISTRY_NAME_MATCH_MODE_PREFIX" => Some(Self::Prefix),
+            "3" | "REGISTRY_NAME_MATCH_MODE_SUFFIX" => Some(Self::Suffix),
+            "4" | "REGISTRY_NAME_MATCH_MODE_CONTAINS" => Some(Self::Contains),
+            _ => None,
+        }
+    }
+
+    /// What the node's `Mode` deserializes.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Prefix => "prefix",
+            Self::Suffix => "suffix",
+            Self::Contains => "contains",
+        }
+    }
+}
+
+/// What the routes read: the node that holds the index.
+#[derive(Clone)]
+pub struct App {
+    pub rpc: Arc<Rpc>,
+}
+
+/// `defaultPageLimit` and `maxPageLimit` in the module's `keeper/query.go`, applied here so the
+/// route's page stays what it documents whatever the node defaults to.
 const DEFAULT_LIMIT: u64 = 50;
 const MAX_LIMIT: u64 = 200;
 
@@ -65,7 +99,7 @@ fn invalid(message: impl Into<String>) -> ApiError {
 }
 
 impl From<anyhow::Error> for ApiError {
-    /// `codes.Internal`: the index failed, not the request.
+    /// `codes.Internal`: the node failed, not the request.
     fn from(err: anyhow::Error) -> Self {
         ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -91,21 +125,25 @@ pub async fn serve(app: App, bind: &str) -> Result<()> {
     Ok(())
 }
 
-/// How far the index reaches, and how the last round of sync went. A 503 while the node cannot
-/// be read: the index can only fall behind from there.
-async fn health(State(app): State<App>) -> Result<Response, ApiError> {
-    let round = app.status.round();
-    let body = json!({
-        "last_id": app.index.last_id()?,
-        "synced_at": round.synced_at,
-        "error": round.error,
-    });
-    let status = if round.error.is_some() {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        StatusCode::OK
-    };
-    Ok((status, Json(body)).into_response())
+/// How far the node's index reaches; a 503 while it cannot be read, since there is nothing to
+/// search without it.
+async fn health(State(app): State<App>) -> Response {
+    match app.rpc.status().await {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(json!({
+                "last_id": status.last_id,
+                "registry_count": status.registry_count,
+                "error": null,
+            })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": format!("{err:#}")})),
+        )
+            .into_response(),
+    }
 }
 
 async fn search(
@@ -140,8 +178,9 @@ async fn search(
     };
 
     let registries: Vec<Value> = app
-        .index
-        .search(mode, name, limit, offset)?
+        .rpc
+        .search(name, mode.as_str(), offset, limit)
+        .await?
         .iter()
         .map(registry_json)
         .collect();
@@ -163,7 +202,7 @@ fn registry_json(r: &Registry) -> Value {
         "name": r.name,
         "description": r.description,
         "creator": r.creator,
-        "created_at": r.createdAt,
+        "created_at": r.created_at,
         "metadata": r.metadata,
     })
 }
