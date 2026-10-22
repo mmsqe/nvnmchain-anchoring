@@ -165,8 +165,8 @@ async fn search(
             Mode::parse(value).ok_or_else(|| invalid(format!("invalid mode {value}")))?
         }
     };
-    // `count_total` and `reverse` are taken and ignored: the total is always counted, and
-    // matches come by id.
+    // `count_total` and `reverse` are taken and ignored, as in the module: nothing is counted,
+    // and matches come by id.
     let number = |key: &str| -> Result<u64, ApiError> {
         params.get(key).map_or(Ok(0), |v| {
             v.trim()
@@ -207,7 +207,7 @@ async fn search(
     let next_key = page.next_key.map(|id| STANDARD.encode(id.to_be_bytes()));
     Ok(Json(json!({
         "registries": registries,
-        "pagination": {"next_key": next_key, "total": page.total.to_string()},
+        "pagination": {"next_key": next_key, "total": "0"},
     })))
 }
 

@@ -19,7 +19,7 @@ pub struct Registry {
     pub metadata: String,
 }
 
-/// One page of matches, and how many match in all.
+/// One page of matches.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Page {
@@ -27,7 +27,6 @@ pub struct Page {
     /// The next match's id, which the node writes as 8 bytes in hex.
     #[serde(default, deserialize_with = "hex_id")]
     pub next_key: Option<u64>,
-    pub total: u64,
 }
 
 /// How far the node's index reaches. It also reports the block it is level with, which is not

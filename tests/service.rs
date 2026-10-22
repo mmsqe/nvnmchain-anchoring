@@ -22,12 +22,13 @@ struct Node {
 }
 
 impl Default for Node {
-    /// Answers every method, emptily. A derived default leaves both results `null`, which neither
-    /// decodes from, and every case below becomes a 500 that still recorded what it was asked.
+    /// Answers every method, emptily, and search as a node from before `nextKey` did. A derived
+    /// default leaves both results `null`, which neither decodes from, and every case below becomes
+    /// a 500 that still recorded what it was asked.
     fn default() -> Self {
         Self {
             asked: None,
-            search: json!({"registries": [], "nextKey": null, "total": 0}),
+            search: json!({"registries": []}),
             status: json!({"lastId": 0, "registryCount": 0}),
             error: None,
         }
@@ -101,7 +102,6 @@ async fn answers_in_the_modules_json() {
         search: json!({
             "registries": [registry(1, "Alpha Fund"), registry(2, "alpha fund")],
             "nextKey": "0x0000000000000003",
-            "total": 5,
         }),
         ..Node::default()
     })
@@ -115,7 +115,7 @@ async fn answers_in_the_modules_json() {
                 {"id": "1", "name": "Alpha Fund", "description": "d", "creator": "nvnm1c", "created_at": "t", "metadata": "m"},
                 {"id": "2", "name": "alpha fund", "description": "d", "creator": "nvnm1c", "created_at": "t", "metadata": "m"},
             ],
-            "pagination": {"next_key": "AAAAAAAAAAM=", "total": "5"},
+            "pagination": {"next_key": "AAAAAAAAAAM=", "total": "0"},
         })
     );
 }

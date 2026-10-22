@@ -21,6 +21,6 @@ The node must run `--anchoring.name-index`, which is what serves `anchoring_sear
 
 `mode` is `REGISTRY_NAME_MATCH_MODE_EXACT` (the default), `_PREFIX`, `_SUFFIX` or `_CONTAINS`, or its
 number. A page is 50 by default, 200 at most; `pagination.next_key` is the next page's
-`pagination.key`, and `pagination.total` counts every match. A missing name, unknown mode or unknown
-parameter is a 400, a node that cannot answer a 500. What each mode matches is the node's, and
-`tempo-e2e` covers it there.
+`pagination.key`, and `pagination.total` is 0, as the module never counted. A missing name, unknown
+mode or unknown parameter is a 400, a node that cannot answer a 500. What each mode matches is the
+node's, and `tempo-e2e` covers it there.
