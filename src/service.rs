@@ -10,6 +10,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE};
+use base64::Engine;
 use serde_json::{json, Value};
 
 use crate::rpc::{Registry, Rpc};
@@ -163,7 +165,8 @@ async fn search(
             Mode::parse(value).ok_or_else(|| invalid(format!("invalid mode {value}")))?
         }
     };
-    // Only offset and limit are honoured, as in the module; the rest is taken and ignored.
+    // `count_total` and `reverse` are taken and ignored: the total is always counted, and
+    // matches come by id.
     let number = |key: &str| -> Result<u64, ApiError> {
         params.get(key).map_or(Ok(0), |v| {
             v.trim()
@@ -171,28 +174,41 @@ async fn search(
                 .map_err(|_| invalid(format!("{key}={v}: not a number")))
         })
     };
+    // A `bytes` field, which the gateway took as standard or URL-safe base64.
+    let key = params
+        .get("pagination.key")
+        .filter(|v| !v.is_empty())
+        .map(|v| {
+            STANDARD
+                .decode(v)
+                .or_else(|_| URL_SAFE.decode(v))
+                .ok()
+                .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                .map(u64::from_be_bytes)
+                .ok_or_else(|| invalid(format!("pagination.key={v}: not a registry id")))
+        })
+        .transpose()?;
     let offset = number("pagination.offset")?;
+    if key.is_some() && offset != 0 {
+        return Err(invalid(
+            "invalid request, either offset or key is expected, got both",
+        ));
+    }
     let limit = match number("pagination.limit")? {
         0 => DEFAULT_LIMIT,
         n => n.min(MAX_LIMIT),
     };
 
-    let registries: Vec<Value> = app
+    let page = app
         .rpc
-        .search(name, mode.as_str(), offset, limit)
-        .await?
-        .iter()
-        .map(registry_json)
-        .collect();
-    // The module sets a `PageResponse` only when the request carried one, and the
-    // gateway writes its defaults out.
-    let pagination = params
-        .keys()
-        .any(|k| k.starts_with("pagination."))
-        .then(|| json!({"next_key": null, "total": "0"}));
-    Ok(Json(
-        json!({"registries": registries, "pagination": pagination}),
-    ))
+        .search(name, mode.as_str(), key, offset, limit)
+        .await?;
+    let registries: Vec<Value> = page.registries.iter().map(registry_json).collect();
+    let next_key = page.next_key.map(|id| STANDARD.encode(id.to_be_bytes()));
+    Ok(Json(json!({
+        "registries": registries,
+        "pagination": {"next_key": next_key, "total": page.total.to_string()},
+    })))
 }
 
 /// A registry as the gateway wrote one: proto field names, and a `uint64` as a string.

@@ -11,11 +11,11 @@ use serde_json::{json, Value};
 use nvnmchain_anchoring::rpc::Rpc;
 use nvnmchain_anchoring::service::{router, App, SEARCH_PATH};
 
-/// A node's `anchoring_` methods, canned. Search answers `registries` whatever it is asked, and
+/// A node's `anchoring_` methods, canned. Search answers `search` whatever it is asked, and
 /// records the params it was asked with.
 struct Node {
     asked: Option<Value>,
-    registries: Value,
+    search: Value,
     status: Value,
     /// Answered instead of either, as a node that is down or not running the index would.
     error: Option<String>,
@@ -27,7 +27,7 @@ impl Default for Node {
     fn default() -> Self {
         Self {
             asked: None,
-            registries: json!([]),
+            search: json!({"registries": [], "nextKey": null, "total": 0}),
             status: json!({"lastId": 0, "registryCount": 0}),
             error: None,
         }
@@ -46,7 +46,7 @@ async fn answer(State(stub): State<Stub>, Json(body): Json<Value>) -> Json<Value
     let result = match body["method"].as_str().unwrap_or_default() {
         "anchoring_searchRegistriesByName" => {
             node.asked = Some(body["params"][0].clone());
-            json!({"registries": node.registries.clone()})
+            node.search.clone()
         }
         "anchoring_nameIndexStatus" => node.status.clone(),
         other => {
@@ -98,7 +98,11 @@ async fn get(url: &str, query: &str) -> (u16, Value) {
 #[tokio::test]
 async fn answers_in_the_modules_json() {
     let (_stub, url) = serve(Node {
-        registries: json!([registry(1, "Alpha Fund"), registry(2, "alpha fund")]),
+        search: json!({
+            "registries": [registry(1, "Alpha Fund"), registry(2, "alpha fund")],
+            "nextKey": "0x0000000000000003",
+            "total": 5,
+        }),
         ..Node::default()
     })
     .await;
@@ -111,9 +115,31 @@ async fn answers_in_the_modules_json() {
                 {"id": "1", "name": "Alpha Fund", "description": "d", "creator": "nvnm1c", "created_at": "t", "metadata": "m"},
                 {"id": "2", "name": "alpha fund", "description": "d", "creator": "nvnm1c", "created_at": "t", "metadata": "m"},
             ],
-            "pagination": null,
+            "pagination": {"next_key": "AAAAAAAAAAM=", "total": "5"},
         })
     );
+}
+
+/// A `next_key` handed back, in either base64 the gateway took, asks the node from that id.
+#[tokio::test]
+async fn a_key_pages_on_from_the_id_it_names() {
+    let (stub, url) = serve(Node::default()).await;
+    for (query, key) in [
+        (
+            "name=a&pagination.key=AAAAAAAAAAM%3D",
+            json!("0x0000000000000003"),
+        ),
+        (
+            "name=a&pagination.key=AAAAAAAA__8%3D",
+            json!("0x000000000000ffff"),
+        ),
+        ("name=a&pagination.key=", Value::Null),
+    ] {
+        let (status, body) = get(&url, query).await;
+        assert_eq!(status, 200, "{query}: {body}");
+        let asked = stub.lock().unwrap().asked.clone().unwrap();
+        assert_eq!(asked["key"], key, "{query}");
+    }
 }
 
 #[tokio::test]
@@ -156,14 +182,13 @@ async fn a_page_is_fifty_unless_asked_and_two_hundred_at_most() {
 
     let (offset, limit, body) = asked("name=a").await;
     assert_eq!((offset, limit), (json!(0), json!(50)));
-    assert_eq!(body["pagination"], Value::Null, "none was asked for");
+    assert_eq!(body["pagination"], json!({"next_key": null, "total": "0"}));
 
     let (_, limit, _) = asked("name=a&pagination.limit=1000").await;
     assert_eq!(limit, json!(200));
 
-    let (offset, limit, body) = asked("name=a&pagination.offset=240&pagination.limit=50").await;
+    let (offset, limit, _) = asked("name=a&pagination.offset=240&pagination.limit=50").await;
     assert_eq!((offset, limit), (json!(240), json!(50)));
-    assert_eq!(body["pagination"], json!({"next_key": null, "total": "0"}));
 }
 
 /// `/health` carries how far the node's index reaches, and is a 503 while it cannot be read.
@@ -214,6 +239,14 @@ async fn a_bad_request_says_what_is_wrong() {
         (
             "name=alpha&pagination.limit=x",
             "pagination.limit=x: not a number",
+        ),
+        (
+            "name=alpha&pagination.key=AAAA",
+            "pagination.key=AAAA: not a registry id",
+        ),
+        (
+            "name=alpha&pagination.key=AAAAAAAAAAM%3D&pagination.offset=1",
+            "invalid request, either offset or key is expected, got both",
         ),
     ] {
         let (status, body) = get(&url, query).await;

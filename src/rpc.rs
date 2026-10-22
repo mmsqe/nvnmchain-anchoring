@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
 use serde_json::{json, Value};
 
 /// `IAnchoring.Registry` as the node answers one: a number for the id, and camelCase.
@@ -17,6 +17,17 @@ pub struct Registry {
     pub creator: String,
     pub created_at: String,
     pub metadata: String,
+}
+
+/// One page of matches, and how many match in all.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Page {
+    pub registries: Vec<Registry>,
+    /// The next match's id, which the node writes as 8 bytes in hex.
+    #[serde(default, deserialize_with = "hex_id")]
+    pub next_key: Option<u64>,
+    pub total: u64,
 }
 
 /// How far the node's index reaches. It also reports the block it is level with, which is not
@@ -63,23 +74,41 @@ impl Rpc {
         Ok(response["result"].take())
     }
 
-    /// Registries whose name matches. `mode` is the bare word the node's `Mode` deserializes.
+    /// Registries whose name matches, from the id `key` or past `offset` matches. `mode` is the
+    /// bare word the node's `Mode` deserializes.
     pub async fn search(
         &self,
         name: &str,
         mode: &str,
+        key: Option<u64>,
         offset: u64,
         limit: u64,
-    ) -> Result<Vec<Registry>> {
-        let params = json!([{"name": name, "mode": mode, "offset": offset, "limit": limit}]);
-        let mut answer = self
-            .call("anchoring_searchRegistriesByName", params)
+    ) -> Result<Page> {
+        let mut params = json!({"name": name, "mode": mode, "offset": offset, "limit": limit});
+        if let Some(key) = key {
+            params["key"] = json!(format!("0x{key:016x}"));
+        }
+        let answer = self
+            .call("anchoring_searchRegistriesByName", json!([params]))
             .await?;
-        serde_json::from_value(answer["registries"].take()).context("decode registries")
+        serde_json::from_value(answer).context("decode search")
     }
 
     pub async fn status(&self) -> Result<IndexStatus> {
         let answer = self.call("anchoring_nameIndexStatus", json!([])).await?;
         serde_json::from_value(answer).context("decode nameIndexStatus")
     }
+}
+
+fn hex_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    let Some(key) = Option::<String>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    let digits = key.strip_prefix("0x").unwrap_or(&key);
+    if digits.len() != 16 {
+        return Err(de::Error::custom(format!("nextKey {key}: not 8 bytes")));
+    }
+    u64::from_str_radix(digits, 16)
+        .map(Some)
+        .map_err(|_| de::Error::custom(format!("nextKey {key}: not hex")))
 }
